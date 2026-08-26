@@ -67,6 +67,39 @@ class VisitedRecord:
 
 
 @dataclass(frozen=True)
+class DispatchRecord:
+    """R29: explicit evidence of an expansion crossing DISPATCH_LOCAL or first EMIT_EXTERNAL."""
+    node_id: str
+    op_id: str
+    visit_no: int
+    kind: str      # "Local" | "External"
+
+
+# ---------------------------------------------------------------------
+# Scheduler decisions (R25)
+# ---------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class Continue:
+    node: str
+    op_id: str
+    kind: str
+
+
+@dataclass(frozen=True)
+class Wait:
+    reason: str
+
+
+@dataclass(frozen=True)
+class Stop:
+    reason: str     # "BudgetDepleted" | "FrontierEmpty" | "FuelExhausted"
+
+
+SchedulerAction = Continue | Wait | Stop
+
+
+@dataclass(frozen=True)
 class OutboxRecord:
     request_id: str
     op_id: str
@@ -131,6 +164,7 @@ class ConvergeTransactionDomain:
     nodes: dict[str, SearchNode] = field(default_factory=dict)
     frontier: list[str] = field(default_factory=list)
     visited: list[VisitedRecord] = field(default_factory=list)   # history, not dedup
+    dispatches: list[DispatchRecord] = field(default_factory=list) # R29: local & external dispatch evidence
     best_partial: Optional[Any] = None        # OPAQUE — never touched by transitions
     frontier_mutations_during_closing: int = 0 # I8 verification counter
 
@@ -144,6 +178,7 @@ class ConvergeTransactionDomain:
     outbox: dict[str, OutboxRecord] = field(default_factory=dict)
     handles: dict[str, InFlightLifecycleState] = field(default_factory=dict)
     completions: dict[str, CompletionRecord] = field(default_factory=dict)
+    applied_completions: list[str] = field(default_factory=list) # R28: CompletionId tracking for I6
 
     # 4. Coordinated accounting
     scope_limit: dict[str, int] = field(default_factory=dict)
@@ -173,6 +208,7 @@ class ConvergeTransactionDomain:
             nodes=dict(self.nodes),
             frontier=list(self.frontier),
             visited=list(self.visited),
+            dispatches=list(self.dispatches),
             best_partial=self.best_partial,
             frontier_mutations_during_closing=self.frontier_mutations_during_closing,
             step_count=self.step_count,
@@ -182,6 +218,7 @@ class ConvergeTransactionDomain:
             outbox=dict(self.outbox),
             handles=h,
             completions=dict(self.completions),
+            applied_completions=list(self.applied_completions),
             scope_limit=dict(self.scope_limit),
             scope_committed=dict(self.scope_committed),
             scope_spent=dict(self.scope_spent),

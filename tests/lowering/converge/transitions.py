@@ -4,11 +4,13 @@ Each transition enforces the frozen normative principles. Faults are injected
 by the harness, never by these functions.
 """
 from dataclasses import replace
+from typing import Any
 
 from model import (
-    ClosingReason, CompletionRecord, ConvergeTransactionDomain,
-    InFlightLifecycleState, NodeStatus, OutboxRecord, Reservation,
-    SearchNode, SearchStatus, SettlementRecord, VisitedRecord, next_id,
+    ClosingReason, CompletionRecord, Continue, ConvergeTransactionDomain,
+    DispatchRecord, InFlightLifecycleState, NodeStatus, OutboxRecord,
+    Reservation, SchedulerAction, SearchNode, SearchStatus, SettlementRecord,
+    Stop, VisitedRecord, Wait, next_id,
 )
 
 
@@ -44,6 +46,8 @@ def dispatch_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
     visit_key = f"{op_id}:{node_id}"
     visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
     d.visited.append(VisitedRecord(visit_key, node_id, op_id, visit_no))
+    # R29: bind VisitedRecord to explicit DispatchRecord for local expansion
+    d.dispatches.append(DispatchRecord(node_id, op_id, visit_no, "Local"))
 
     if node_id in d.frontier:
         d.frontier.remove(node_id)
@@ -68,6 +72,25 @@ def classify_runnable(d: ConvergeTransactionDomain, op_cost: int, resource: str 
     available = d.intent_available.get(resource, 0)
     scope_head = d.scope_limit.get(resource, 0) - d.scope_spent.get(resource, 0) - d.scope_committed.get(resource, 0)
     return (op_cost <= available and op_cost <= scope_head)
+
+
+def scheduler_step(d: ConvergeTransactionDomain, prog: Any) -> SchedulerAction:
+    """R25: Machine-owned scheduling decisions. Driver never writes/pops frontier."""
+    if d.step_count >= prog.max_steps:
+        return Stop("FuelExhausted")
+    if not d.frontier:
+        return Stop("FrontierEmpty")
+
+    for n in d.frontier:
+        op = prog.node_ops.get(n)
+        if op is None:
+            from scenarios import OpDef
+            op = OpDef(op_id=f"op:{n}")
+        cost = op.cost if op.kind == "external" else 0
+        if classify_runnable(d, cost, "usd"):
+            return Continue(node=n, op_id=op.op_id, kind=op.kind)
+
+    return Stop("BudgetDepleted")
 
 
 def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
@@ -180,8 +203,13 @@ def emit_external(d: ConvergeTransactionDomain, request_or_handle_id: str,
             visit_key = f"{rec.op_id}:{node_id}"
             visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
             d.visited.append(VisitedRecord(visit_key, node_id, rec.op_id, visit_no))
+            # R29: bind VisitedRecord to explicit DispatchRecord for external expansion
+            d.dispatches.append(DispatchRecord(node_id, rec.op_id, visit_no, "External"))
             if node_id in d.frontier:
                 d.frontier.remove(node_id)
+        else:
+            # R26: Effectful CheckSatisfaction commit point -> satisfaction_attempts increments here
+            d.satisfaction_attempts += 1
     else:
         # Transport retry (T04): only legal with adapter guarantees (T04B).
         if st is not None and st.delivery_unknown:
@@ -289,7 +317,7 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
 
 
 # ---------------------------------------------------------------------
-# apply — semantic incorporation, exactly once per completion (I6)
+# apply — semantic incorporation, exactly once per completion (I6, R27)
 # ---------------------------------------------------------------------
 
 def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
@@ -306,6 +334,65 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
         raise TransitionError("I8: frontier mutation during Closing")
     st.applied = True
     st.state = "Applied"
+    c_id = f"{handle_id}:{st.completion.receipt_id}" if st.completion else handle_id
+    d.applied_completions.append(c_id)
+    return True
+
+
+def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str,
+                           succs: list[str]) -> bool:
+    """R27: Atomic space completion incorporation.
+
+    Atomically applies handle AND adds discovered successors to frontier.
+    Handle is never Applied without its successors being discovered.
+    """
+    st = d.handles.get(handle_id)
+    if st is None:
+        raise TransitionError("apply for unknown handle")
+    if st.applied:
+        return False
+    if st.state != "Settled":
+        raise TransitionError(f"apply_space_completion called in invalid state '{st.state}' — must be Settled")
+
+    # Discover successors into frontier & nodes
+    discover_successors(d, succs)
+
+    st.applied = True
+    st.state = "Applied"
+    c_id = f"{handle_id}:{st.completion.receipt_id}" if st.completion else handle_id
+    d.applied_completions.append(c_id)
+    return True
+
+
+def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str,
+                               node_id: str, op_id: str, satisfied: bool,
+                               value: object = None, error: str = None,
+                               abort_on_error: bool = False) -> bool:
+    """R27: Atomic satisfier completion incorporation.
+
+    Atomically applies satisfier handle AND registers satisfaction outcome.
+    """
+    st = d.handles.get(handle_id)
+    if st is None:
+        raise TransitionError("apply for unknown handle")
+    if st.applied:
+        return False
+    if st.state != "Settled":
+        raise TransitionError(f"apply_satisfier_completion called in invalid state '{st.state}' — must be Settled")
+
+    if satisfied:
+        d.satisfied_value = value
+        d.frame_status = SearchStatus.SATISFIED
+        d.current_in_flight = None
+    elif error is not None:
+        d.satisfier_error = error
+        if abort_on_error:
+            fatal_close(d, error)
+
+    st.applied = True
+    st.state = "Applied"
+    c_id = f"{handle_id}:{st.completion.receipt_id}" if st.completion else handle_id
+    d.applied_completions.append(c_id)
     return True
 
 

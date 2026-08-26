@@ -253,3 +253,20 @@ D16 = ScenarioProgram(
     budget_limit=100,
     effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
 )
+
+# R26: effectful satisfier commit point under DeliveryUnknown -> satisfaction_attempts==1 upon emission
+D17 = ScenarioProgram(
+    name="D17_effectful_satisfier_delivery_unknown",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={
+        "root": OpDef("opRoot", kind="local"),
+    },
+    satisfier_map={
+        "root": ("ok", True, "T-unreached"),
+    },
+    max_steps=6,
+    budget_limit=100,
+    effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
+    fault_spec=FaultSpec(delivery_unknown=True),
+)

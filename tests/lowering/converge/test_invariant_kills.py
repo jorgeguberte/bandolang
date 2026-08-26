@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from model import (ConvergeTransactionDomain, InFlightLifecycleState,
+from model import (ConvergeTransactionDomain, DispatchRecord, InFlightLifecycleState,
                    SearchStatus, VisitedRecord)
 
 PASS, FAIL = 0, 0
@@ -92,15 +92,16 @@ bk_empty = HarnessBookkeeping(reservations_created_by_cf={})
 survives("I3 control probe (reservation of OTHER operation accepted)",
          lambda x: __import__("invariants").i3_terminal_zero_obligations(x, bk_empty), d3c)
 
-# I6 kill: same completion digest applied twice via two handles
+# I6 kill (R28): same CompletionId applied twice
 d4 = base_domain()
-ha = InFlightLifecycleState(handle_id="ha", request_id="ra", applied=True, state="Applied")
-hb = InFlightLifecycleState(handle_id="hb", request_id="rb", applied=True, state="Applied")
-comp_a = __import__("model").CompletionRecord("ha", "receipt-1", "same-digest", "Success")
-comp_b = __import__("model").CompletionRecord("hb", "receipt-2", "same-digest", "Success")
-ha.completion, hb.completion = comp_a, comp_b
-d4.handles = {"ha": ha, "hb": hb}
-kill("I6 kill (same completion applied twice)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4)
+d4.applied_completions = ["ha:rcpt-1", "ha:rcpt-1"]
+kill("I6 kill (same CompletionId applied twice)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4)
+
+# I6 control probe (R28): two different completions with identical digests
+d4b = base_domain()
+d4b.applied_completions = ["ha:rcpt-1", "hb:rcpt-2"]
+survives("I6 control probe (distinct completions with identical digest accepted)",
+         lambda x: __import__("invariants").i6_apply_at_most_once(x), d4b)
 
 # I7 kill: scope_spent disagrees with sum of settlement records
 d5 = base_domain()
@@ -110,18 +111,26 @@ d5.handles = {"hs": hs}
 d5.scope_spent["usd"] = 99   # ledger says 99, records say 10
 kill("I7 kill (ledger != settled amounts)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5)
 
-# I8 kill (R18): frontier mutation during closing state
+# I8 kill (R30): attempt actual machine frontier mutation while Closing
 d8 = base_domain()
 d8.frame_status = SearchStatus.CLOSING
-d8.frontier_mutations_during_closing = 1
-kill("I8 kill (frontier mutation during closing)", lambda x: __import__("invariants").i8_closing_frontier_frozen(x), d8)
+try:
+    __import__("transitions").discover_successors(d8, ["ghost_node"])
+except __import__("transitions").TransitionError:
+    pass
+kill("I8 kill (frontier mutation attempted during closing)", lambda x: __import__("invariants").i8_closing_frontier_frozen(x), d8)
 survives("I8 clean closing state accepted", lambda x: __import__("invariants").i8_closing_frontier_frozen(x), base_domain())
 
-# I9 kill: visited record for an op that never crossed emission
+# I9 kill (R29): forged visit record without corresponding dispatch record
 d6 = base_domain()
-d6.visited.append(VisitedRecord(visit_key="k", node_id="n1", op_id="ghost-op", visit_no=1))
-kill("I9 kill (visited without dispatch)", lambda x: __import__("invariants").i9_visited_requires_dispatch(x), d6)
-survives("I9 clean history accepted", lambda x: __import__("invariants").i9_visited_requires_dispatch(x), base_domain())
+d6.dispatches = [DispatchRecord("n1", "op-real", 1, "Local")]
+d6.visited.append(VisitedRecord(visit_key="op-ghost:n1", node_id="n1", op_id="op-ghost", visit_no=1))
+kill("I9 kill (forged visit without matching dispatch)", lambda x: __import__("invariants").i9_visited_requires_dispatch(x), d6)
+
+d6_probe = base_domain()
+d6_probe.dispatches = [DispatchRecord("n1", "op-real", 1, "Local")]
+d6_probe.visited.append(VisitedRecord(visit_key="op-real:n1", node_id="n1", op_id="op-real", visit_no=1))
+survives("I9 clean history accepted", lambda x: __import__("invariants").i9_visited_requires_dispatch(x), d6_probe)
 
 # I10 kill A: scope committed beyond its limit (minted ownership)
 d7a = base_domain()

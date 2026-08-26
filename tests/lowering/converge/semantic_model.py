@@ -119,15 +119,21 @@ class SemanticFrame:
             if self.step_count >= self.max_steps or not self.frontier:
                 break
 
-            node = self.frontier.pop(0)
+            # R25: Semantic search scheduler selects first runnable node
+            runnable_idx = None
+            for i, n in enumerate(self.frontier):
+                op = prog.node_ops.get(n, OpDef(op_id=f"op:{n}"))
+                op_ceiling = op.cost if op.kind == "external" else 0
+                if self.budget_spent + op_ceiling <= self.budget_limit:
+                    runnable_idx = i
+                    break
+
+            if runnable_idx is None:
+                # No runnable node within budget -> Stop(BudgetDepleted)
+                break
+
+            node = self.frontier.pop(runnable_idx)
             op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
-            op_ceiling = op.cost if op.kind == "external" else 0
-
-            # R20: CanAfford check against budget_limit uses cost ceiling, not actual charge
-            if self.budget_spent + op_ceiling > self.budget_limit:
-                # Unaffordable operation under cost ceiling: cannot expand within budget
-                continue
-
             succs = list(prog.successors.get(node, []))
             self.expand(node, op, succs)
 
@@ -139,13 +145,32 @@ class SemanticFrame:
             # Candidates to check: the expanded node itself, then its successors
             candidates = [node] + succs
             for cand in candidates:
-                # R24: effectful satisfier
+                # R24/R26: effectful satisfier
                 if prog.effectful_satisfier:
                     es_cost = prog.effectful_satisfier.cost
                     if self.budget_spent + es_cost > self.budget_limit:
                         continue
-                    self.budget_spent += prog.effectful_satisfier.charge()
+                    # R26: satisfaction attempt committed upon emission
+                    self.satisfaction_attempts += 1
                     self.effects.append(f"external({prog.effectful_satisfier.op_id})")
+
+                    if prog.fault_spec.delivery_unknown:
+                        # DeliveryUnknown: request emitted, remains in-flight without receipt
+                        self.status = "Closing"
+                        self.outcome = SemanticOutcome("Closing", error="PendingExhausted")
+                        self.outstanding_scope_commitment = es_cost
+                        self.unsettled_request_count = 1
+                        self.attributable_owner_reserved = es_cost
+                        self.intent_available_consumed = es_cost
+                        return self.outcome
+
+                    self.budget_spent += prog.effectful_satisfier.charge()
+                    kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
+                    if ok:
+                        self.status = Status.SATISFIED
+                        self.outcome = SemanticOutcome(Status.SATISFIED, val)
+                        return self.outcome
+                    continue
 
                 if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
                     return self.outcome
@@ -171,9 +196,9 @@ class SemanticFrame:
             "visited": [v.node_id for v in self.visited],
             "frontier": list(self.frontier),
             "budget_spent": self.budget_spent,
-            "outstanding_scope_commitment": 0,
-            "unsettled_request_count": 0,
-            "attributable_owner_reserved": 0,
-            "intent_available_consumed": self.budget_spent,
+            "outstanding_scope_commitment": getattr(self, "outstanding_scope_commitment", 0),
+            "unsettled_request_count": getattr(self, "unsettled_request_count", 0),
+            "attributable_owner_reserved": getattr(self, "attributable_owner_reserved", 0),
+            "intent_available_consumed": getattr(self, "intent_available_consumed", self.budget_spent),
             "effects": sorted(self.effects),
         }

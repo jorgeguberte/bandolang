@@ -84,11 +84,9 @@ def i4_stage_reject_zero_delta(before: dict, after: dict) -> bool:
 #     request_id; a different id is a new semantic attempt by construction.
 
 
-# I6. Handle.Applied(c) ==> applied outcome <= 1 per completion
+# I6. Handle.Applied(c) ==> semantic_outcome applied <= 1 per CompletionId (R28)
 def i6_apply_at_most_once(d: ConvergeTransactionDomain) -> bool:
-    applied_digests = [st.completion.digest for st in d.handles.values()
-                       if st.applied and st.completion]
-    return len(applied_digests) == len(set(applied_digests))
+    return len(d.applied_completions) == len(set(d.applied_completions))
 
 
 # I7. SettlementRecord(h) ==> ledger reconciliation count == 1
@@ -115,12 +113,10 @@ def i8_closing_frontier_frozen(d: ConvergeTransactionDomain) -> bool:
 
 
 # I9. VisitedRecord(n, op, k) ==> that expansion crossed DISPATCH_LOCAL or
-#     first logical EMIT_EXTERNAL (visited is history, not dedup)
+#     first logical EMIT_EXTERNAL, strictly bound to DispatchRecord(n, op, k) (R29)
 def i9_visited_requires_dispatch(d: ConvergeTransactionDomain) -> bool:
-    emitted_ops = {rec.op_id for rec in d.outbox.values()
-                   if d.first_emission_flags.get(rec.request_id)}
-    expanding_nodes = {nid for nid, node in d.nodes.items() if node.status == NodeStatus.EXPANDING}
-    return all(v.op_id in emitted_ops or v.node_id in expanding_nodes for v in d.visited)
+    dispatched = {(dp.node_id, dp.op_id, dp.visit_no) for dp in d.dispatches}
+    return all((v.node_id, v.op_id, v.visit_no) in dispatched for v in d.visited)
 
 
 # I10. BudgetScope cannot grant or mint ownership; IntentFrame conserves resources
