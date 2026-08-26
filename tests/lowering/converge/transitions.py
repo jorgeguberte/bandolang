@@ -24,9 +24,35 @@ class FatalInvariantViolation(Exception):
 # StageLocal — reserve resources and write outbox. NOT a semantic dispatch.
 # ---------------------------------------------------------------------
 
+def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
+                       satisfied: bool, value: object = None,
+                       error: str = None, abort_on_error: bool = False) -> None:
+    """Satisfaction check on a node WITHOUT dispatching/expanding it.
+
+    Frozen ConvergeFrame v0 semantics: CheckSatisfaction is part of the
+    parent expansion's processing — the successor node is consumed by the
+    check without consuming fuel or entering visitation history.
+
+    Campaign 2 finding: Campaign 1 never exercised satisfaction of an
+    unexpanded successor; this transition was missing from the harness.
+    Classified HARNESS_GAP (spec unchanged).
+    """
+    if d.frame_status != SearchStatus.SEARCHING:
+        raise TransitionError("CheckSatisfaction outside Searching frame")
+    d.satisfaction_attempts += 1
+    if satisfied:
+        d.satisfied_value = value
+        return
+    if error is not None:
+        d.satisfier_error = error
+        if abort_on_error:
+            fatal_close(d, error)
+
+
 def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                 request_id: str, resource: str, amount: int,
-                dedup_capable: bool = False, idempotent: bool = False) -> None:
+                dedup_capable: bool = False, idempotent: bool = False,
+                local_only: bool = False) -> None:
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("StageLocal outside Searching frame")
     # I4 guard: rejection must leave committed/reserved deltas at zero.
@@ -40,6 +66,7 @@ def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
     d.outbox[request_id] = OutboxRecord(
         request_id=request_id, op_id=op_id, payload_digest=f"digest({node_id})",
         dedup_capable=dedup_capable, idempotent=idempotent,
+        node_id=node_id, local_only=local_only,
     )
 
 
@@ -63,8 +90,9 @@ def emit_external(d: ConvergeTransactionDomain, request_id: str,
         # visitation recorded (I9, T03).
         d.first_emission_flags[request_id] = True
         d.step_count += 1
-        d.satisfaction_attempts += 1
-        node_id = _node_for_op(d, rec.op_id)
+        if not rec.local_only:
+            d.satisfaction_attempts += 1   # external emission carries an attempt;
+        node_id = rec.node_id or _node_for_op(d, rec.op_id)   # local dispatch does not
         d.nodes[node_id] = __import__("model", fromlist=["SearchNode"]).SearchNode(node_id, NodeStatus.EXPANDING)
         visit_key = f"{rec.op_id}:{node_id}"
         visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
@@ -197,6 +225,27 @@ def fatal_close(d: ConvergeTransactionDomain, err: str) -> None:
     d.protocol_violations.append({"fatal": err})
     d.frame_status = SearchStatus.CLOSING
     d.closing_reason = ClosingReason("PendingFailure", err)
+
+
+def exhaust(d: ConvergeTransactionDomain) -> None:
+    """Natural exhaustion: frontier drained / fuel out without satisfaction.
+
+    Campaign 2 finding: this transition existed in the frozen semantics
+    (Exhausted outcome of ConvergeFrame v0) but had never been exercised —
+    Campaign 1 only tested cancel/fatal closing paths. Added for the
+    semantic differential; classified HARNESS_GAP, not spec change.
+    """
+    if d.frame_status != SearchStatus.SEARCHING:
+        return
+    unsettled = [s for s in d.handles.values() if s.settlement is None]
+    pending_scope = any(v > 0 for v in d.scope_committed.values())
+    if unsettled or pending_scope:
+        # must close first and drain obligations before terminalizing
+        d.frame_status = SearchStatus.CLOSING
+        d.closing_reason = ClosingReason("Draining")
+        return
+    d.frame_status = SearchStatus.EXHAUSTED
+    d.current_in_flight = None
 
 
 def finish_if_drained(d: ConvergeTransactionDomain) -> bool:

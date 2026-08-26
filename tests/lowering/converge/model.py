@@ -71,6 +71,8 @@ class OutboxRecord:
     payload_digest: str
     dedup_capable: bool       # adapter guarantee: request_id dedup
     idempotent: bool          # adapter guarantee: operation idempotency
+    node_id: Optional[str] = None   # explicit node identity (differential parity)
+    local_only: bool = False        # DISPATCH_LOCAL semantics: no observable Σ
 
 
 @dataclass
@@ -146,6 +148,10 @@ class ConvergeTransactionDomain:
     # Durable protocol-violation evidence (T07B): written atomically
     # with admission of the second receipt, before any fatal control flow.
     protocol_violations: list[dict] = field(default_factory=list)
+
+    # Satisfaction result carried by check_satisfaction (differential parity)
+    satisfied_value: object = None
+    satisfier_error: str = None
 
     def copy(self) -> "ConvergeTransactionDomain":
         """Snapshot for crash/rollback-of-local-state semantics in tests."""
