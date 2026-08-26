@@ -23,6 +23,7 @@ from scenarios import (
     D31_POST_FUEL_CHECK_NONE_EXHAUSTS,
     D32_DYNAMIC_GATE_REJECTION_STEP_FAILURE,
     D33_SPACE_STEP_FAILURE_PRUNE_CONTINUES,
+    D34_SPACE_STEP_FAILURE_REQUEUE_RETRIES_WITH_NEW_REQUEST,
     OpDef, ScenarioProgram,
 )
 import transitions as tx
@@ -42,7 +43,9 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
     """Execute a ScenarioProgram on the lowered machine driven 100% by machine scheduler_step actions (R67)."""
     d.on_satisfier_error = prog.on_satisfier_error
     d.on_step_failure = prog.on_step_failure
+    d.max_satisfaction_attempts = prog.max_satisfaction_attempts
     tx.discover_successors(d, prog.initial_frontier)
+    space_attempts: dict[str, int] = {}
 
     while d.frame_status == SearchStatus.SEARCHING:
         action = tx.scheduler_step(d, prog)
@@ -54,6 +57,8 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
             break
         elif isinstance(action, ActionExpand):
             node = action.node_id
+            space_attempts[node] = space_attempts.get(node, 0) + 1
+            attempt_no = space_attempts[node]
             op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
             cost = op.cost if op.kind == "external" else 0
             charge = op.charge() if op.kind == "external" else 0
@@ -64,12 +69,12 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                 # R19: Real local dispatch — zero handles, zero outbox, zero settlement
                 h.step(f"dispatch-local-{op.op_id}", tx.dispatch_local, node, op.op_id, succs)
             else:
-                req_id = op.request_id or f"req:{op.op_id}"
-                handle = h.step(f"stage-{op.op_id}", tx.stage_local, node, op.op_id, req_id,
+                req_id = op.request_id or f"req:{op.op_id}:{node}:{attempt_no}"
+                handle = h.step(f"stage-{op.op_id}-{attempt_no}", tx.stage_local, node, op.op_id, req_id,
                                 "usd", cost, dedup_capable=op.dedup_capable, idempotent=op.idempotent,
                                 local_only=False)
 
-                h.step(f"emit-{op.op_id}", tx.emit_external, handle,
+                h.step(f"emit-{op.op_id}-{attempt_no}", tx.emit_external, handle,
                        deliver_unknown=op_is_delivery_unknown)
 
                 if op_is_delivery_unknown:
@@ -88,7 +93,13 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                         break
 
                 # R64/R69: space StepFailure fault definition from ScenarioProgram
-                space_fault = prog.space_faults.get(op.op_id)
+                fault_spec_val = prog.space_faults.get(op.op_id)
+                if isinstance(fault_spec_val, list):
+                    fault_idx = min(attempt_no - 1, len(fault_spec_val) - 1)
+                    space_fault = fault_spec_val[fault_idx]
+                else:
+                    space_fault = fault_spec_val
+
                 space_payload = SpaceOutcome(error=space_fault, is_failure=True) if space_fault else SpaceOutcome(successors=succs)
                 rcpt_space = ExecutionReceipt(req_id, f"rcpt-{req_id}", "usd", charge)
 
@@ -372,6 +383,13 @@ def run(prog: ScenarioProgram) -> None:
             assert sem_obs["value"] == "T-prune-success", f"R69: value mismatch, got {sem_obs['value']}"
             print("    \u2713 R69 verified: space StepFailure with prune policy pruned failed node and search continued -> Satisfied")
 
+        # A2 assertion for D34
+        if prog.name == "D34_space_step_failure_requeue_retries_with_new_request":
+            assert sem_obs["status"] == "Satisfied", f"A2: status must be Satisfied, got {sem_obs['status']}"
+            assert sem_obs["value"] == "T-requeue-success", f"A2: value mismatch, got {sem_obs['value']}"
+            assert sem_obs["step_count"] == 2, f"A2: step_count must be 2 (attempt 1 failed, attempt 2 succeeded), got {sem_obs['step_count']}"
+            print("    \u2713 A2 verified: space StepFailure with requeue policy retried with fresh request_id -> Satisfied(T-requeue-success)")
+
         print(f"  \u2713 PASS {prog.name}  (status={sem_obs['status']} value={sem_obs['value']!r})")
         PASS += 1
 
@@ -389,7 +407,8 @@ if __name__ == "__main__":
                  D29_CHECKED_NOT_SATISFIED_NEVER_RECHECKED,
                  D31_POST_FUEL_CHECK_NONE_EXHAUSTS,
                  D32_DYNAMIC_GATE_REJECTION_STEP_FAILURE,
-                 D33_SPACE_STEP_FAILURE_PRUNE_CONTINUES):
+                 D33_SPACE_STEP_FAILURE_PRUNE_CONTINUES,
+                 D34_SPACE_STEP_FAILURE_REQUEUE_RETRIES_WITH_NEW_REQUEST):
         run(prog)
 
     print("=" * 70)

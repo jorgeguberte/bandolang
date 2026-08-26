@@ -1,42 +1,24 @@
-# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 13
+# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 14 (FINAL PHASE-D ACCEPTANCE)
 
-> **REISSUE 13 after thirteenth adversarial audit round (R66–R70).**
-> The thirteenth audit resolved the core architectural structure by unifying all machine actions under `RunnableAction` (`ActionExpand` | `ActionCheckSatisfaction`), enforcing mandatory `ExecutionReceipt` without fallbacks, and completing `ConfirmedNotDelivered` across the full obligation and failure lifecycle:
-> 1. R66: `ExecutionReceipt(request_id, receipt_id, resource, amount)` is strictly mandatory on `admit_completion()`. Rejection tests prove missing receipt, mismatched `request_id`, and mismatched `receipt_id` are rejected immediately. `settle(handle)` has zero caller accounting parameters.
-> 2. R67: Machine-owned `RunnableAction` scheduler (`ActionExpand` | `ActionCheckSatisfaction`). Transitions enforce eligibility machine-side (`CheckedNotSatisfied` and `Satisfied` nodes are rejected on `check_satisfaction` and `stage_local`). Zero driver-local counters or candidate loops.
-> 3. R68: Eliminated `check_partial_after_fuel` steering oracle entirely. Post-fuel partial satisfaction is driven naturally by `ActionCheckSatisfaction` on real `SearchNode`s.
-> 4. R69: Declarative `space_faults` mapping and `on_step_failure` ("abort" | "prune" | "requeue") without magic op names. Added D33 proving prune policy allows search to continue on remaining frontier.
-> 5. R70: `confirmed_not_delivered()` releases accounting exactly once, clears `current_in_flight`, updates `HarnessBookkeeping`, and routes failure semantics according to operation kind. Added T25 proving CND during Closing drains cleanly to `Cancelled`.
-> All 80 test cases pass across all 4 test suites without divergence or false positives.
+> **REISSUE 14 after Final Phase-D Acceptance gate (A1 + A2).**
+> The final acceptance gate resolved the 2 remaining operational requirements:
+> 1. A1: Transition-level satisfaction attempt limit enforcement persisted in domain configuration (`d.max_satisfaction_attempts`). Both `check_satisfaction` and `stage_local(is_expansion=False)` reject attempts exceeding the ceiling with strict zero delta (negative kills verified).
+> 2. A2: Space `StepFailure` with `on_step_failure="requeue"` marks failed node as `Queued`, restores it to the frontier, and allows subsequent semantic attempts to execute under a fresh `request_id` (D34 verified: step_count=2, fresh request identity, satisfied `T-requeue-success`).
+> All 81 test cases pass across all 4 test suites without divergence or false positives.
 
-## Audit repairs applied (Round 13: R66–R70)
+## Audit repairs applied (Final Acceptance: A1 + A2)
 
 ```text
-R66 Actually Mandatory ExecutionReceipt
-    FIXED — `admit_completion()` requires non-None `ExecutionReceipt` matching handle `request_id`
-    and completion `receipt_id`. `settle(d, handle_id)` signature has zero caller accounting parameters
-    and zero fallback paths. Validated with 3 new negative mutation kills.
+A1 Transition-Level Satisfaction Attempt Ceiling
+    FIXED — `ConvergeTransactionDomain.max_satisfaction_attempts` is a persistent machine configuration.
+    `check_satisfaction()` and `stage_local(is_expansion=False)` check `satisfaction_attempts >= max_satisfaction_attempts`
+    before any state or accounting mutation and raise `TransitionError("SatisfactionLimitReached")`.
+    Direct negative mutation tests prove strict rejection with zero delta on counters and reservations.
 
-R67 Machine-Owned RunnableAction Model
-    FIXED — `scheduler_step(d, prog)` returns `ActionExpand | ActionCheckSatisfaction | ActionWait | ActionStop`.
-    Eligibility for `ActionCheckSatisfaction` computes `Untested | RetryableFailure(n)`, `PartialOf(n)`,
-    budget headroom, and `max_satisfaction_attempts`. `check_satisfaction()` and `stage_local()` reject
-    ineligible node checks at the transition level.
-
-R68 Removal of Post-Fuel Steering Oracle
-    FIXED — Deleted `check_partial_after_fuel`. At max expansion fuel, `ActionExpand` becomes ineligible,
-    and remaining untested `PartialOf(n)` nodes in the search graph are automatically scheduled
-    as `ActionCheckSatisfaction`. Rebuilt D03 and D31 around real graph nodes.
-
-R69 Declarative Space StepFailure & DynamicGateRejection (D32, D33)
-    FIXED — Replaced magic op strings with `prog.space_faults` mapping and `prog.on_step_failure`.
-    `apply_space_completion()` marks `StepFailure` and handles "abort" (terminates as Failed)
-    and "prune" (marks node `Pruned` and removes from frontier). Added D33.
-
-R70 Complete ConfirmedNotDelivered Lifecycle (T24, T25)
-    FIXED — `confirmed_not_delivered(d, handle)` releases reservations and commitments,
-    removes attribution from `HarnessBookkeeping`, and updates node failure state.
-    Invariant checkers I1/I2 treat CND handles as resolved. Added T25 (CND while Closing).
+A2 Space StepFailure Requeue Policy & Fresh Request Identity (D34)
+    FIXED — Implemented `on_step_failure="requeue"` in `apply_space_completion()`: sets node status
+    to `Queued`, restores node to `frontier`, and resets frame to `Searching`. Subsequent semantic attempt
+    stages with a fresh `request_id` (`req:opRoot:node:2`) and succeeds. Added D34 regression test.
 ```
 
 ## Complete verification results
@@ -59,12 +41,13 @@ Invariant Kill Tests (Mutation Testing & Bijection):
                 I7 ghost reconciliation kill, I7 ghost scope_spent kill, I7 identical receipt probe,
                 R50/R56 canonical digest order/op_id/type collision tests,
                 R57/R62/R66 mandatory ExecutionReceipt authority & identity kills,
+                A1 transition-level satisfaction attempt ceiling & zero-delta kill,
                 I8 closing mutation kill, I8 clean closing probe, I9 forged visit kill,
                 I9 clean history probe, I10 scope limit kill, I10 IntentFrame conservation kill,
                 I10 spent>avail control probe)
 
 Campaign 2 Basic (Declarative Search Programs):
-    26/26 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
+    27/27 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
                 D03 max_steps + partial [R4/R68 verified], D04 Ok(None), D05 Err+abort,
                 D06 external, D13 ceiling vs actual charge [R12/R14 verified],
                 D14 budget headroom depletion [R15/R34 verified],
@@ -85,7 +68,8 @@ Campaign 2 Basic (Declarative Search Programs):
                 D29 CheckedNotSatisfied node is not re-checked on subsequent expansion [R61/R67 verified],
                 D31 post-fuel Ok(None) candidate in graph exhausts naturally [R63/R68 verified],
                 D32 declarative space StepFailure DynamicGateRejection terminates as Failed [R64/R69 verified],
-                D33 space StepFailure with prune policy allows search to continue -> Satisfied [R69 verified])
+                D33 space StepFailure with prune policy allows search to continue -> Satisfied [R69 verified],
+                D34 space StepFailure with requeue policy retries with fresh request_id -> Satisfied [A2 verified])
 
 Campaign 2 Fault (Environmental Fault Injections):
     6/6 PASS   (D07 DeliveryUnknown [Waiting verified],
@@ -99,9 +83,9 @@ Semantic model:
     REAL / AUTONOMOUS (purely declarative search space execution via unified RunnableAction)
 
 Lowered model:
-    REAL / ADVERSARIALLY HARDENED (machine-owned RunnableAction scheduler, mandatory ExecutionReceipt authority,
-    Closing semantic barrier, declarative Space StepFailure handling, ConfirmedNotDelivered lifecycle,
-    exact canonical JSON digests, true two-way bijection invariants, snapshot-authoritative recovery)
+    REAL / ADVERSARIALLY HARDENED (machine-owned RunnableAction scheduler, transition-level attempt limits,
+    mandatory ExecutionReceipt authority, Closing semantic barrier, declarative Space StepFailure requeue/prune handling,
+    ConfirmedNotDelivered lifecycle, exact canonical JSON digests, true two-way bijection invariants, snapshot-authoritative recovery)
 
 Differential counterexamples:
     NONE IN TESTED REGIME
@@ -124,13 +108,13 @@ Executable lowered state-machine model
     REAL / ADVERSARIALLY HARDENED (27/27 adversarial scenarios)
 
 Executable semantic model
-    REAL / AUTONOMOUS (32/32 differential programs)
+    REAL / AUTONOMOUS (33/33 differential programs)
 
 Invariant checker
     SELF-TESTED (21/21 mutation kill tests & control probes)
 
 Differential semantic preservation
-    VERIFIED IN TESTED REGIME (audited across 13 adversarial review rounds, R1–R70 fixed)
+    VERIFIED IN TESTED REGIME (audited across 14 adversarial review rounds, R1–R70 + A1–A2 fixed)
 
 Actual compiler/lowering implementation
     NOT YET VERIFIED
@@ -149,6 +133,6 @@ Item 3 (CFG / Result / Error Model)
     UNBLOCKED per campaign plan — Phase D lowering safety, Waiting lifecycle,
     Closing semantic barrier, budget conservation, mandatory ExecutionReceipt authority,
     machine-owned RunnableAction model (ActionExpand | ActionCheckSatisfaction),
-    declarative StepFailure recovery, ConfirmedNotDelivered, and differential preservation
-    have survived 13 adversarial audit rounds with zero bypasses.
+    transition-level attempt limits (A1), declarative StepFailure requeue with fresh request identity (A2),
+    ConfirmedNotDelivered, and differential preservation have survived 14 adversarial audit rounds with zero bypasses.
 ```

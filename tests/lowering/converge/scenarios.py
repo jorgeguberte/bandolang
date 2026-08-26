@@ -555,3 +555,19 @@ D33_SPACE_STEP_FAILURE_PRUNE_CONTINUES = ScenarioProgram(
     max_steps=6,
     budget_limit=100,
 )
+
+# A2: space StepFailure with requeue policy requeues node; next semantic attempt uses fresh request_id and succeeds
+D34_SPACE_STEP_FAILURE_REQUEUE_RETRIES_WITH_NEW_REQUEST = ScenarioProgram(
+    name="D34_space_step_failure_requeue_retries_with_new_request",
+    initial_frontier=["root"],
+    successors={"root": ["succQ"]},
+    node_ops={
+        "root": OpDef("opRoot", kind="external", cost=10),
+    },
+    space_faults={"opRoot": ["TransientStepFailure", None]},
+    on_step_failure="requeue",
+    partial_map={"succQ": "P_succ"},
+    satisfier_map={"succQ": ("ok", True, "T-requeue-success")},
+    max_steps=6,
+    budget_limit=100,
+)

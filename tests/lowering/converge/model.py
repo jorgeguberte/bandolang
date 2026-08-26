@@ -253,7 +253,8 @@ class ConvergeTransactionDomain:
     satisfied_value: object = None
     satisfier_error: str = None
     on_satisfier_error: str = "abort"         # R52: durable machine/frame error policy ("abort" | "retry")
-    on_step_failure: str = "abort"            # R64: durable machine/frame space failure policy ("abort" | "prune")
+    on_step_failure: str = "abort"            # R64: durable machine/frame space failure policy ("abort" | "prune" | "requeue")
+    max_satisfaction_attempts: int = 10       # A1: durable satisfaction attempt limit on domain
     exhaustion_reason: Optional[str] = None   # R34: "BudgetDepleted" | "FrontierEmpty" | "FuelExhausted"
 
     def copy(self) -> "ConvergeTransactionDomain":
@@ -291,6 +292,7 @@ class ConvergeTransactionDomain:
             satisfier_error=self.satisfier_error,
             on_satisfier_error=self.on_satisfier_error,
             on_step_failure=self.on_step_failure,
+            max_satisfaction_attempts=self.max_satisfaction_attempts,
             exhaustion_reason=self.exhaustion_reason,
         )
 

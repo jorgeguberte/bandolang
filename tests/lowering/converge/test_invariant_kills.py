@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from model import (ConvergeTransactionDomain, DispatchRecord, InFlightLifecycleState,
-                   SearchStatus, VisitedRecord)
+                   NodeStatus, SatisfactionState, SearchNode, SearchStatus, VisitedRecord)
 
 PASS, FAIL = 0, 0
 
@@ -225,6 +225,32 @@ except __import__("transitions").TransitionError as e:
     assert "ReceiptIdMismatch" in str(e), f"wrong refusal: {e}"
 
 print("  ✓ R57/R62 settlement & receipt authority verified: receipt is mandatory and strictly bound to request_id/receipt_id")
+
+# A1: Transition-level satisfaction attempt ceiling enforcement
+d_a1 = base_domain()
+d_a1.max_satisfaction_attempts = 1
+d_a1.satisfaction_attempts = 1
+d_a1.nodes["nodeA"] = SearchNode("nodeA", NodeStatus.FRONTIER, SatisfactionState.UNTESTED)
+
+# Negative A1 (local check): must reject with zero delta
+try:
+    __import__("transitions").check_satisfaction(d_a1, "nodeA", "op", True)
+    raise AssertionError("check_satisfaction permitted beyond max_satisfaction_attempts")
+except __import__("transitions").TransitionError as e:
+    assert "SatisfactionLimitReached" in str(e), f"wrong refusal: {e}"
+assert d_a1.satisfaction_attempts == 1, "satisfaction_attempts mutated on rejected check"
+assert d_a1.satisfied_value is None, "satisfied_value mutated on rejected check"
+assert d_a1.frame_status == SearchStatus.SEARCHING, "frame_status mutated on rejected check"
+
+# Negative A1 (effectful check via stage_local): must reject with zero delta
+try:
+    __import__("transitions").stage_local(d_a1, "nodeA", "op", "r_a1", "usd", 5, is_expansion=False)
+    raise AssertionError("stage_local(is_expansion=False) permitted beyond max_satisfaction_attempts")
+except __import__("transitions").TransitionError as e:
+    assert "SatisfactionLimitReached" in str(e), f"wrong refusal: {e}"
+assert d_a1.scope_committed.get("usd", 0) == 0, "scope_committed mutated on rejected stage"
+assert d_a1.intent_reserved.get("usd", 0) == 0, "intent_reserved mutated on rejected stage"
+print("  ✓ A1 satisfaction attempt limit verified: transitions strictly enforce ceiling with zero delta")
 
 # I8 kill (R30): attempt actual machine frontier mutation while Closing
 d8 = base_domain()

@@ -164,8 +164,10 @@ def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("StageLocal outside Searching frame")
 
-    # R67: Transition-level satisfaction eligibility check
+    # R67/A1: Transition-level satisfaction eligibility check
     if not is_expansion:
+        if d.satisfaction_attempts >= d.max_satisfaction_attempts:
+            raise TransitionError(f"SatisfactionLimitReached: attempts {d.satisfaction_attempts} >= limit {d.max_satisfaction_attempts}")
         existing_node = d.nodes.get(node_id)
         if existing_node and existing_node.satisfaction_state in (SatisfactionState.CHECKED_NOT_SATISFIED, SatisfactionState.SATISFIED):
             raise TransitionError(f"IneligibleCheck: node '{node_id}' is already {existing_node.satisfaction_state} (R67)")
@@ -494,6 +496,13 @@ def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool
                 d.frontier.remove(node_id)
             if d.frame_status == SearchStatus.WAITING:
                 d.frame_status = SearchStatus.SEARCHING
+        elif d.on_step_failure == "requeue":
+            if node_id in d.nodes:
+                d.nodes[node_id] = replace(d.nodes[node_id], status=NodeStatus.QUEUED)
+            if node_id and node_id not in d.frontier:
+                d.frontier.append(node_id)
+            if d.frame_status == SearchStatus.WAITING:
+                d.frame_status = SearchStatus.SEARCHING
         return True
 
     discover_successors(d, payload.successors)
@@ -641,9 +650,12 @@ def recover(d: ConvergeTransactionDomain, snapshot: ConvergeTransactionDomain,
 
 def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                        satisfied: bool, value: object = None, error: str = None) -> bool:
-    """Check satisfaction for local satisfiers (R61/R67)."""
+    """Check satisfaction for local satisfiers (R61/R67/A1)."""
     if d.frame_status not in (SearchStatus.SEARCHING, SearchStatus.WAITING):
         return False
+
+    if d.satisfaction_attempts >= d.max_satisfaction_attempts:
+        raise TransitionError(f"SatisfactionLimitReached: attempts {d.satisfaction_attempts} >= limit {d.max_satisfaction_attempts} (A1)")
 
     existing_node = d.nodes.get(node_id)
     if existing_node and existing_node.satisfaction_state in (SatisfactionState.CHECKED_NOT_SATISFIED, SatisfactionState.SATISFIED):
