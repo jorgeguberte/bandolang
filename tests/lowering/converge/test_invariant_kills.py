@@ -45,6 +45,7 @@ def survives(name: str, checker, domain: ConvergeTransactionDomain) -> None:
 def base_domain() -> ConvergeTransactionDomain:
     d = ConvergeTransactionDomain()
     d.scope_limit["usd"] = 100
+    d.intent_initial_total["usd"] = 100
     d.intent_available["usd"] = 100
     return d
 
@@ -109,16 +110,37 @@ d5.handles = {"hs": hs}
 d5.scope_spent["usd"] = 99   # ledger says 99, records say 10
 kill("I7 kill (ledger != settled amounts)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5)
 
+# I8 kill (R18): frontier mutation during closing state
+d8 = base_domain()
+d8.frame_status = SearchStatus.CLOSING
+d8.frontier_mutations_during_closing = 1
+kill("I8 kill (frontier mutation during closing)", lambda x: __import__("invariants").i8_closing_frontier_frozen(x), d8)
+survives("I8 clean closing state accepted", lambda x: __import__("invariants").i8_closing_frontier_frozen(x), base_domain())
+
 # I9 kill: visited record for an op that never crossed emission
 d6 = base_domain()
 d6.visited.append(VisitedRecord(visit_key="k", node_id="n1", op_id="ghost-op", visit_no=1))
 kill("I9 kill (visited without dispatch)", lambda x: __import__("invariants").i9_visited_requires_dispatch(x), d6)
 survives("I9 clean history accepted", lambda x: __import__("invariants").i9_visited_requires_dispatch(x), base_domain())
 
-# I10 kill: scope committed beyond its limit (minted ownership)
-d7 = base_domain()
-d7.scope_committed["usd"] = 500   # limit was 100
-kill("I10 kill (scope minted beyond limit)", lambda x: __import__("invariants").i10_scope_cannot_mint(x), d7)
+# I10 kill A: scope committed beyond its limit (minted ownership)
+d7a = base_domain()
+d7a.scope_committed["usd"] = 500   # limit was 100
+kill("I10 kill A (scope minted beyond limit)", lambda x: __import__("invariants").i10_scope_cannot_mint(x), d7a)
+
+# I10 kill B (R18): IntentFrame broken conservation (total > initial)
+d7b = base_domain()
+d7b.intent_available["usd"] = 50
+d7b.intent_spent["usd"] = 60       # 50 + 60 = 110 != 100!
+kill("I10 kill B (IntentFrame conservation broken)", lambda x: __import__("invariants").i10_scope_cannot_mint(x), d7b)
+
+# I10 control probe (R18): valid state where spent > current available (60 > 40)
+d7c = base_domain()
+d7c.intent_available["usd"] = 40
+d7c.intent_spent["usd"] = 60
+d7c.scope_spent["usd"] = 60
+survives("I10 control probe (spent > available accepted when conserved)",
+         lambda x: __import__("invariants").i10_scope_cannot_mint(x), d7c)
 
 print("=" * 70)
 print(f"RESULT: {PASS} passed, {FAIL} failed")

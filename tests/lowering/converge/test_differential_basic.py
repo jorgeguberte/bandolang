@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from scenarios import D01, D02, D03, D04, D05, D06, D13, OpDef, ScenarioProgram
+from scenarios import D01, D02, D03, D04, D05, D06, D13, D14, OpDef, ScenarioProgram
 import transitions as tx
 from differential import compare, classify, lowered_observation
 from harness import CrashInjected, Harness
@@ -43,9 +43,16 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
         cost = op.cost if op.kind == "external" else 0
         charge = op.charge() if op.kind == "external" else 0
 
-        h.step(f"stage-{op.op_id}", tx.stage_local, node, op.op_id, req_id,
-               "usd", cost, dedup_capable=op.dedup_capable, idempotent=op.idempotent,
-               local_only=(op.kind == "local"))
+        # R15: StageLocal attempts to reserve under BudgetScope headroom
+        try:
+            handle = h.step(f"stage-{op.op_id}", tx.stage_local, node, op.op_id, req_id,
+                            "usd", cost, dedup_capable=op.dedup_capable, idempotent=op.idempotent,
+                            local_only=(op.kind == "local"))
+        except tx.TransitionError as e:
+            if "StageLocal.Rejected" in str(e):
+                # Unaffordable node cannot be scheduled; search continues
+                continue
+            raise
 
         handle = h.step(f"emit-{op.op_id}", tx.emit_external, req_id,
                         deliver_unknown=prog.fault_spec.delivery_unknown)
@@ -99,7 +106,6 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                 h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id,
                        False, error=val, abort_on_error=(prog.on_satisfier_error == "abort"))
                 if prog.on_satisfier_error == "abort":
-                    d.scope_committed.update({k: 0 for k in d.scope_committed})
                     h.step("drain", tx.finish_if_drained)
                     break
             elif ok:
@@ -132,12 +138,13 @@ def run(prog: ScenarioProgram) -> None:
 
     # Lowered machine executes autonomously via drive_lowered_program()
     d = ConvergeTransactionDomain()
-    d.scope_limit["usd"] = 100
+    d.scope_limit["usd"] = prog.budget_limit
+    d.intent_initial_total["usd"] = 100
     d.intent_available["usd"] = 100
     h = Harness(d)
     try:
         drive_lowered_program(prog, d, h)
-        low_obs = lowered_observation(d)
+        low_obs = lowered_observation(d, bk=h.bk, initial_available=100)
     except Exception as e:
         print(f"  \u2717 FAIL {prog.name}: lowered crashed: {type(e).__name__}: {e}")
         FAIL += 1
@@ -169,7 +176,7 @@ def run(prog: ScenarioProgram) -> None:
 if __name__ == "__main__":
     print("=" * 70)
     print("CAMPAIGN 2 BASIC — declarative ScenarioProgram, autonomous execution")
-    for prog in (D01, D02, D03, D04, D05, D06, D13):
+    for prog in (D01, D02, D03, D04, D05, D06, D13, D14):
         run(prog)
 
     print("=" * 70)

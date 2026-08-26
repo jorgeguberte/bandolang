@@ -198,3 +198,20 @@ D13 = ScenarioProgram(
     satisfier_map={"root": ("ok", True, "T-reconciled")},
     max_steps=6,
 )
+
+# R15: budget headroom exhaustion / depletion (limit=100, A costs 60, B costs 60)
+D14 = ScenarioProgram(
+    name="D14_budget_depleted_exhausts",
+    initial_frontier=["A"],
+    successors={"A": ["B"], "B": []},
+    node_ops={
+        "A": OpDef("opA", kind="external", cost=60),
+        "B": OpDef("opB", kind="external", cost=60),
+    },
+    satisfier_map={
+        "A": ("ok", False, None),
+        "B": ("ok", False, None),
+    },
+    max_steps=6,
+    budget_limit=100,
+)

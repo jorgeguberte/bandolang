@@ -32,12 +32,13 @@ def run(prog: ScenarioProgram) -> None:
 
     # Lowered machine executes autonomously via drive_lowered_program()
     d = ConvergeTransactionDomain()
-    d.scope_limit["usd"] = 100
+    d.scope_limit["usd"] = prog.budget_limit
+    d.intent_initial_total["usd"] = 100
     d.intent_available["usd"] = 100
     h = Harness(d)
     try:
         drive_lowered_program(prog, d, h)
-        low_obs = lowered_observation(d)
+        low_obs = lowered_observation(d, bk=h.bk, initial_available=100)
     except Exception as e:
         print(f"  \u2717 FAIL {prog.name}: lowered crashed: {type(e).__name__}: {e}")
         FAIL += 1

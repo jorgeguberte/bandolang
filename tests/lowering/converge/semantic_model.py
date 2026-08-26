@@ -121,8 +121,14 @@ class SemanticFrame:
 
             node = self.frontier.pop(0)
             op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
-            succs = list(prog.successors.get(node, []))
+            op_cost = op.charge() if op.kind == "external" else 0
 
+            # R15: CanAfford check against budget_limit in search policy
+            if self.budget_spent + op_cost > self.budget_limit:
+                # Unaffordable operation: cannot expand within budget
+                continue
+
+            succs = list(prog.successors.get(node, []))
             self.expand(node, op, succs)
 
             # Check for environmental cancellation
@@ -160,6 +166,6 @@ class SemanticFrame:
             "outstanding_scope_commitment": 0,
             "unsettled_request_count": 0,
             "attributable_owner_reserved": 0,
-            "intent_available_delta": self.budget_spent,
+            "intent_available_consumed": self.budget_spent,
             "effects": sorted(self.effects),
         }

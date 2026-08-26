@@ -24,16 +24,20 @@ class Divergence:
                 f"  semantic: {self.semantic!r}\n  lowered:  {self.lowered!r}")
 
 
-def lowered_observation(d: ConvergeTransactionDomain, initial_available: int = 100) -> dict:
+def lowered_observation(d: ConvergeTransactionDomain, bk: HarnessBookkeeping | None = None,
+                        initial_available: int = 100) -> dict:
     """Extract the SEMANTICALLY RELEVANT observation from the lowered domain,
-    including ledger and obligation observables (R12/R14)."""
+    including ledger and obligation observables (R12/R14/R17)."""
     status = d.frame_status
     error = None
     if d.closing_reason is not None:
         error = d.closing_reason.error or d.closing_reason.kind
 
     curr_avail = d.intent_available.get("usd", initial_available)
-    avail_delta = initial_available - curr_avail
+    avail_consumed = initial_available - curr_avail
+
+    # R17 (audit): attributable reservations belong specifically to this CF via bookkeeping
+    attributable = sum(bk.reservations_created_by_cf.values()) if bk else sum(d.intent_reserved.values())
 
     return {
         "status": status,
@@ -45,9 +49,9 @@ def lowered_observation(d: ConvergeTransactionDomain, initial_available: int = 1
         "frontier": [n for n in d.frontier],
         "budget_spent": sum(d.scope_spent.values()),
         "outstanding_scope_commitment": sum(d.scope_committed.values()),
-        "unsettled_request_count": sum(1 for s in d.handles.values() if s.settlement is None),
-        "attributable_owner_reserved": sum(d.intent_reserved.values()),
-        "intent_available_delta": avail_delta,
+        "unsettled_request_count": sum(1 for s in d.handles.values() if s.settlement is None and s.state != "Aborted"),
+        "attributable_owner_reserved": attributable,
+        "intent_available_consumed": avail_consumed,
         "effects": sorted(
             f"external({rec.op_id})" for rec in d.outbox.values()
             if d.first_emission_flags.get(rec.request_id) and not rec.local_only
@@ -58,13 +62,13 @@ def lowered_observation(d: ConvergeTransactionDomain, initial_available: int = 1
 def compare(scenario: str, semantic_obs: dict, lowered_obs: dict) -> list[Divergence]:
     """Field-by-field comparison of normalized observations.
     R6 (audit): exact T-value comparison.
-    R14 (audit): compares obligations, commitments, and available deltas."""
+    R14/R17 (audit): compares obligations, commitments, and available consumption."""
     divergences = []
     for key in ("status", "value", "error", "step_count",
                 "satisfaction_attempts", "visited", "frontier",
                 "budget_spent", "outstanding_scope_commitment",
                 "unsettled_request_count", "attributable_owner_reserved",
-                "intent_available_delta", "effects"):
+                "intent_available_consumed", "effects"):
         s, l = semantic_obs.get(key), lowered_obs.get(key)
         if s != l:
             divergences.append(Divergence(scenario, key, s, l))

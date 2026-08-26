@@ -53,13 +53,19 @@ def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
 def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                 request_id: str, resource: str, amount: int,
                 dedup_capable: bool = False, idempotent: bool = False,
-                local_only: bool = False) -> None:
+                local_only: bool = False) -> str:
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("StageLocal outside Searching frame")
+
+    # Sequential in-flight: cannot stage a new request if an unsettled handle exists
+    unsettled = [s for s in d.handles.values() if s.settlement is None and s.state != "Aborted"]
+    if unsettled:
+        raise TransitionError("sequential in-flight: previous request still unsettled (I1/R7)")
+
     # I4 guard: rejection must leave committed/reserved deltas at zero.
-    # R12: intent_available is the unreserved balance in IntentFrame.
+    # R12/R15: headroom accounts for both committed AND spent in BudgetScope
     available = d.intent_available.get(resource, 0)
-    scope_head = d.scope_limit.get(resource, 0) - d.scope_committed.get(resource, 0)
+    scope_head = d.scope_limit.get(resource, 0) - d.scope_spent.get(resource, 0) - d.scope_committed.get(resource, 0)
     if amount > available or amount > scope_head or amount < 0:
         raise TransitionError("StageLocal.Rejected")   # caller sees rejection; no deltas move
 
@@ -73,41 +79,54 @@ def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
         reserved_resource=resource, reserved_amount=amount,
     )
 
+    # R15: StageLocal creates stable InFlightHandle atomically with reservation and outbox
+    handle_id = next_id("h")
+    st = InFlightLifecycleState(
+        handle_id=handle_id, request_id=request_id, state="Staged",
+        reserved_resource=resource, reserved_amount=amount,
+    )
+    d.handles[handle_id] = st
+    d.current_in_flight = st
+    return handle_id
+
 
 # ---------------------------------------------------------------------
 # EmitExternal — first logical emission consumes fuel; transport retries do not.
 # ---------------------------------------------------------------------
 
-def emit_external(d: ConvergeTransactionDomain, request_id: str,
+def emit_external(d: ConvergeTransactionDomain, request_or_handle_id: str,
                   deliver_unknown: bool = False) -> str:
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("EmitExternal outside Searching frame")
+
+    # Find the handle by handle_id or request_id
+    st = d.handles.get(request_or_handle_id)
+    if st is None:
+        hid = _find_handle_by_request(d, request_or_handle_id)
+        if hid:
+            st = d.handles.get(hid)
+
+    request_id = st.request_id if st else request_or_handle_id
     rec = d.outbox.get(request_id)
     if rec is None:
         raise TransitionError("no staged record for request")
 
-    handle_id = next_id("h")
-    st = InFlightLifecycleState(
-        handle_id=handle_id, request_id=request_id,
-        reserved_resource=rec.reserved_resource, reserved_amount=rec.reserved_amount,
-    )
-
-    # R7 (audit): sequential in-flight — a NEW request may not be emitted
-    # while ANY other semantic request remains unsettled. Retries of the SAME
-    # request are exempt (they re-use its handle). A settled-but-not-drained
-    # current_in_flight does not block: settlement discharged the obligation.
-    prior_id = _find_handle_by_request(d, request_id)
-    if prior_id is None:
-        unsettled = [s for s in d.handles.values() if s.settlement is None]
-        if unsettled:
-            raise TransitionError(
-                "sequential in-flight: previous request still unsettled (I1/R7)")
+    if st is None:
+        handle_id = next_id("h")
+        st = InFlightLifecycleState(
+            handle_id=handle_id, request_id=request_id,
+            reserved_resource=rec.reserved_resource, reserved_amount=rec.reserved_amount,
+        )
+        d.handles[handle_id] = st
+    else:
+        handle_id = st.handle_id
 
     if request_id not in d.first_emission_flags:
         # First logical emission: exactly one fuel increment, node advances,
         # visitation recorded (I9, T03).
         d.first_emission_flags[request_id] = True
         d.step_count += 1
+        st.state = "InFlight"
         node_id = rec.node_id or _node_for_op(d, rec.op_id)
         # R1 (audit): emission does NOT carry an implicit satisfier attempt.
         # Only CheckSatisfaction increments satisfaction_attempts.
@@ -119,22 +138,15 @@ def emit_external(d: ConvergeTransactionDomain, request_id: str,
             d.frontier.remove(node_id)      # expanded node leaves the frontier
     else:
         # Transport retry (T04): only legal with adapter guarantees (T04B).
-        prior_id = _find_handle_by_request(d, request_id)
-        prior = d.handles.get(prior_id)
-        if prior is not None and prior.delivery_unknown:
+        if st is not None and st.delivery_unknown:
             if not (rec.dedup_capable or rec.idempotent):
                 raise TransitionError("BLIND RETRY PROHIBITED (T04B)")
-            st.transport_attempts = prior.transport_attempts + 1
-            handle_id = prior_id          # retry RE-USES the same handle
+            st.transport_attempts += 1
         else:
             raise TransitionError("re-emission without DeliveryUnknown")
 
-    if d.current_in_flight is not None and request_id not in d.first_emission_flags \
-            and d.current_in_flight.request_id != request_id:
-        raise TransitionError("in-flight slot occupied (sequential search)")
     st.delivery_unknown = deliver_unknown
     d.current_in_flight = st
-    d.handles[handle_id] = st
     return handle_id
 
 
@@ -192,13 +204,27 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
         raise TransitionError("settlement for unknown handle")
     if st.settlement is not None:
         return          # idempotent: duplicate settlement reconciles nothing extra
+
+    ceiling = st.reserved_amount
+    ceiling_res = st.reserved_resource or resource
+
+    # R16 (audit): receipt adversarial bounds checks
+    if amount < 0:
+        raise TransitionError("negative settlement charge")
+    if st.reserved_amount == 0 and amount > 0:
+        raise TransitionError("ChargeOnZeroReservation: cannot settle positive charge on zero reservation")
+    if amount > ceiling:
+        d.protocol_violations.append({"fatal": f"SettlementExceedsCeiling: charge {amount} > ceiling {ceiling}"})
+        raise FatalInvariantViolation(f"SettlementExceedsCeiling: charge {amount} exceeds reserved ceiling {ceiling}")
+    if resource != ceiling_res:
+        d.protocol_violations.append({"fatal": f"SettlementResourceMismatch: {resource} != {ceiling_res}"})
+        raise FatalInvariantViolation(f"SettlementResourceMismatch: resource {resource} != reserved {ceiling_res}")
+
     st.settlement = SettlementRecord(
         handle_id=handle_id, receipt_id=st.completion.receipt_id if st.completion else "?",
         resource=resource, amount=amount,
     )
-    # R12: ceiling R vs actual charge C <= R
-    ceiling = st.reserved_amount if st.reserved_amount > 0 else amount
-    ceiling_res = st.reserved_resource or resource
+    st.state = "Settled"
 
     # IntentFrame reconciliation:
     # reserved -= R; spent += C; available += (R - C) [unspent refund]
@@ -224,12 +250,12 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
         raise TransitionError("apply for unknown handle")
     if st.applied:
         return False         # idempotent: duplicate apply is a no-op
-    if st.state != "Delivered":
+    if st.state not in ("Delivered", "Settled"):
         raise TransitionError("apply before delivery")
-    if mutate_frontier and d.frame_status == SearchStatus.CLOSING:
+    if mutate_frontier and d.frame_status in (SearchStatus.CLOSING, SearchStatus.CANCELLED,
+                                              SearchStatus.FAILED, SearchStatus.EXHAUSTED):
         raise TransitionError("I8: frontier mutation during Closing")
     st.applied = True
-    st.state = "Applied"
     return True
 
 
@@ -238,11 +264,24 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
 # ---------------------------------------------------------------------
 
 def cancel(d: ConvergeTransactionDomain) -> None:
-    """Owner cancels: Closing(PendingCancelled). Late settlement still settles."""
+    """Owner cancels: Closing(PendingCancelled). Late settlement still settles.
+    R15: Any staged but un-emitted handles are aborted and their reservations released."""
     if d.frame_status == SearchStatus.CLOSING:
         return
     d.frame_status = SearchStatus.CLOSING
     d.closing_reason = ClosingReason("PendingCancelled")
+
+    # Release any staged but not yet emitted handle reservations
+    for hid, st in list(d.handles.items()):
+        if st.state == "Staged":
+            st.state = "Aborted"
+            R = st.reserved_amount
+            res = st.reserved_resource
+            d.intent_reserved[res] = max(0, d.intent_reserved.get(res, 0) - R)
+            d.intent_available[res] = d.intent_available.get(res, 0) + R
+            d.scope_committed[res] = max(0, d.scope_committed.get(res, 0) - R)
+            if d.current_in_flight == st:
+                d.current_in_flight = None
 
 
 def fatal_close(d: ConvergeTransactionDomain, err: str) -> None:
@@ -275,7 +314,7 @@ def finish_if_drained(d: ConvergeTransactionDomain) -> bool:
     if d.frame_status != SearchStatus.CLOSING:
         return False
     unsettled = [s for s in d.handles.values()
-                 if s.settlement is None]
+                 if s.settlement is None and s.state != "Aborted"]
     pending_scope = any(v > 0 for v in d.scope_committed.values())
     if unsettled or pending_scope:
         return False

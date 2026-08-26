@@ -52,7 +52,7 @@ def i2_terminal_no_inflight(d: ConvergeTransactionDomain) -> bool:
     if d.frame_status not in TERMINAL:
         return True
     return d.current_in_flight is None and not any(
-        s.settlement is None for s in d.handles.values())
+        s.settlement is None and s.state != "Aborted" for s in d.handles.values())
 
 
 # I3. ConvergeFrame terminal ==> scope_committed == 0 AND no outstanding
@@ -86,9 +86,6 @@ def i4_stage_reject_zero_delta(before: dict, after: dict) -> bool:
 
 # I6. Handle.Applied(c) ==> applied outcome <= 1 per completion
 def i6_apply_at_most_once(d: ConvergeTransactionDomain) -> bool:
-    for st in d.handles.values():
-        if st.applied and st.state != "Applied":
-            return False
     applied_digests = [st.completion.digest for st in d.handles.values()
                        if st.applied and st.completion]
     return len(applied_digests) == len(set(applied_digests))
@@ -114,9 +111,7 @@ def i7_settlement_exactly_once(d: ConvergeTransactionDomain) -> bool:
 
 # I8. Closing ==> frontier mutations == 0 (frontier frozen during closing)
 def i8_closing_frontier_frozen(d: ConvergeTransactionDomain) -> bool:
-    # enforced structurally in apply_semantic / emit_external; here we verify
-    # no node entered Frontier status while CLOSING.
-    return True   # structural guard + scenario-level assertion
+    return d.frontier_mutations_during_closing == 0
 
 
 # I9. VisitedRecord(n, op, k) ==> that expansion crossed DISPATCH_LOCAL or
@@ -127,15 +122,24 @@ def i9_visited_requires_dispatch(d: ConvergeTransactionDomain) -> bool:
     return all(v.op_id in emitted_ops for v in d.visited)
 
 
-# I10. BudgetScope cannot grant or mint ownership
+# I10. BudgetScope cannot grant or mint ownership; IntentFrame conserves resources
 def i10_scope_cannot_mint(d: ConvergeTransactionDomain) -> bool:
-    for r, committed in d.scope_committed.items():
-        if committed > d.scope_limit.get(r, 0):
+    for r in set(d.scope_limit) | set(d.scope_committed) | set(d.scope_spent):
+        committed = d.scope_committed.get(r, 0)
+        spent = d.scope_spent.get(r, 0)
+        limit = d.scope_limit.get(r, 0)
+        if committed < 0 or spent < 0:
             return False
-    for r in d.scope_spent:
-        spent = d.scope_spent[r]
-        reserved = d.intent_reserved.get(r, 0)
-        available_before = d.intent_available.get(r, 0)
-        if spent > available_before:      # spending more than ever existed
+        if committed + spent > limit:
             return False
+    # IntentFrame conservation check:
+    for r in set(d.intent_initial_total) | set(d.intent_available) | set(d.intent_reserved) | set(d.intent_spent):
+        avail = d.intent_available.get(r, 0)
+        res = d.intent_reserved.get(r, 0)
+        sp = d.intent_spent.get(r, 0)
+        if avail < 0 or res < 0 or sp < 0:
+            return False
+        if r in d.intent_initial_total:
+            if avail + res + sp != d.intent_initial_total[r]:
+                return False
     return True

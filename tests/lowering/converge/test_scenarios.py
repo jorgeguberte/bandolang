@@ -42,6 +42,7 @@ def scenario(name: str):
 def new_domain() -> tuple[ConvergeTransactionDomain, Harness]:
     d = ConvergeTransactionDomain()
     d.scope_limit["usd"] = 100
+    d.intent_initial_total["usd"] = 100
     d.intent_available["usd"] = 100
     return d, Harness(d)
 
@@ -65,6 +66,7 @@ def t01():
     assert_true(len(d.visited) == 0, "visited recorded on rejection")
     assert_true(not d.handles, "handle allocated on rejection")
     assert_true(all(v == 0 for v in d.scope_committed.values()), "commitment persisted")
+    assert_true(len(h.bk.reservations_created_by_cf) == 0, "phantom reservation in bookkeeping on rejection")
 
 
 @scenario("T02_CANCEL_AFTER_STAGE_BEFORE_EMIT")
@@ -80,11 +82,10 @@ def t02():
     except tx.TransitionError:
         pass
     assert_true(d.step_count == 0, "steps counted despite cancel-before-emit")
-    # Release reservation, drain, terminalize
-    d.scope_committed["usd"] -= 10
-    d.intent_reserved["usd"] -= 10
-    d.intent_available["usd"] += 10
-    h.bk.reservations_created_by_cf.pop("r1", None)
+    # Lowered cancel automatically releases staged reservation and clears in-flight:
+    assert_true(d.intent_available["usd"] == 100, f"available not refunded on cancel: {d.intent_available}")
+    assert_true(d.intent_reserved.get("usd", 0) == 0, "reserved not cleared on cancel")
+    assert_true(d.scope_committed.get("usd", 0) == 0, "scope commitment not cleared on cancel")
     h.step("drain", tx.finish_if_drained)
     assert_true(d.frame_status == SearchStatus.CANCELLED,
                 f"R2: cancelled frame must terminalize Cancelled, got {d.frame_status}")
@@ -293,19 +294,19 @@ def t11():
 
 @scenario("T12_SEQUENTIAL_IN_FLIGHT_REGRESSION")
 def t12():
-    """R7/R11: emitting a new request while a previous request is unsettled MUST fail."""
+    """R7/R11/R15: staging a new request while a previous request is unsettled MUST fail."""
     d, h = new_domain()
     h.step("stage-1", tx.stage_local, "n1", "op1", "r1", "usd", 10)
     h1 = h.step("emit-1", tx.emit_external, "r1")
-    h.step("stage-2", tx.stage_local, "n2", "op2", "r2", "usd", 10)
     try:
-        h.step("emit-2-before-settle", tx.emit_external, "r2")
-        raise AssertionError("second request admitted while first request unsettled")
+        h.step("stage-2-before-settle", tx.stage_local, "n2", "op2", "r2", "usd", 10)
+        raise AssertionError("second request staged while first request unsettled")
     except tx.TransitionError as e:
         assert_true("sequential in-flight" in str(e), f"wrong refusal message: {e}")
-    # Settle r1 -> now r2 is admitted
+    # Settle r1 -> now r2 can be staged and emitted
     h.step("deliver-1", tx.admit_completion, h1, "rc1", "d1")
     h.step("settle-1", tx.settle, h1, "usd", 10)
+    h2 = h.step("stage-2-after-settle", tx.stage_local, "n2", "op2", "r2", "usd", 10)
     h.step("emit-2-after-settle", tx.emit_external, "r2")
     assert_true(d.current_in_flight.request_id == "r2", "r2 not admitted after settlement")
 
@@ -328,9 +329,36 @@ def t13():
     assert_true(d.frame_status == SearchStatus.EXHAUSTED, f"expected Exhausted, got {d.frame_status}")
 
 
+@scenario("T14_SETTLEMENT_EXCEEDS_CEILING")
+def t14():
+    """R16: settlement charge exceeding ceiling or charging on zero reservation must be refused."""
+    d, h = new_domain()
+    h.step("stage-10", tx.stage_local, "n14", "op14", "r14", "usd", 10)
+    handle = h.step("emit", tx.emit_external, "r14")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-14", "digest-14")
+    # Charge 15 on ceiling 10 -> raises FatalInvariantViolation
+    try:
+        h.step("settle-exceeds", tx.settle, handle, "usd", 15)
+        raise AssertionError("settlement exceeding ceiling was permitted")
+    except tx.FatalInvariantViolation:
+        pass
+    assert_true(len(d.protocol_violations) > 0, "no protocol violation recorded for settlement exceeding ceiling")
+
+    # Second case: zero reservation cannot settle positive charge
+    d2, h2 = new_domain()
+    h2.step("stage-0", tx.stage_local, "n14b", "op14b", "r14b", "usd", 0)
+    handle2 = h2.step("emit-0", tx.emit_external, "r14b")
+    h2.step("deliver-0", tx.admit_completion, handle2, "rcpt-14b", "digest-14b")
+    try:
+        h2.step("settle-positive-on-zero", tx.settle, handle2, "usd", 5)
+        raise AssertionError("settling positive charge on zero reservation was permitted")
+    except tx.TransitionError as e:
+        assert_true("ChargeOnZeroReservation" in str(e), f"wrong refusal: {e}")
+
+
 # =====================================================================
 print("\n" + "=" * 70)
-print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed (15 total)")
+print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed (16 total)")
 if FAIL:
     sys.exit(1)
 print("Phase D lowering survived every adversarial scenario under full invariant checking.")

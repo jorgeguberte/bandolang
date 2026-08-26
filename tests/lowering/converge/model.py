@@ -131,6 +131,7 @@ class ConvergeTransactionDomain:
     frontier: list[str] = field(default_factory=list)
     visited: list[VisitedRecord] = field(default_factory=list)   # history, not dedup
     best_partial: Optional[Any] = None        # OPAQUE — never touched by transitions
+    frontier_mutations_during_closing: int = 0 # I8 verification counter
 
     # 2. Fuel & attempts
     step_count: int = 0
@@ -147,6 +148,7 @@ class ConvergeTransactionDomain:
     scope_limit: dict[str, int] = field(default_factory=dict)
     scope_committed: dict[str, int] = field(default_factory=dict)
     scope_spent: dict[str, int] = field(default_factory=dict)
+    intent_initial_total: dict[str, int] = field(default_factory=dict)
     intent_available: dict[str, int] = field(default_factory=dict)
     intent_reserved: dict[str, int] = field(default_factory=dict)   # owned by IntentFrame
     intent_spent: dict[str, int] = field(default_factory=dict)
@@ -171,6 +173,7 @@ class ConvergeTransactionDomain:
             frontier=list(self.frontier),
             visited=list(self.visited),
             best_partial=self.best_partial,
+            frontier_mutations_during_closing=self.frontier_mutations_during_closing,
             step_count=self.step_count,
             satisfaction_attempts=self.satisfaction_attempts,
             first_emission_flags=dict(self.first_emission_flags),
@@ -181,10 +184,13 @@ class ConvergeTransactionDomain:
             scope_limit=dict(self.scope_limit),
             scope_committed=dict(self.scope_committed),
             scope_spent=dict(self.scope_spent),
+            intent_initial_total=dict(self.intent_initial_total),
             intent_available=dict(self.intent_available),
             intent_reserved=dict(self.intent_reserved),
             intent_spent=dict(self.intent_spent),
             protocol_violations=[dict(v) for v in self.protocol_violations],
+            satisfied_value=self.satisfied_value,
+            satisfier_error=self.satisfier_error,
         )
 
 
