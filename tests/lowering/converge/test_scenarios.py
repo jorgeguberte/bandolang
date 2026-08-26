@@ -147,7 +147,7 @@ def t06():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op6", "op6", "r6", "usd", 15)
     handle = h.step("emit", tx.emit_external, "r6")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-1", "digest-A")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-1")
     ledger_before = dict(d.scope_spent)
     h.step("settle", tx.settle, handle, "usd", 15)
     after_once = dict(d.scope_spent)
@@ -161,12 +161,15 @@ def t06():
 
 @scenario("T07_RECEIPT_EQUIVOCATION")
 def t07():
+    from model import SpaceOutcome
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op7", "op7", "r7", "usd", 5)
     handle = h.step("emit", tx.emit_external, "r7")
-    h.step("deliver-A", tx.admit_completion, handle, "rcpt-A", "digest-X")
+    h.step("deliver-A", tx.admit_completion, handle, "rcpt-A",
+           semantic_payload=SpaceOutcome(successors=["succA"]))
     try:
-        h.step("deliver-B-conflict", tx.admit_completion, handle, "rcpt-B", "digest-Y")
+        h.step("deliver-B-conflict", tx.admit_completion, handle, "rcpt-B",
+               semantic_payload=SpaceOutcome(successors=["succB"]))
         raise AssertionError("equivocating receipt accepted without violation")
     except tx.FatalInvariantViolation:
         pass
@@ -178,14 +181,17 @@ def t07():
 def t07b():
     """R22: Crash after durable conflict commit, before fatal control flow completes.
     Recovery MUST reconstruct from durable state: conflict and obligations survive."""
+    from model import SpaceOutcome
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op8", "op8", "r8", "usd", 5)
     handle = h.step("emit", tx.emit_external, "r8")
-    h.step("deliver-A", tx.admit_completion, handle, "rcpt-A", "digest-X")
+    h.step("deliver-A", tx.admit_completion, handle, "rcpt-A",
+           semantic_payload=SpaceOutcome(successors=["succA"]))
 
     # Conflict arrives on receipt B: admitted + persisted violation + fatal_close raised
     try:
-        h.step("deliver-B", tx.admit_completion, handle, "rcpt-B", "digest-Y")
+        h.step("deliver-B", tx.admit_completion, handle, "rcpt-B",
+               semantic_payload=SpaceOutcome(successors=["succB"]))
     except tx.FatalInvariantViolation:
         pass
 
@@ -217,7 +223,7 @@ def t08():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op9", "op9", "r9", "usd", 25)
     handle = h.step("emit", tx.emit_external, "r9")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-8", "digest-8")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-8")
     h.step("settle", tx.settle, handle, "usd", 25)
     snapshot = h.snapshot()   # durable: settlement record persisted
     try:
@@ -241,7 +247,7 @@ def t09():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op10", "op10", "r10", "usd", 30)
     handle = h.step("emit", tx.emit_external, "r10")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-9", "digest-9")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-9")
     h.step("settle", tx.settle, handle, "usd", 30)
     pre_state = h.snapshot()
 
@@ -267,7 +273,7 @@ def t10():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op11", "op11", "r11", "usd", 40)
     handle = h.step("emit", tx.emit_external, "r11")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-10", "digest-10")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-10")
     h.step("cancel", tx.cancel)
     assert_true(d.frame_status == SearchStatus.CLOSING, "not Closing after cancel")
     frontier_before = list(d.frontier)
@@ -291,7 +297,7 @@ def t11():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op12", "op12", "r12", "usd", 50)
     handle = h.step("emit", tx.emit_external, "r12")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-11", "digest-11")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-11")
     # fatal failure occurs with in-flight obligation H
     h.step("fatal-close", tx.fatal_close, "FatalInvariantViolation")
     reason = d.closing_reason
@@ -322,9 +328,11 @@ def t12():
     except tx.TransitionError as e:
         assert_true("sequential in-flight" in str(e), f"wrong refusal message: {e}")
     # Settle r1 and apply -> now r2 can be staged and emitted
-    h.step("deliver-1", tx.admit_completion, h1, "rc1", "d1")
+    from model import SpaceOutcome
+    h.step("deliver-1", tx.admit_completion, h1, "rc1",
+           semantic_payload=SpaceOutcome(successors=[]))
     h.step("settle-1", tx.settle, h1, "usd", 10)
-    h.step("apply-1", tx.apply_space_completion, h1, [])
+    h.step("apply-1", tx.apply_space_completion, h1)
     h2 = h.step("stage-2-after-settle", tx.stage_local, "n2", "op2", "r2", "usd", 10)
     h.step("emit-2-after-settle", tx.emit_external, "r2")
     assert_true(d.current_in_flight.request_id == "r2", "r2 not admitted after settlement")
@@ -336,7 +344,7 @@ def t13():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op13", "op13", "r13", "usd", 20)
     handle = h.step("emit", tx.emit_external, "r13")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-13", "digest-13")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-13")
     # Frontier runs dry or fuel exhausted while commitment is pending:
     h.step("exhaust-pending", tx.exhaust)
     assert_true(d.frame_status == SearchStatus.CLOSING, f"expected Closing, got {d.frame_status}")
@@ -354,7 +362,7 @@ def t14():
     d, h = new_domain()
     h.step("stage-10", tx.stage_local, "n14", "op14", "r14", "usd", 10)
     handle = h.step("emit", tx.emit_external, "r14")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-14", "digest-14")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-14")
     # Charge 15 on ceiling 10 -> raises FatalInvariantViolation
     try:
         h.step("settle-exceeds", tx.settle, handle, "usd", 15)
@@ -367,7 +375,7 @@ def t14():
     d2, h2 = new_domain()
     h2.step("stage-0", tx.stage_local, "n14b", "op14b", "r14b", "usd", 0)
     handle2 = h2.step("emit-0", tx.emit_external, "r14b")
-    h2.step("deliver-0", tx.admit_completion, handle2, "rcpt-14b", "digest-14b")
+    h2.step("deliver-0", tx.admit_completion, handle2, "rcpt-14b")
     try:
         h2.step("settle-positive-on-zero", tx.settle, handle2, "usd", 5)
         raise AssertionError("settling positive charge on zero reservation was permitted")
@@ -382,7 +390,7 @@ def t15():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "n15", "op15", "r15", "usd", 20)
     handle = h.step("emit", tx.emit_external, "r15")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-15", "digest-15",
+    h.step("deliver", tx.admit_completion, handle, "rcpt-15",
            semantic_payload=SpaceOutcome(successors=["succA", "succB"]))
     h.step("settle", tx.settle, handle, "usd", 20)
 
@@ -405,7 +413,7 @@ def t16():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "cand16", "opSat", "r16", "usd", 5, is_expansion=False)
     handle = h.step("emit", tx.emit_external, "r16")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-16", "digest-16",
+    h.step("deliver", tx.admit_completion, handle, "rcpt-16",
            semantic_payload=SatisfierOutcome(node_id="cand16", op_id="opSat", satisfied=True, value="T-sat-val"))
     h.step("settle", tx.settle, handle, "usd", 5)
 
@@ -424,12 +432,14 @@ def t16():
 @scenario("T17_REQUEST_ID_REUSE_REJECTED")
 def t17():
     """R43: StageLocal for a new request must reject a historical request_id before any reservation."""
+    from model import SpaceOutcome
     d, h = new_domain()
     h.step("stage-1", tx.stage_local, "n1", "op1", "r_unique", "usd", 10)
     handle1 = h.step("emit-1", tx.emit_external, "r_unique")
-    h.step("deliver-1", tx.admit_completion, handle1, "rcpt-1", "d1")
+    h.step("deliver-1", tx.admit_completion, handle1, "rcpt-1",
+           semantic_payload=SpaceOutcome(successors=[]))
     h.step("settle-1", tx.settle, handle1, "usd", 10)
-    h.step("apply-1", tx.apply_space_completion, handle1, [])
+    h.step("apply-1", tx.apply_space_completion, handle1)
 
     # Now attempt to reuse "r_unique" for a different node / attempt:
     avail_before = d.intent_available["usd"]
@@ -454,7 +464,7 @@ def t18():
     d, h = new_domain()
     h.step("stage", tx.stage_local, "n18", "op18", "r18", "usd", 10)
     handle = h.step("emit", tx.emit_external, "r18")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-18", "d18",
+    h.step("deliver", tx.admit_completion, handle, "rcpt-18",
            semantic_payload=SpaceOutcome(successors=["childX"]))
     h.step("settle", tx.settle, handle, "usd", 10)
 
@@ -468,7 +478,7 @@ def t18():
 
 # =====================================================================
 print("\n" + "=" * 70)
-print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed (16 total)")
+print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed ({PASS + FAIL} total)")
 if FAIL:
     sys.exit(1)
 print("Phase D lowering survived every adversarial scenario under full invariant checking.")

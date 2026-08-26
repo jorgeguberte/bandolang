@@ -255,8 +255,20 @@ def _node_for_op(d: ConvergeTransactionDomain, op_id: str) -> str:
 # Completion admission — durable records; equivocation detected here (T07/T07B)
 # ---------------------------------------------------------------------
 
+def canonical_digest(receipt_id: str, outcome: str = "Success",
+                     semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None) -> str:
+    """R46: Deterministic canonical digest binding receipt_id, outcome, and semantic_payload."""
+    if isinstance(semantic_payload, SpaceOutcome):
+        p_str = f"Space({sorted(semantic_payload.successors)})"
+    elif isinstance(semantic_payload, SatisfierOutcome):
+        p_str = f"Satisfier({semantic_payload.node_id}:{semantic_payload.satisfied}:{semantic_payload.value}:{semantic_payload.error})"
+    else:
+        p_str = "None"
+    return f"digest({receipt_id}:{outcome}:{p_str})"
+
+
 def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
-                     receipt_id: str, digest: str, outcome: str = "Success",
+                     receipt_id: str, digest: Optional[str] = None, outcome: str = "Success",
                      semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None) -> None:
     st = d.handles.get(handle_id)
     if st is None:
@@ -264,6 +276,12 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
 
     if outcome == "Failure" and semantic_payload is not None:
         raise TransitionError("Failure outcome cannot carry success semantic payload (R37)")
+
+    expected_digest = canonical_digest(receipt_id, outcome, semantic_payload)
+    if digest is not None and digest != expected_digest:
+        # R46: digest must bind outcome and semantic_payload
+        raise TransitionError(f"DigestPayloadMismatch: digest '{digest}' does not bind payload (expected '{expected_digest}') (R46)")
+    digest = expected_digest
 
     existing = next((c for c in d.completions.values() if c.handle_id == handle_id), None)
     if existing is not None:
@@ -363,12 +381,10 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
     return True
 
 
-def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str,
-                           succs: list[str]) -> bool:
-    """R27: Atomic space completion incorporation.
+def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool:
+    """R27/R45: Atomic space completion incorporation.
 
-    Atomically applies handle AND adds discovered successors to frontier.
-    Handle is never Applied without its successors being discovered.
+    Autonomously reads and applies durable SpaceOutcome from st.completion.semantic_payload.
     """
     st = d.handles.get(handle_id)
     if st is None:
@@ -377,13 +393,15 @@ def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str,
         return False
     if st.state != "Settled":
         raise TransitionError(f"apply_space_completion called in invalid state '{st.state}' — must be Settled")
+    if st.completion is None or not isinstance(st.completion.semantic_payload, SpaceOutcome):
+        raise TransitionError("apply_space_completion called on handle without durable SpaceOutcome")
 
-    # Discover successors into frontier & nodes
-    discover_successors(d, succs)
+    # Discover successors into frontier & nodes from durable payload
+    discover_successors(d, st.completion.semantic_payload.successors)
 
     st.applied = True
     st.state = "Applied"
-    c_id = f"{handle_id}:{st.completion.receipt_id}" if st.completion else handle_id
+    c_id = f"{handle_id}:{st.completion.receipt_id}"
     d.applied_completions.append(c_id)
     if d.frame_status == SearchStatus.WAITING:
         d.frame_status = SearchStatus.SEARCHING
@@ -391,12 +409,10 @@ def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str,
 
 
 def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str,
-                               node_id: str, op_id: str, satisfied: bool,
-                               value: object = None, error: str = None,
                                abort_on_error: bool = False) -> bool:
-    """R27: Atomic satisfier completion incorporation.
+    """R27/R45: Atomic satisfier completion incorporation.
 
-    Atomically applies satisfier handle AND registers satisfaction outcome.
+    Autonomously reads and applies durable SatisfierOutcome from st.completion.semantic_payload.
     """
     st = d.handles.get(handle_id)
     if st is None:
@@ -405,21 +421,24 @@ def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str,
         return False
     if st.state != "Settled":
         raise TransitionError(f"apply_satisfier_completion called in invalid state '{st.state}' — must be Settled")
+    if st.completion is None or not isinstance(st.completion.semantic_payload, SatisfierOutcome):
+        raise TransitionError("apply_satisfier_completion called on handle without durable SatisfierOutcome")
 
-    if satisfied:
-        d.satisfied_value = value
+    so = st.completion.semantic_payload
+    if so.satisfied:
+        d.satisfied_value = so.value
         d.frame_status = SearchStatus.SATISFIED
         d.current_in_flight = None
-    elif error is not None:
-        d.satisfier_error = error
+    elif so.error is not None:
+        d.satisfier_error = so.error
         if abort_on_error:
-            fatal_close(d, error)
+            fatal_close(d, so.error)
     elif d.frame_status == SearchStatus.WAITING:
         d.frame_status = SearchStatus.SEARCHING
 
     st.applied = True
     st.state = "Applied"
-    c_id = f"{handle_id}:{st.completion.receipt_id}" if st.completion else handle_id
+    c_id = f"{handle_id}:{st.completion.receipt_id}"
     d.applied_completions.append(c_id)
     return True
 
@@ -513,17 +532,15 @@ def recover(d: ConvergeTransactionDomain, snapshot: ConvergeTransactionDomain,
     or committed post-state, never partial (transactional atomicity).
     """
     if crash_point == "after_settlement_before_apply":
-        # Restore durable state, then forward-apply from durable semantic payload.
+        # Restore durable state, then forward-apply from durable semantic payload (R32/R45).
         restored = snapshot.copy()
         for hid, st in restored.handles.items():
             if st.settlement is not None and not st.applied and st.completion is not None:
                 payload = st.completion.semantic_payload
                 if isinstance(payload, SpaceOutcome):
-                    apply_space_completion(d, hid, payload.successors)
+                    apply_space_completion(d, hid)
                 elif isinstance(payload, SatisfierOutcome):
-                    apply_satisfier_completion(d, hid, payload.node_id, payload.op_id,
-                                               payload.satisfied, value=payload.value,
-                                               error=payload.error)
+                    apply_satisfier_completion(d, hid)
                 else:
                     st_live = d.handles.get(hid) or st
                     st_live.applied = True

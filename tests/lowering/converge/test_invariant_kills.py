@@ -97,14 +97,20 @@ d4 = base_domain()
 d4.applied_completions = ["ha:rcpt-1", "ha:rcpt-1"]
 kill("I6 kill A (same CompletionId applied twice)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4)
 
-# I6 kill B (R35): applied handle missing application record (completeness gap)
+# I6 kill B (R39/R44): ghost application record with no Applied handle
 d4c = base_domain()
-st_app = InFlightLifecycleState("ha", "ra", applied=True, state="Applied")
-d4c.handles["ha"] = st_app
-d4c.applied_completions = []
-kill("I6 kill B (applied handle missing application record)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4c)
+d4c.applied_completions = ["ha:rcpt-ghost"]
+d4c.handles = {}
+kill("I6 kill B (ghost application record with no Applied handle)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4c)
 
-# I6 control probe (R28): two different completions with identical digests
+# I6 kill C (R35): applied handle missing application record (forward completeness gap)
+d4d = base_domain()
+st_app = InFlightLifecycleState("ha", "ra", applied=True, state="Applied")
+d4d.handles["ha"] = st_app
+d4d.applied_completions = []
+kill("I6 kill C (applied handle missing application record)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4d)
+
+# I6 control probe (R28/R39): two different completions with identical digests
 d4b = base_domain()
 st_a = InFlightLifecycleState("ha", "ra", applied=True, state="Applied")
 st_b = InFlightLifecycleState("hb", "rb", applied=True, state="Applied")
@@ -115,21 +121,38 @@ d4b.applied_completions = ["ha:rcpt-1", "hb:rcpt-2"]
 survives("I6 control probe (distinct completions with identical digest accepted)",
          lambda x: __import__("invariants").i6_apply_at_most_once(x), d4b)
 
-# I7 kill: scope_spent disagrees with sum of settlement records
+# I7 kill A: scope_spent disagrees with sum of settlement records
 d5 = base_domain()
 hs = InFlightLifecycleState(handle_id="hs", request_id="rs")
 hs.settlement = __import__("model").SettlementRecord("hs", "rcpt", "usd", 10)
 d5.handles = {"hs": hs}
+d5.settlement_reconciliations = {"hs": 1}
 d5.scope_spent["usd"] = 99   # ledger says 99, records say 10
-kill("I7 kill (ledger != settled amounts)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5)
+kill("I7 kill A (ledger != settled amounts)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5)
 
-# I7 control probe (R36): two distinct handles with the same receipt_id
+# I7 kill B (R40/R44): reconciliation count > 1 on same handle
+d5a = base_domain()
+hs_a = InFlightLifecycleState(handle_id="hs_a", request_id="rs_a")
+hs_a.settlement = __import__("model").SettlementRecord("hs_a", "rcpt", "usd", 10)
+d5a.handles = {"hs_a": hs_a}
+d5a.scope_spent["usd"] = 10
+d5a.settlement_reconciliations = {"hs_a": 2}
+kill("I7 kill B (duplicate reconciliation count on same handle)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5a)
+
+# I7 kill C (R40/R44): ghost reconciliation record without matching settled handle
+d5c = base_domain()
+d5c.settlement_reconciliations = {"ghost_h": 1}
+d5c.handles = {}
+kill("I7 kill C (ghost reconciliation record without settled handle)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5c)
+
+# I7 control probe (R36/R40): two distinct handles with the same receipt_id
 d5b = base_domain()
 hs1 = InFlightLifecycleState(handle_id="hs1", request_id="rs1")
 hs2 = InFlightLifecycleState(handle_id="hs2", request_id="rs2")
 hs1.settlement = __import__("model").SettlementRecord("hs1", "same-rcpt", "usd", 10)
 hs2.settlement = __import__("model").SettlementRecord("hs2", "same-rcpt", "usd", 10)
 d5b.handles = {"hs1": hs1, "hs2": hs2}
+d5b.settlement_reconciliations = {"hs1": 1, "hs2": 1}
 d5b.scope_spent["usd"] = 20
 survives("I7 control probe (different handles with same receipt_id accepted)",
          lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5b)

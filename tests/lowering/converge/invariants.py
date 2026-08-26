@@ -84,28 +84,42 @@ def i4_stage_reject_zero_delta(before: dict, after: dict) -> bool:
 #     request_id; a different id is a new semantic attempt by construction.
 
 
-# I6. Handle.Applied(c) ==> semantic_outcome applied <= 1 per CompletionId (R28/R35)
+# I6. Handle.Applied(c) ==> semantic_outcome applied <= 1 per CompletionId (R28/R39 bijection)
 def i6_apply_at_most_once(d: ConvergeTransactionDomain) -> bool:
     # 1. Uniqueness of application records
     if len(d.applied_completions) != len(set(d.applied_completions)):
         return False
-    # 2. Completeness: every handle that is applied must have a corresponding record
+    # 2. Forward completeness: every handle that is applied must have a corresponding record
     for hid, st in d.handles.items():
         if st.applied:
             c_id = f"{hid}:{st.completion.receipt_id}" if st.completion else hid
             if c_id not in d.applied_completions:
                 return False
+    # 3. Backward completeness (R39): every application record must bind to an actual Applied handle
+    applied_handle_cids = {
+        f"{hid}:{st.completion.receipt_id}" if st.completion else hid
+        for hid, st in d.handles.items() if st.applied
+    }
+    for c_id in d.applied_completions:
+        if c_id not in applied_handle_cids:
+            return False
     return True
 
 
-# I7. SettlementRecord(h) ==> ledger reconciliation count == 1 per handle (R36)
+# I7. SettlementRecord(h) ==> ledger reconciliation count == 1 per handle (R40)
 def i7_settlement_exactly_once(d: ConvergeTransactionDomain) -> bool:
-    settled_handles = []
+    # 1. Every settled handle must have exactly 1 independent reconciliation event
     for hid, st in d.handles.items():
         if st.settlement is not None:
-            settled_handles.append(hid)
-    if len(settled_handles) != len(set(settled_handles)):
-        return False
+            if d.settlement_reconciliations.get(hid, 0) != 1:
+                return False
+    # 2. Every reconciliation event must correspond to an actual settled handle
+    for hid, count in d.settlement_reconciliations.items():
+        if count != 1:
+            return False
+        if hid not in d.handles or d.handles[hid].settlement is None:
+            return False
+    # 3. Ledger consistency: scope_spent must equal exact sum of settlement records
     total_by_resource: dict[str, int] = {}
     for st in d.handles.values():
         if st.settlement:

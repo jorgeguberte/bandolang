@@ -58,7 +58,7 @@ class SemanticFrame:
     def expand(self, node_id: str, op: OpDef, succs: list[str],
                delivery_unknown: bool = False) -> list[str]:
         """Expand node: costs 1 step fuel, marks Expanding, records visited,
-        adds external effects/budget if external, adds successors to frontier."""
+        adds external effects/budget if external, adds successors to frontier (R47)."""
         if self.status != Status.SEARCHING or self.step_count >= self.max_steps:
             return []
         self.step_count += 1
@@ -68,11 +68,12 @@ class SemanticFrame:
             self.effects.append(f"external({op.op_id})")
             if not delivery_unknown:
                 self.budget_spent += op.charge()
-        for s in succs:
-            if s not in self.nodes:
-                self.nodes[s] = "Frontier"
-                self.frontier.append(s)
-        return succs
+        if not delivery_unknown:
+            for s in succs:
+                if s not in self.nodes:
+                    self.nodes[s] = "Frontier"
+                    self.frontier.append(s)
+        return succs if not delivery_unknown else []
 
     def check_satisfaction(self, node_id: str,
                            satisfier_map: dict[str, tuple[str, bool, Any]],
@@ -161,10 +162,12 @@ class SemanticFrame:
             # Candidates to check: the expanded node itself, then its successors
             candidates = [node] + succs
             for cand in candidates:
-                # R33/R42: Check satisfaction eligibility
-                if self.satisfaction_attempts >= prog.max_satisfaction_attempts:
+                # R48: Strict PartialOf check — only nodes explicitly declared in partial_map are checkable
+                if cand not in prog.partial_map:
                     continue
-                if prog.partial_map and cand not in prog.partial_map:
+
+                # R42/R49: Check satisfaction attempt limit
+                if self.satisfaction_attempts >= prog.max_satisfaction_attempts:
                     continue
 
                 # R24/R26: effectful satisfier
@@ -197,10 +200,12 @@ class SemanticFrame:
                 if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
                     return self.outcome
 
-        # Post-fuel / partial check (D03)
+        # Post-fuel / partial check (D03 / R49)
         if self.status == Status.SEARCHING and prog.check_partial_after_fuel:
-            if self.check_satisfaction(prog.check_partial_after_fuel, prog.satisfier_map, prog.on_satisfier_error):
-                return self.outcome
+            if (self.satisfaction_attempts < prog.max_satisfaction_attempts and
+                prog.check_partial_after_fuel in prog.partial_map):
+                if self.check_satisfaction(prog.check_partial_after_fuel, prog.satisfier_map, prog.on_satisfier_error):
+                    return self.outcome
 
         if self.status == Status.SEARCHING:
             if self.step_count >= self.max_steps:

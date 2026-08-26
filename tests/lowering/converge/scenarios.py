@@ -1,13 +1,14 @@
-"""scenarios.py — declarative search-space scenario programs for Campaign 2.
+"""scenarios.py — declarative search space specifications for Campaign 2.
 
-R8 (audit): ScenarioProgram is a DECLARATIVE specification of the search space,
-operations, satisfier function, and environmental faults.
-It NEVER contains:
-- scripted step-by-step traces
-- expected end_state oracles
+Frozen principle: tests describe the SEARCH SPACE and ENVIRONMENTAL FAULTS as inputs,
+NOT the expected trajectory or outcome.
 
-Both the semantic model and the lowered model consume this program
-independently and derive their own execution paths.
+R8 (audit): ScenarioProgram replaces the old scripted Scenario/Step lists.
+R14 (audit): fault specs are inputs to the harness, not outcome oracles.
+R33/R48 (audit): explicit partial_map (only nodes with PartialOf(node)==Some(P) are checkable).
+R42/R49 (audit): max_satisfaction_attempts limit.
+R46 (audit): deterministic completion payload binding.
+R47 (audit): DeliveryUnknown does not incorporate successors before completion.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ class OpDef:
     idempotent: bool = True
 
     def charge(self) -> int:
-        return self.cost if self.actual_cost is None else self.actual_cost
+        return self.actual_cost if self.actual_cost is not None else self.cost
 
 
 @dataclass(frozen=True)
@@ -56,14 +57,14 @@ class ScenarioProgram:
     check_partial_after_fuel: Optional[str] = None
     # R24: effectful satisfier definition (own budget/cost, effects trace)
     effectful_satisfier: Optional[OpDef] = None
-    # R33: explicit PartialOf mapping: node_id -> Partial (only partial nodes are checkable)
+    # R33/R48: explicit PartialOf mapping: node_id -> Partial (only partial nodes are checkable)
     partial_map: dict[str, Any] = field(default_factory=dict)
-    # R42: maximum satisfaction attempts before satisfier eligibility is exhausted
+    # R42/R49: maximum satisfaction attempts before satisfier eligibility is exhausted
     max_satisfaction_attempts: int = 10
 
 
 # =====================================================================
-# Basic battery D01–D06 programs
+# Basic battery D01–D06 programs (R48: explicit partial_map)
 # =====================================================================
 
 D01 = ScenarioProgram(
@@ -71,6 +72,7 @@ D01 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op1", kind="local")},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("ok", False, None)},
     max_steps=6,
 )
@@ -82,6 +84,7 @@ D02 = ScenarioProgram(
     initial_frontier=["A"],
     successors={"A": ["B"], "B": []},
     node_ops={"A": OpDef("opA", kind="local"), "B": OpDef("opB", kind="local")},
+    partial_map={"A": "P_A", "B": "P_B"},
     satisfier_map={"A": ("ok", False, None), "B": ("ok", True, "T-value-B")},
     max_steps=6,
 )
@@ -95,6 +98,7 @@ D03 = ScenarioProgram(
         "P": OpDef("opP", kind="external", cost=10),
         "Q": OpDef("opQ", kind="external", cost=10),
     },
+    partial_map={"P": "P_P", "Q": "P_Q", "partial_candidate": "P_cand"},
     satisfier_map={
         "P": ("ok", False, None),
         "Q": ("ok", False, None),
@@ -109,6 +113,7 @@ D04 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op4", kind="external", cost=8)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("ok", False, None)},
     max_steps=6,
 )
@@ -118,6 +123,7 @@ D05 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op5", kind="external", cost=9)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("err", False, "satisfier exploded")},
     on_satisfier_error="abort",
     max_steps=6,
@@ -128,6 +134,7 @@ D06 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("opExt", kind="external", cost=12)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("ok", True, "T-ext")},
     max_steps=6,
 )
@@ -142,6 +149,7 @@ D07 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op7", kind="external", cost=10)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("ok", False, None)},
     max_steps=6,
     fault_spec=FaultSpec(delivery_unknown=True),
@@ -152,6 +160,7 @@ D08 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op8", kind="external", cost=15, dedup_capable=True)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("ok", True, "T-retry")},
     max_steps=6,
     fault_spec=FaultSpec(delivery_unknown=True, safe_retry=True),
@@ -162,6 +171,7 @@ D09 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op9", kind="external", cost=20)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("ok", False, None)},
     max_steps=6,
     fault_spec=FaultSpec(duplicate_completion=True),
@@ -172,6 +182,7 @@ D10 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op10", kind="external", cost=25)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("ok", True, "T-crash")},
     max_steps=6,
     fault_spec=FaultSpec(crash_after_settlement=True),
@@ -182,6 +193,8 @@ D11 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op11", kind="external", cost=40)},
+    partial_map={"root": "P_root"},
+    satisfier_map={"root": ("ok", False, None)},
     max_steps=6,
     fault_spec=FaultSpec(cancel_in_flight=True),
 )
@@ -191,6 +204,7 @@ D12 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op12", kind="external", cost=50)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("err", False, "fatal protocol breach")},
     on_satisfier_error="abort",
     max_steps=6,
@@ -202,6 +216,7 @@ D13 = ScenarioProgram(
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("op13", kind="external", cost=10, actual_cost=6)},
+    partial_map={"root": "P_root"},
     satisfier_map={"root": ("ok", True, "T-reconciled")},
     max_steps=6,
 )
@@ -215,6 +230,7 @@ D14 = ScenarioProgram(
         "A": OpDef("opA", kind="external", cost=60),
         "B": OpDef("opB", kind="external", cost=60),
     },
+    partial_map={"A": "PA", "B": "PB"},
     satisfier_map={
         "A": ("ok", False, None),
         "B": ("ok", False, None),
@@ -233,6 +249,7 @@ D15 = ScenarioProgram(
         "B": OpDef("opB", kind="external", cost=60, actual_cost=10), # ceiling 60 > remaining 40!
         "C": OpDef("opC", kind="local"),
     },
+    partial_map={"A": "PA", "B": "PB", "C": "PC"},
     satisfier_map={
         "A": ("ok", False, None),
         "B": ("ok", False, None),
@@ -242,7 +259,7 @@ D15 = ScenarioProgram(
     budget_limit=100,
 )
 
-# R24/R33: effectful satisfier coverage (own budget, effect trace, settlement, explicit PartialOf)
+# R24/R33/R48: effectful satisfier coverage (own budget, effect trace, settlement, explicit PartialOf)
 D16 = ScenarioProgram(
     name="D16_effectful_satisfier",
     initial_frontier=["root"],
@@ -291,6 +308,7 @@ D18_WAITING = ScenarioProgram(
         "A": OpDef("opA", kind="external", cost=10),
         "B": OpDef("opB", kind="local"),
     },
+    partial_map={},
     fault_spec=FaultSpec(delivery_unknown=True),
     max_steps=6,
     budget_limit=100,
@@ -305,6 +323,7 @@ D19_CRASH_RECOVERY = ScenarioProgram(
         "root": OpDef("opRoot", kind="external", cost=10),
         "childB": OpDef("opB", kind="local"),
     },
+    partial_map={"childB": "P_childB"},
     satisfier_map={
         "childB": ("ok", True, "T-recovered"),
     },
@@ -322,26 +341,46 @@ D20_TARGETED_DELIVERY_UNKNOWN = ScenarioProgram(
         "A": OpDef("opA", kind="external", cost=20),
         "B": OpDef("opB", kind="external", cost=10),
     },
+    partial_map={},
     fault_spec=FaultSpec(delivery_unknown_ops=("opB",)),
     max_steps=6,
     budget_limit=100,
 )
 
-# R42: max_satisfaction_attempts limit exhaustion
+# R42/R49: max_satisfaction_attempts limit exhaustion across multiple partial candidates
 D21_SATISFACTION_LIMIT = ScenarioProgram(
     name="D21_satisfaction_attempt_limit_exhausts",
     initial_frontier=["root"],
-    successors={"root": []},
+    successors={"root": ["P1", "P2"]},
     node_ops={
         "root": OpDef("opRoot", kind="local"),
+        "P1": OpDef("opP1", kind="local"),
+        "P2": OpDef("opP2", kind="local"),
     },
     partial_map={
-        "root": "PartialRoot",
+        "P1": "Part1",
+        "P2": "Part2",
     },
     satisfier_map={
-        "root": ("ok", False, None),
+        "P1": ("ok", False, None),
+        "P2": ("ok", True, "T-unreached-attempt-blocked"),
     },
     max_steps=6,
     budget_limit=100,
     max_satisfaction_attempts=1,
+)
+
+# R47: DeliveryUnknown on external expansion does not incorporate successors
+D22_DELIVERY_UNKNOWN_NO_SUCCESSORS = ScenarioProgram(
+    name="D22_delivery_unknown_does_not_incorporate_successors",
+    initial_frontier=["A"],
+    successors={"A": ["B"], "B": []},
+    node_ops={
+        "A": OpDef("opA", kind="external", cost=10),
+        "B": OpDef("opB", kind="local"),
+    },
+    partial_map={},
+    fault_spec=FaultSpec(delivery_unknown=True),
+    max_steps=6,
+    budget_limit=100,
 )

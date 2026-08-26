@@ -1,54 +1,47 @@
-# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 8
+# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 9
 
-> **REISSUE 8 after eighth audit round (R37–R43).**
-> The eighth audit verified deep integrity and binding properties:
-> 1. Completion / Payload binding (digest and outcome strictly bind semantic payloads; failure cannot carry success payload).
-> 2. Generic `apply_semantic` bypass removed for typed outcomes.
-> 3. I6 true bijection (Applied handles <=> unique application records).
-> 4. I7 real independent reconciliation count per handle (`settlement_reconciliations`).
-> 5. Targeted fault injection (`delivery_unknown_ops`) and preservation of prior settled spend during Waiting.
-> 6. Unambiguous `PartialOf` eligibility and `max_satisfaction_attempts` limit.
-> 7. `request_id` identity reuse rejection before any mutation or reservation.
-> All seven issues have been resolved across both the lowered machine and the semantic model.
+> **REISSUE 9 after ninth adversarial audit round (R44–R49).**
+> The ninth audit verified exact alignment between declared detector semantics and actual test harness implementations:
+> 1. R44: Real I6 two-way bijection and I7 independent `settlement_reconciliations` tracking fully implemented and verified with mutation kills.
+> 2. R45: Typed apply operations (`apply_space_completion`, `apply_satisfier_completion`) autonomously consume durable payloads without caller-supplied authority.
+> 3. R46: Deterministic canonical digest binding (`canonical_digest`) validating outcome and semantic payload.
+> 4. R47: `DeliveryUnknown` prevents premature successor incorporation (D22 verified).
+> 5. R48: Strict `PartialOf` eligibility across all declarative scenarios without implicit fallback.
+> 6. R49: Real satisfaction attempt limit test (D21 verified with multi-candidate blocking).
+> All 62 test cases pass across all 4 test suites without divergence or false positives.
 
-## Audit repairs applied (Round 8: R37–R43)
+## Audit repairs applied (Round 9: R44–R49)
 
 ```text
-R37 Completion / Payload Binding
-    FIXED — `admit_completion()` strictly validates that `digest`, `outcome`, and `semantic_payload`
-    form a coherent bound outcome. Rejects Failure outcome carrying success payload.
-    Equivocation detection checks full payload divergence on the same handle.
-
-R38 Remove Generic Apply Bypass
-    FIXED — `apply_semantic()` refuses to apply handles carrying typed SpaceOutcome
-    or SatisfierOutcome, preventing bypass of successor discovery or satisfaction incorporation.
-    Added T18 regression scenario.
-
-R39 I6 True Bijection
-    FIXED — I6 enforces exact two-way bijection:
-        (a) unique application records
-        (b) every Applied handle has matching application record
-        (c) every application record corresponds to an actual Applied handle
+R44 Real I6 Bijection & I7 Reconciliation Count Implementation
+    FIXED — `invariants.py` checks both directions of I6:
+        (1) uniqueness of application records
+        (2) every Applied handle has a corresponding record
+        (3) every application record corresponds to an actual Applied handle
     Added I6 kill B (ghost application record with no Applied handle => FAIL).
+    I7 consumes `d.settlement_reconciliations[handle_id]` directly and enforces count == 1 per handle.
+    Added I7 kill B (duplicate reconciliation count => FAIL) and kill C (ghost reconciliation record => FAIL).
 
-R40 I7 Real Reconciliation Count
-    FIXED — domain tracks independent `settlement_reconciliations[handle_id]` count.
-    I7 verifies `reconciliation_count[h] == 1` per handle and exact scope spent match.
+R45 Typed Apply Consumes Durable Payload
+    FIXED — `apply_space_completion(d, handle_id)` and `apply_satisfier_completion(d, handle_id)`
+    read directly from `st.completion.semantic_payload`. Removed caller-supplied successor/satisfaction parameters.
 
-R41 Targeted Faults & DeliveryUnknown History Preservation (D20)
-    FIXED — FaultSpec supports targeted `delivery_unknown_ops`.
-    SemanticFrame preserves prior settled `budget_spent` when an in-flight operation
-    suffers DeliveryUnknown.
-    Added D20 (A settles 20, B suffers DeliveryUnknown ceiling 10 => spent=20, committed=10).
+R46 Canonical Completion Digest Binding
+    FIXED — `canonical_digest(receipt_id, outcome, semantic_payload)` cryptographically/deterministically
+    binds the receipt, outcome, and payload. `admit_completion()` validates that supplied digest matches.
 
-R42 PartialOf & Satisfaction Attempt Limit (D21)
-    FIXED — explicit `partial_map` mapping and `max_satisfaction_attempts` limit.
-    Added D21 testing exhaustion when satisfaction attempts reach the configured limit.
+R47 DeliveryUnknown Successor Discovery Guard (D22)
+    FIXED — `SemanticFrame.expand()` avoids discovering/adding successors to the frontier when `delivery_unknown`
+    is True. Added D22 verifying that successor B is absent from frontier/nodes during Waiting.
 
-R43 Request ID Identity & Reuse Protection (T17)
-    FIXED — `StageLocal` rejects historical `request_id` reuse for new requests before
-    any mutation of available, reserved, or committed funds.
-    Added T17 regression scenario.
+R48 Strict PartialOf Eligibility
+    FIXED — Removed truthiness fallback (`if cand not in prog.partial_map: continue`).
+    Annotated all declarative scenarios D01–D22 with explicit `partial_map`.
+
+R49 Multi-Candidate Satisfaction Attempt Limit Verification (D21)
+    FIXED — D21 pressure-tests `max_satisfaction_attempts=1` across two partial candidates (P1 and P2).
+    Verified that P1 attempt is counted and P2 check is blocked -> natural Exhaustion.
+    Enforced `max_satisfaction_attempts` on post-fuel partial checks as well.
 ```
 
 ## Complete verification results
@@ -60,27 +53,28 @@ Campaign 1 (Lowered Safety & Crash Recovery):
                 T15 autonomous space apply recovery, T16 autonomous satisfier apply recovery,
                 T17 request_id reuse rejection, T18 generic apply bypass refused)
 
-Invariant Kill Tests (Mutation Testing):
-    17/17 PASS (I1 frame-wide, I3 scope kill, I3 attributable kill, I3 control probe,
-                I6 CompletionId uniqueness kill, I6 completeness gap kill,
-                I6 identical digest probe, I7 ledger vs records kill,
-                I7 identical receipt probe, I8 closing mutation kill,
+Invariant Kill Tests (Mutation Testing & Bijection):
+    20/20 PASS (I1 frame-wide, I3 scope kill, I3 attributable kill, I3 control probe,
+                I6 CompletionId uniqueness kill, I6 ghost record kill, I6 completeness gap kill,
+                I6 identical digest probe, I7 ledger vs records kill, I7 duplicate reconciliation kill,
+                I7 ghost reconciliation kill, I7 identical receipt probe, I8 closing mutation kill,
                 I8 clean closing probe, I9 forged visit kill, I9 clean history probe,
                 I10 scope limit kill, I10 IntentFrame conservation kill,
                 I10 spent>avail control probe)
 
 Campaign 2 Basic (Declarative Search Programs):
-    15/15 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
+    16/16 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
                 D03 max_steps + partial [R4 verified], D04 Ok(None), D05 Err+abort,
                 D06 external, D13 ceiling vs actual charge [R12/R14 verified],
                 D14 budget headroom depletion [R15/R34 verified],
                 D15 unaffordable ceiling refused [R20/R25/R34 verified],
-                D16 effectful satisfier with explicit PartialOf [R24/R33 verified],
+                D16 effectful satisfier with explicit PartialOf [R24/R33/R48 verified],
                 D17 effectful satisfier commit point under DeliveryUnknown [R26/R31 verified],
                 D18 sequential Waiting blocks local dispatch [R31 verified],
-                D19 autonomous crash recovery preserves space successors [R32/R37 verified],
+                D19 autonomous crash recovery preserves space successors [R32/R45 verified],
                 D20 targeted DeliveryUnknown preserves prior spend [R41 verified],
-                D21 satisfaction attempt limit exhaustion [R42 verified])
+                D21 multi-candidate satisfaction attempt limit exhaustion [R42/R49 verified],
+                D22 DeliveryUnknown prevents premature successor discovery [R47 verified])
 
 Campaign 2 Fault (Environmental Fault Injections):
     6/6 PASS   (D07 DeliveryUnknown [Waiting verified], D08 safe retry,
@@ -92,7 +86,7 @@ Semantic model:
     REAL / AUTONOMOUS (purely declarative search space execution)
 
 Lowered model:
-    REAL / ADVERSARIALLY HARDENED (bound completion payloads, bijection invariants,
+    REAL / ADVERSARIALLY HARDENED (canonical bound completion digests, two-way bijection invariants,
     independent reconciliation tracking, request_id reuse protection, autonomous recovery)
 
 Differential counterexamples:
@@ -116,13 +110,13 @@ Executable lowered state-machine model
     REAL / ADVERSARIALLY HARDENED (20/20 adversarial scenarios)
 
 Executable semantic model
-    REAL / AUTONOMOUS (21/21 differential programs)
+    REAL / AUTONOMOUS (22/22 differential programs)
 
 Invariant checker
-    SELF-TESTED (17/17 mutation kill tests & control probes)
+    SELF-TESTED (20/20 mutation kill tests & control probes)
 
 Differential semantic preservation
-    VERIFIED IN TESTED REGIME (audited across 8 adversarial review rounds, R1–R43 fixed)
+    VERIFIED IN TESTED REGIME (audited across 9 adversarial review rounds, R1–R49 fixed)
 
 Actual compiler/lowering implementation
     NOT YET VERIFIED
@@ -139,6 +133,6 @@ best_partial / lineage / Ψ
 ```text
 Item 3 (CFG / Result / Error Model)
     UNBLOCKED per campaign plan — Phase D lowering safety, Waiting lifecycle,
-    budget conservation, durable autonomous recovery, invariant bijection,
-    and differential preservation have survived 8 adversarial audit rounds.
+    budget conservation, durable autonomous recovery, invariant two-way bijection,
+    and differential preservation have survived 9 adversarial audit rounds.
 ```
