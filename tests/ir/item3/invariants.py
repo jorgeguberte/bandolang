@@ -133,18 +133,15 @@ def check_all_invariants(state: ExecutionState, context: dict[str, Any] | None =
     else:
         results["I3.1"] = "VIOLATION: fact present in Ψ without dominating proof"
 
-    # I3.2 No eager latent discharge
+    # I3.2 No eager latent discharge (G2: strict NOT_APPLICABLE if unrefined_vars is not explicitly provided)
     unref = ctx.get("unrefined_vars")
-    if unref is not None:
+    if unref is not None and len(unref) > 0:
         if i3_2_no_eager_latent_discharge(unref, state):
             results["I3.2"] = "PASS"
         else:
             results["I3.2"] = "VIOLATION: unrefined result leaked latent postcondition into Ψ"
     else:
-        if i3_2_no_eager_latent_discharge(list(state.var_latent.keys()), state):
-            results["I3.2"] = "PASS"
-        else:
-            results["I3.2"] = "VIOLATION: latent postconditions leaked into Ψ before refinement"
+        results["I3.2"] = "NOT_APPLICABLE: requires unrefined_vars list to evaluate"
 
     # I3.3 CFG must-fact merge
     if "pred_facts" in ctx and "merge_facts" in ctx:
@@ -161,17 +158,17 @@ def check_all_invariants(state: ExecutionState, context: dict[str, Any] | None =
     else:
         results["I3.4"] = "VIOLATION: multiple mutually exclusive outcome tags active simultaneously in Ψ"
 
-    # I3.5 No false clean failure
+    # I3.5 No false clean failure (G2: strict NOT_APPLICABLE if outcome/evidence context is absent)
     applied = ctx.get("confirmed_applied_effects")
     outcome_val = ctx.get("outcome_val")
-    if outcome_val is not None or applied is not None:
+    if outcome_val is not None or (applied is not None and len(applied) > 0):
         val = outcome_val if outcome_val is not None else next((v for v in state.env.values() if isinstance(v, (ErrVal, ActFailureVal, ActPartialVal, DeliveryUnknownVal, SettlementUnknownVal))), None)
-        if i3_5_no_false_clean_failure(val, confirmed_applied_effects=applied):
+        if val is not None and i3_5_no_false_clean_failure(val, confirmed_applied_effects=applied):
             results["I3.5"] = "PASS"
         else:
             results["I3.5"] = "VIOLATION: clean Failure asserted on operation with partial mutations or ambiguity"
     else:
-        results["I3.5"] = "PASS"
+        results["I3.5"] = "NOT_APPLICABLE: requires outcome_val or confirmed_applied_effects context"
 
     # I3.6 Handle effect monotonicity
     if "left_handle" in ctx and "right_handle" in ctx and "joined_handle" in ctx:

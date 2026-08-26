@@ -1,10 +1,24 @@
-# SOMA-IR Item 3 — Execution Report (CFG / Result / Error Model) — FINAL ACCEPTANCE (F1–F3)
+# SOMA-IR Item 3 — Execution Report (CFG / Result / Error Model) — FINAL ACCEPTANCE (G1 & G2)
 
-> **Item 3 integrated execution report after final acceptance gate.**
-> 1. F1: Exact observable differential comparator comparing strict `Fact` object equality ($\text{sem.ctx.psi} == \text{cfg\_state.psi}$) without name+arity shortcuts, exact latent postcondition sets, block-argument bindings, derived handle $\Sigma$, concrete value lineage, outcome variant, observable effects ($\Sigma$), and status. Verified with 2 negative mutations proving fact argument mismatches and extra conditional facts fail differential checks.
-> 2. F2: Completed `check_all_invariants` contract returning explicit `PASS`, `VIOLATION`, or `NOT_APPLICABLE(reason)` across all invariants I3.1–I3.8.
+> **Item 3 integrated execution report after final acceptance validation.**
+> 1. G1: Complete observable comparator comparing all 10 declared SOMA-IR observables inside `compare_exact_observables`:
+>    * Exact active $\Psi$ path facts (strict Fact object equality)
+>    * Latent postcondition sets
+>    * Block argument bindings & values
+>    * Block argument / variable types
+>    * Derived Handle $\Sigma$ (semantic join type vs CFG-derived join type)
+>    * Concrete value lineage
+>    * Outcome variant
+>    * Observable external effects trace ($\Sigma$)
+>    * Execution status
+>    * Protocol violations
+>    * Verified with 4 negative mutation proofs (wrong fact args, extra CFG fact, wrong lineage, wrong outcome variant).
+> 2. G2: Strict `NOT_APPLICABLE` semantics in `check_all_invariants`:
+>    * I3.2 returns `NOT_APPLICABLE` when explicit unrefined_vars context is absent (never infers unrefined variables).
+>    * I3.5 returns `NOT_APPLICABLE` when outcome/effect evidence is absent (never returns PASS from absence of evidence).
+>    * Evaluated and verified via aggregate tests in mutation kills suite.
 > 3. F3: R15 exercises real CFG dataflow verification over mismatched predecessor handles via `CFGDataflowAnalyzer(prog).analyze()`, strictly asserting `TypeError`.
-> All 49 Item 3 test cases (21 golden, 15 kills, 13 exact differential) and all 81 Phase D regression tests pass across the repository.
+> All 53 Item 3 test cases (21 golden, 17 kills, 15 exact differential) and all 81 Phase D regression tests pass across the repository.
 
 ---
 
@@ -17,7 +31,7 @@ my-wiki
 
 bandolang
     executable harness / language experiments
-    baseline: 765e48aa25f8263595f9c42a20e36365b210ce84
+    baseline: 0c86f07297e68fa7db9b4869c9b13997db707019
 
 bando (soma-docs)
     published Fumadocs docs
@@ -29,7 +43,7 @@ bando (soma-docs)
 ## 2. Normative Obligations & Architecture
 
 ```text
-Track A — RESULT-LATENT-POSTCOND (J1, F1)
+Track A — RESULT-LATENT-POSTCOND (J1, F1, G1)
     Result<T,E> binds LatentPostconditions(on_ok, on_err).
     Postconditions remain LATENT on SSA definitions and NEVER enter Ψ before refinement.
     `SwitchResult` branches instantiate postconditions bound to the block argument SSA symbol.
@@ -37,19 +51,19 @@ Track A — RESULT-LATENT-POSTCOND (J1, F1)
     Branch-specific facts are discarded on merge; common facts are preserved.
     Loop fixed-point analysis proves iteration facts do not leak to headers or exit paths without proof.
 
-Track B — ACT-SETTLEMENT-OUTCOME (J3, F1)
+Track B — ACT-SETTLEMENT-OUTCOME (J3, F1, G1, G2)
     Physical ambiguity (DeliveryUnknown, SettlementUnknown) is strictly disjoint from Definite Failure.
     `ActOutcome` / `EffectOutcome` distinguishes Completed(Result<T,E>) vs Pending(Unknown).
     `await` on ChildHandle suspends while settlement is unknown; does not fabricate Err.
     Confirmed failure (ConfirmedNotDelivered) becomes clean Err only upon definite certainty.
 
-Track C — ACT-PARTIAL-COMPLETION (J3, F1)
+Track C — ACT-PARTIAL-COMPLETION (J3, F1, G1, G2)
     Partial completion (A+B applied, C+D failed) carries PartialEffectReport.
     Partial is distinct from Success, clean Failure, and Unknown.
     Adapters declaring transactional/atomic contracts reject Partial with FatalProtocolViolation.
     Success-only facts do NOT materialize in Partial branch.
 
-Track D — HANDLE-EFFECT-JOIN (J2, J3, F1, F3)
+Track D — HANDLE-EFFECT-JOIN (J2, J3, F1, F3, G1)
     Derived ChildHandle block argument types compute may-effect union Σ_join = ⋃_P Σ_P from all predecessor edges.
     Type mismatch between predecessor handles is strictly rejected at CFG dataflow verification (F3).
     May-effects summary Σ_join does not invent concrete execution provenance.
@@ -86,8 +100,8 @@ Golden Scenarios Battery (R01–R18, X1–X4) — F3 Verified:
     - X2_PARTIAL_MERGE_INTEGRATION: static dataflow analyzer verifies CompleteSuccess + PartialCompletion merge [PASS]
     - X3_X4_HANDLE_AWAIT_REFINEMENT_INTEGRATION: handle join + await neutrality + result refinement [PASS]
 
-Adversarial Mutation Kills (K1–K12 & Probes) — F2 Verified:
-    15/15 PASS
+Adversarial Mutation Kills (K1–K12 & Probes) — G2 Verified:
+    17/17 PASS
     - K1 Eager postcondition leak: detector flagged unrefined fact in Ψ [PASS]
     - K2 Err receives Ok fact: detector flagged contradiction [PASS]
     - K3 Union instead of intersection merge: detector flagged non-intersection fact [PASS]
@@ -101,9 +115,11 @@ Adversarial Mutation Kills (K1–K12 & Probes) — F2 Verified:
     - K11 Await reattributes child effects: detector flagged polluted effect trace [PASS]
     - K12 Branch fact survives merge: detector flagged missing intersection [PASS]
     - Control Probes: 3/3 clean valid states accepted [PASS]
+    - Aggregate Missing Contexts: I3.2, I3.3, I3.5, I3.6, I3.7, I3.8 return NOT_APPLICABLE [G2 PASS]
+    - Aggregate Supplied Violating Context: I3.2 returns VIOLATION [G2 PASS]
 
-Exact Observable Differential Semantics Battery (F1):
-    13/13 PASS
+Exact Observable Differential Semantics Battery (G1):
+    15/15 PASS
     - D_R01_ok_postcondition [PASS]
     - D_R02_err_isolation [PASS]
     - D_R08_unknown_not_err [PASS]
@@ -115,8 +131,10 @@ Exact Observable Differential Semantics Battery (F1):
     - D_handle_join_provenance_separation [PASS]
     - D_X1_result_act_integration [PASS]
     - D_X3_X4_handle_await_refinement [PASS]
-    - MUTATION_same_fact_name_wrong_args: exact comparator caught mismatched fact args [F1 PASS]
-    - MUTATION_extra_conditional_cfg_fact: exact comparator caught extra spurious CFG fact [F1 PASS]
+    - MUTATION_same_fact_name_wrong_args: caught mismatched fact args [G1 PASS]
+    - MUTATION_extra_conditional_cfg_fact: caught extra spurious CFG fact [G1 PASS]
+    - MUTATION_wrong_concrete_lineage: caught forged lineage [G1 PASS]
+    - MUTATION_wrong_outcome_variant: caught wrong outcome variant [G1 PASS]
 
 Phase D Lowering Regression Battery:
     81/81 PASS (zero regressions across all 4 Phase D suites)

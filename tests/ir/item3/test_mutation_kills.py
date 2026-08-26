@@ -275,6 +275,33 @@ survives("PROBE_CLEAN_AWAIT_NEUTRALITY", lambda: i3_7_await_effect_neutrality([]
 
 
 # =====================================================================
+# G2 — Aggregate check_all_invariants Strict NOT_APPLICABLE Semantics
+# =====================================================================
+
+def test_aggregate_missing_contexts():
+    st = ExecutionState(current_block="entry")
+    res = check_all_invariants(st)
+    assert res["I3.2"].startswith("NOT_APPLICABLE"), f"I3.2 without context must be NOT_APPLICABLE, got {res['I3.2']}"
+    assert res["I3.5"].startswith("NOT_APPLICABLE"), f"I3.5 without context must be NOT_APPLICABLE, got {res['I3.5']}"
+    assert res["I3.3"].startswith("NOT_APPLICABLE"), f"I3.3 without context must be NOT_APPLICABLE, got {res['I3.3']}"
+    assert res["I3.6"].startswith("NOT_APPLICABLE"), f"I3.6 without context must be NOT_APPLICABLE, got {res['I3.6']}"
+    assert res["I3.7"].startswith("NOT_APPLICABLE"), f"I3.7 without context must be NOT_APPLICABLE, got {res['I3.7']}"
+    assert res["I3.8"].startswith("NOT_APPLICABLE"), f"I3.8 without context must be NOT_APPLICABLE, got {res['I3.8']}"
+    return True
+
+survives("AGGREGATE_MISSING_CONTEXTS_RETURN_NOT_APPLICABLE", test_aggregate_missing_contexts)
+
+
+def test_aggregate_supplied_violating_context():
+    st = ExecutionState(current_block="entry", var_latent={"r": LatentPostconditions(on_ok=(FactTemplate("LeakedFact", ("$val",)),))}, psi=frozenset([Fact("LeakedFact", ("x",))]))
+    res = check_all_invariants(st, context={"unrefined_vars": ["r"]})
+    assert res["I3.2"].startswith("VIOLATION"), f"I3.2 with leaked fact must report VIOLATION, got {res['I3.2']}"
+    return True
+
+survives("AGGREGATE_SUPPLIED_VIOLATING_CONTEXT_REPORTS_VIOLATION", test_aggregate_supplied_violating_context)
+
+
+# =====================================================================
 print("\n" + "=" * 70)
 print(f"ITEM 3 MUTATION KILLS RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")
 if FAIL:
