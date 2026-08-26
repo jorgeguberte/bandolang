@@ -289,9 +289,28 @@ def t11():
                 f"expected Failed(err), got {d.frame_status}")
 
 
+@scenario("T12_SEQUENTIAL_IN_FLIGHT_REGRESSION")
+def t12():
+    """R7/R11: emitting a new request while a previous request is unsettled MUST fail."""
+    d, h = new_domain()
+    h.step("stage-1", tx.stage_local, "n1", "op1", "r1", "usd", 10)
+    h1 = h.step("emit-1", tx.emit_external, "r1")
+    h.step("stage-2", tx.stage_local, "n2", "op2", "r2", "usd", 10)
+    try:
+        h.step("emit-2-before-settle", tx.emit_external, "r2")
+        raise AssertionError("second request admitted while first request unsettled")
+    except tx.TransitionError as e:
+        assert_true("sequential in-flight" in str(e), f"wrong refusal message: {e}")
+    # Settle r1 -> now r2 is admitted
+    h.step("deliver-1", tx.admit_completion, h1, "rc1", "d1")
+    h.step("settle-1", tx.settle, h1, "usd", 10)
+    h.step("emit-2-after-settle", tx.emit_external, "r2")
+    assert_true(d.current_in_flight.request_id == "r2", "r2 not admitted after settlement")
+
+
 # =====================================================================
 print("\n" + "=" * 70)
-print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed (13 total)")
+print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed (14 total)")
 if FAIL:
     sys.exit(1)
 print("Phase D lowering survived every adversarial scenario under full invariant checking.")

@@ -31,20 +31,20 @@ def lowered_observation(d: ConvergeTransactionDomain) -> dict:
         "Satisfied": "Satisfied",
         "Exhausted": "Exhausted",
         "Failed": "Failed",
+        "Cancelled": "Cancelled",   # R2: cancellation distinct
         "Searching": "Searching",
         "Closing": "Closing",       # closing frames normalize to their pending outcome
     }
     status = d.frame_status
-    value = None
     error = None
     if d.closing_reason is not None:
         error = d.closing_reason.error or d.closing_reason.kind
 
-    applied_digests = [s.completion.digest for s in d.handles.values() if s.applied]
-    if applied_digests and status == "Closing" and d.closing_reason and \
-            d.closing_reason.kind != "PendingFailure":
-        status = "Satisfied"
-        value = applied_digests[0]
+    if status == "Closing" and d.closing_reason:
+        if d.closing_reason.kind == "PendingCancelled":
+            status = "Cancelled"
+        elif d.closing_reason.kind == "PendingFailure":
+            status = "Failed"
 
     return {
         "status": status_map.get(status, status),

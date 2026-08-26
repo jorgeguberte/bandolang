@@ -29,9 +29,9 @@ def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                        error: str = None, abort_on_error: bool = False) -> None:
     """CheckSatisfaction on a node WITHOUT dispatching/expanding it.
 
-    Frozen ConvergeFrame v0 semantics: CheckSatisfaction is part of the
-    parent expansion's processing — the successor node is consumed by the
-    check without consuming fuel or entering visitation history.
+    Frozen ConvergeFrame v0 semantics: CheckSatisfaction evaluates whether
+    a candidate in the frontier or current expansion satisfies the goal.
+    It does NOT consume fuel and does NOT record visitation.
 
     R1 (audit): the ONLY place satisfaction_attempts increments.
     R3 (audit): Ok(Some(T)) performs the normative Satisfied transition itself.
@@ -39,8 +39,6 @@ def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("CheckSatisfaction outside Searching frame")
     d.satisfaction_attempts += 1
-    if node_id in d.frontier:
-        d.frontier.remove(node_id)     # checked successor is consumed
     if satisfied:
         d.satisfied_value = value
         d.frame_status = SearchStatus.SATISFIED      # R3: normative transition

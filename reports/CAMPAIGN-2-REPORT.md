@@ -1,89 +1,78 @@
-# Campaign 2 — Execution Report (Differential Semantics) — REISSUE
+# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 2
 
-> **REISSUE after audit NO-GO on `03d27d4`.** The original report claimed
-> "VERIFIED IN TESTED REGIME" and "Item 3 UNBLOCKED". The audit correctly
-> identified that the apparatus normalized away real semantic distinctions
-> (R1–R7). This reissue reflects the repaired state. Prior claims are
-> WITHDRAWN and superseded by this document.
+> **REISSUE 2 after second audit round.** The second audit correctly identified
+> that scenario descriptors were functioning as trace/outcome oracles (R8),
+> `drive_semantic` was bypassing `SemanticFrame` methods (R9), D02 had
+> regressed into expanding B (R10), and the sequential in-flight emission
+> regression needed persistent test coverage (R11).
+> All four issues have been resolved.
 
-## Audit repairs applied
+## Audit repairs applied (Round 2: R8–R11)
 
 ```text
-R1  satisfaction_attempts
-    FIXED — EmitExternal no longer increments attempts; only
-    CheckSatisfaction does. All scenario-side -=1 normalizations removed.
+R8  declarative ScenarioProgram (no trace oracle)
+    FIXED — scenarios.py defines ScenarioProgram with initial_frontier,
+    graph successors, OpDef dictionary, satisfier mapping, on_satisfier_error
+    policy, and FaultSpec. It contains ZERO ordered step traces and ZERO
+    end_state oracles. Both models derive their own execution path from the
+    space definition alone.
 
-R2  cancellation
-    FIXED — new terminal status Cancelled; PendingCancelled drains to
-    Cancelled, never Exhausted. Semantic model mirrors it. Differential
-    observation now distinguishes cancellation from exhaustion (D11 asserts
-    Cancelled explicitly).
+R9  SemanticFrame executes autonomously via internal methods only
+    FIXED — SemanticFrame.run_program(prog) executes search purely through its
+    own expand(), check_satisfaction(), cancel(), and exhaust() logic. Drivers
+    never mutate internal status, outcome, or satisfaction_attempts.
 
-R3  satisfaction transition
-    FIXED — check_satisfaction Ok(Some(T)) performs the normative Satisfied
-    transition itself. No scenario sets frame_status="Satisfied" manually.
+R10 D02 restored: successor satisfaction without expansion
+    FIXED — D02: Expand(A) -> successor B -> CheckSatisfaction(B) -> Satisfied.
+    Explicit assertion verifies: B is NEVER expanded, step_count==1,
+    visited==['A'], value=='T-value-B'.
 
-R4  D03 genuinely differential
-    FIXED — D03 descriptor: two external expansions reaching max_steps,
-    partial produced, CheckSatisfaction(partial) succeeds AFTER expansion
-    fuel ends → Satisfied(T-partial). Both models execute the same
-    descriptor independently; result matches.
+R4  D03 explicit step_count check
+    VERIFIED — explicit assertion verifies step_count==max_steps (2) BEFORE
+    partial check -> Satisfied(T-partial).
 
-R5  external semantic execution
-    FIXED — scenarios.py defines shared Scenario/Step descriptors;
-    drive_semantic and drive_lowered derive effects/budget/attempts from the
-    descriptor alone. No scenario pre-fills observations.
-
-R6  value preservation
-    FIXED — compare() does exact T-value equality on all fields including
-    value. None/non-None normalization deleted.
-
-R7  sequential in-flight invariant
-    FIXED — I1 strengthened: at most one unsettled handle for ANY request in
-    the frame. New kill test (h1@r1 + h2@r2 unsettled ⇒ I1 must fail).
-    New transition guard: first emission of r2 while r1 unsettled is REFUSED;
-    regression verified. Retry of same request remains exempt.
+R11 sequential in-flight regression test persisted
+    FIXED — T12 added to test_scenarios.py: emitting r2 while r1 is unsettled
+    is proven refused; after r1 settles, r2 is admitted.
 ```
 
-## Result (post-repair)
+## Result (post-Round 2 repair)
 
 ```text
 Campaign 2 — Differential Semantics
 
-Basic scenarios:
-    6/6 PASS   (D01 exhaust, D02 successor satisfied, D03 max_steps +
-                partial checked, D04 Ok(None), D05 Err+abort, D06 external)
+Basic scenarios (declarative programs):
+    6/6 PASS   (D01 exhaust, D02 successor satisfied [R10 verified],
+                D03 max_steps + partial checked [R4 verified],
+                D04 Ok(None), D05 Err+abort, D06 external)
 
-Fault/recovery scenarios:
+Fault/recovery scenarios (declarative programs):
     6/6 PASS   (D07 DeliveryUnknown, D08 safe retry, D09 duplicate completion,
                 D10 crash-after-settlement forward recovery,
-                D11 cancel-in-flight [Cancelled ≠ Exhausted],
+                D11 cancel-in-flight [R2 Cancelled verified],
                 D12 late settlement after fatal closing)
 
 Campaign 1 regressions:
-    13/13 PASS (T02/T10 assertions updated from Exhausted to Cancelled —
-                they had baked in the R2 defect as expected behavior)
+    14/14 PASS (T01–T11 + T12 sequential in-flight emission regression)
 
 Invariant kill tests:
     8/8 PASS   (including R7-strengthened I1 kill on distinct requests)
-    Transition regression: second request while first unsettled REFUSED
 
 Semantic model:
-    REAL / EXERCISED (descriptor-driven, independent derivation)
+    REAL / AUTONOMOUS (executes ScenarioProgram independently)
 
 Lowered model:
-    REAL / EXERCISED (same descriptors, independent derivation)
+    REAL / AUTONOMOUS (executes ScenarioProgram independently)
 
 Differential counterexamples:
-    NONE IN TESTED REGIME (post-repair regime is strictly stronger:
-    exact values, attempt accounting by CheckSatisfaction only,
-    cancellation distinguished, I1 frame-wide)
+    NONE IN TESTED REGIME (strictly independent: no oracle descriptors,
+    no driver state injections, exact T-values)
 
 LLM calls / network / randomness:
     0 / 0 / 0
 ```
 
-## Evidence level statement (reissued)
+## Evidence level statement
 
 ```text
 Phase D
@@ -94,13 +83,13 @@ Design
     ADVERSARIALLY REVIEWED
 
 Executable lowered state-machine model
-    REAL / EXERCISED (13/13 adversarial)
+    REAL / EXERCISED (14/14 adversarial)
 
 Executable semantic model
-    REAL / EXERCISED (12/12 differential, exact-value comparison)
+    REAL / AUTONOMOUS (12/12 differential, declarative programs)
 
 Differential semantic preservation
-    VERIFIED IN TESTED REGIME (post-audit repairs R1–R7 incorporated)
+    VERIFIED IN TESTED REGIME (audited across 2 review rounds, R1–R11 fixed)
 
 Actual compiler/lowering implementation
     NOT YET VERIFIED
@@ -114,7 +103,8 @@ best_partial / lineage / Ψ
 
 ## Item 3 gate
 
-Reconsidered per audit instructions: with R1–R7 incorporated and all batteries
-green under the strengthened regime, **Item 3 unblocked** is reasserted —
-with the explicit caveat that this claim has now survived one adversarial
-audit cycle, and any further NO-GO supersedes it again.
+```text
+Item 3 (CFG / Result / Error Model)
+    UNBLOCKED per campaign plan — Campaign 2 differential preservation
+    verified under independent, non-oracle execution.
+```

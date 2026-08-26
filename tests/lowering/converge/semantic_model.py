@@ -4,12 +4,17 @@ Models the WHAT (ConvergeFrame v0 semantics), not the soma.vm.* HOW.
 Deliberately more direct than the lowered model in model.py/transitions.py:
 no outbox, no CompletionRecord, no StageLocal, no settlement records.
 
+R9 (audit): SemanticFrame executes ScenarioProgram autonomously using ONLY
+its own internal methods. Drivers NEVER poke internal status or counters.
+
 Deterministic stubs only: 0 LLM calls, 0 network, 0 randomness.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Optional
+
+from scenarios import OpDef, ScenarioProgram
 
 
 class Status:
@@ -27,7 +32,7 @@ class Visit:
 
 @dataclass(frozen=True)
 class SemanticOutcome:
-    status: str                 # Satisfied / Exhausted / Failed / Searching
+    status: str                 # Satisfied / Exhausted / Failed / Cancelled / Searching
     value: Any = None           # the T in Ok(Some(T))
     error: Optional[str] = None
 
@@ -48,83 +53,96 @@ class SemanticFrame:
     status: str = Status.SEARCHING
     outcome: Optional[SemanticOutcome] = None
 
-    # ---- deterministic stubs (injected by each scenario) ----------------
+    # ---- core methods ---------------------------------------------------
 
-    # successors(node_id) -> list of successor ids (pure)
-    successors: Callable[[str], list[str]] = lambda n: []
-
-    # external_expand(node_id) -> performs one external action; returns cost
-    #   and appends to effects. This is the semantic 'act/read' directly.
-    external_expand_cost: int = 0
-
-    # satisfier(node_id) -> ("ok", True, value) | ("ok", False, None) | ("err", msg)
-    satisfier: Callable[[str], tuple] = staticmethod(lambda n: ("ok", False, None))
-
-    on_satisfier_error: str = "retry_once"     # "retry_once" | "abort"
-
-    max_steps_partial_check: bool = True       # D03 normative rule: partial still checked
-
-    # ---- core loop ------------------------------------------------------
-
-    def expand_local(self, node_id: str) -> list[str]:
-        """Local expansion: pure computation, no external effect. Costs 1 step."""
+    def expand(self, node_id: str, op: OpDef, succs: list[str]) -> list[str]:
+        """Expand node: costs 1 step fuel, marks Expanding, records visited,
+        adds external effects/budget if external, adds successors to frontier."""
         if self.status != Status.SEARCHING or self.step_count >= self.max_steps:
             return []
         self.step_count += 1
         self.nodes[node_id] = "Expanding"
         self.visited.append(Visit(node_id))
-        succs = list(self.successors(node_id))
+        if op.kind == "external":
+            self.budget_spent += op.cost
+            self.effects.append(f"external({op.op_id})")
         for s in succs:
             if s not in self.nodes:
                 self.nodes[s] = "Frontier"
                 self.frontier.append(s)
         return succs
 
-    def check_satisfaction(self, node_id: str) -> bool:
-        """Satisfier attempt. Counts regardless of result (semantic attempt)."""
+    def check_satisfaction(self, node_id: str,
+                           satisfier_map: dict[str, tuple[str, bool, Any]],
+                           on_satisfier_error: str = "abort") -> bool:
+        """Satisfier attempt. Returns True if search should terminate (Satisfied or Failed)."""
         if self.status != Status.SEARCHING:
             return False
-        kind, ok, value = self.satisfier(node_id)
+        kind, ok, value = satisfier_map.get(node_id, ("ok", False, None))
+        self.satisfaction_attempts += 1
         if kind == "err":
-            self.satisfaction_attempts += 1
-            if self.on_satisfier_error == "abort":
+            if on_satisfier_error == "abort":
                 self.status = Status.FAILED
                 self.outcome = SemanticOutcome(Status.FAILED, error=value)
-                return True     # terminal
-            return False        # retryable: continue searching
-        self.satisfaction_attempts += 1
+                return True
+            return False
         if ok:
             self.status = Status.SATISFIED
             self.outcome = SemanticOutcome(Status.SATISFIED, value=value)
             return True
         return False
 
-    def run(self) -> SemanticOutcome:
-        """Deterministic DFS-style drive of the space until outcome."""
-        seed = self.frontier[0] if self.frontier else "root"
-        if seed not in self.nodes:
-            self.nodes[seed] = "Frontier"
-            self.frontier.insert(0, seed)
-
-        while self.status == Status.SEARCHING:
-            if self.step_count >= self.max_steps:
-                break
-            if not self.frontier:
-                break
-            node = self.frontier.pop(0)
-            succs = self.expand_local(node)
-            # satisfaction check on the expanded node itself, then successors
-            candidates = [node] + succs
-            for c in candidates:
-                if self.check_satisfaction(c):
-                    break
-
+    def cancel(self) -> None:
+        """Owner cancellation (R2)."""
         if self.status == Status.SEARCHING:
-            # exhausted fuel or frontier without satisfaction
-            if self.max_steps_partial_check and self.outcome is None:
-                pass    # partial produced may still be checked by scenario harness
+            self.status = Status.CANCELLED
+            self.outcome = SemanticOutcome(Status.CANCELLED)
+
+    def exhaust(self) -> None:
+        """Natural exhaustion."""
+        if self.status == Status.SEARCHING:
             self.status = Status.EXHAUSTED
             self.outcome = SemanticOutcome(Status.EXHAUSTED)
+
+    # ---- autonomous runner ----------------------------------------------
+
+    def run_program(self, prog: ScenarioProgram) -> SemanticOutcome:
+        """Execute a ScenarioProgram purely via semantic search semantics."""
+        self.max_steps = prog.max_steps
+        self.budget_limit = prog.budget_limit
+
+        for n in prog.initial_frontier:
+            self.frontier.append(n)
+            self.nodes[n] = "Frontier"
+
+        while self.status == Status.SEARCHING:
+            if self.step_count >= self.max_steps or not self.frontier:
+                break
+
+            node = self.frontier.pop(0)
+            op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
+            succs = list(prog.successors.get(node, []))
+
+            self.expand(node, op, succs)
+
+            # Check for environmental cancellation
+            if prog.fault_spec.cancel_in_flight:
+                self.cancel()
+                return self.outcome
+
+            # Candidates to check: the expanded node itself, then its successors
+            candidates = [node] + succs
+            for cand in candidates:
+                if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
+                    return self.outcome
+
+        # Post-fuel / partial check (D03)
+        if self.status == Status.SEARCHING and prog.check_partial_after_fuel:
+            self.check_satisfaction(prog.check_partial_after_fuel, prog.satisfier_map, prog.on_satisfier_error)
+
+        if self.status == Status.SEARCHING:
+            self.exhaust()
+
         return self.outcome
 
     # ---- observables ----------------------------------------------------

@@ -1,97 +1,186 @@
-"""scenarios.py — shared scenario descriptors for Campaign 2.
+"""scenarios.py — declarative search-space scenario programs for Campaign 2.
 
-R5 (audit): ONE descriptor per scenario, consumed INDEPENDENTLY by the
-semantic model and the lowered model. Neither model sees the other's output;
-both derive effects/budget/attempts from this descriptor alone.
+R8 (audit): ScenarioProgram is a DECLARATIVE specification of the search space,
+operations, satisfier function, and environmental faults.
+It NEVER contains:
+- scripted step-by-step traces
+- expected end_state oracles
 
-R6 (audit): descriptors carry exact T values; comparison is exact.
+Both the semantic model and the lowered model consume this program
+independently and derive their own execution paths.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Any, Optional
 
 
-@dataclass
-class Step:
-    """One expansion step in the scenario's intended execution."""
-    node: str
-    op: str
-    request: str
-    kind: str                  # "local" | "external"
-    cost: int = 0              # budget consumed by an external action
-    check_after: bool = False  # CheckSatisfaction(node) after expansion?
-    check_result: str = "none" # "none" | "fail" | f"satisfied:{T}" | f"error:{msg}"
-    abort_on_error: bool = False
+@dataclass(frozen=True)
+class OpDef:
+    op_id: str
+    kind: str = "local"              # "local" | "external"
+    cost: int = 0                    # budget consumed by external action
+    request_id: Optional[str] = None # defaults to f"req:{op_id}"
+    dedup_capable: bool = True
+    idempotent: bool = True
 
 
-@dataclass
-class Scenario:
+@dataclass(frozen=True)
+class FaultSpec:
+    """Environmental/transport fault injection flags (inputs, not outcome oracles)."""
+    delivery_unknown: bool = False
+    safe_retry: bool = False
+    duplicate_completion: bool = False
+    crash_after_settlement: bool = False
+    cancel_in_flight: bool = False
+
+
+@dataclass(frozen=True)
+class ScenarioProgram:
     name: str
-    max_steps: int
-    steps: list[Step] = field(default_factory=list)
-    end_state: str = "Searching"   # Searching / Satisfied / Exhausted / Failed / Cancelled
-    cancel_at_end: bool = False
+    initial_frontier: list[str]
+    successors: dict[str, list[str]] = field(default_factory=dict)
+    node_ops: dict[str, OpDef] = field(default_factory=dict)
+    # satisfier_map: node_id -> ("ok", True/False, val) | ("err", False, error_msg)
+    satisfier_map: dict[str, tuple[str, bool, Any]] = field(default_factory=dict)
+    on_satisfier_error: str = "abort"      # "abort" | "retry"
+    max_steps: int = 6
+    budget_limit: int = 100
+    fault_spec: FaultSpec = field(default_factory=FaultSpec)
+    # For D03: check a specific partial candidate after expansion fuel is exhausted
+    check_partial_after_fuel: Optional[str] = None
 
 
 # =====================================================================
-# Basic battery D01–D06
+# Basic battery D01–D06 programs
 # =====================================================================
 
-D01 = Scenario(
+D01 = ScenarioProgram(
     name="D01_local_expand_exhausted",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op1", kind="local")},
+    satisfier_map={"root": ("ok", False, None)},
     max_steps=6,
-    steps=[Step("root", "op1", "r1", "local", check_after=True, check_result="fail")],
-    end_state="Exhausted",
 )
 
-D02 = Scenario(
+# R10 restored: Expand A produces successor B. CheckSatisfaction(B) satisfies
+# with T-value-B. B is NEVER expanded, never in visited, never consumes step fuel.
+D02 = ScenarioProgram(
     name="D02_expand_successor_satisfied",
+    initial_frontier=["A"],
+    successors={"A": ["B"], "B": []},
+    node_ops={"A": OpDef("opA", kind="local"), "B": OpDef("opB", kind="local")},
+    satisfier_map={"A": ("ok", False, None), "B": ("ok", True, "T-value-B")},
     max_steps=6,
-    steps=[
-        Step("A", "opA", "rA", "local"),
-        Step("B", "opB", "rB", "local", check_after=True, check_result="satisfied:T-value-B"),
-    ],
-    end_state="Satisfied",
 )
 
-D03 = Scenario(
+# R4: max_steps reached, partial checked after fuel ends
+D03 = ScenarioProgram(
     name="D03_max_steps_partial_still_checked",
+    initial_frontier=["P"],
+    successors={"P": ["Q"], "Q": []},
+    node_ops={
+        "P": OpDef("opP", kind="external", cost=10),
+        "Q": OpDef("opQ", kind="external", cost=10),
+    },
+    satisfier_map={
+        "P": ("ok", False, None),
+        "Q": ("ok", False, None),
+        "partial_candidate": ("ok", True, "T-partial"),
+    },
     max_steps=2,
-    steps=[
-        Step("P", "opP", "rP", "external", cost=10),
-        Step("Q", "opQ", "rQ", "external", cost=10,
-             check_after=True, check_result="satisfied:T-partial"),
-    ],
-    end_state="Satisfied",
+    check_partial_after_fuel="partial_candidate",
 )
 
-D04 = Scenario(
+D04 = ScenarioProgram(
     name="D04_satisfier_none_exhausts",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op4", kind="external", cost=8)},
+    satisfier_map={"root": ("ok", False, None)},
     max_steps=6,
-    steps=[
-        Step("root", "op4", "r4", "external", cost=8,
-             check_after=True, check_result="fail"),
-    ],
-    end_state="Exhausted",
 )
 
-D05 = Scenario(
+D05 = ScenarioProgram(
     name="D05_satisfier_error_abort",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op5", kind="external", cost=9)},
+    satisfier_map={"root": ("err", False, "satisfier exploded")},
+    on_satisfier_error="abort",
     max_steps=6,
-    steps=[
-        Step("root", "op5", "r5", "external", cost=9,
-             check_after=True, check_result="error:satisfier exploded",
-             abort_on_error=True),
-    ],
-    end_state="Failed",
 )
 
-D06 = Scenario(
+D06 = ScenarioProgram(
     name="D06_external_satisfied",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("opExt", kind="external", cost=12)},
+    satisfier_map={"root": ("ok", True, "T-ext")},
     max_steps=6,
-    steps=[
-        Step("root", "opExt", "rext", "external", cost=12,
-             check_after=True, check_result="satisfied:T-ext"),
-    ],
-    end_state="Satisfied",
+)
+
+
+# =====================================================================
+# Fault/recovery battery D07–D12 programs
+# =====================================================================
+
+D07 = ScenarioProgram(
+    name="D07_delivery_unknown",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op7", kind="external", cost=10)},
+    satisfier_map={"root": ("ok", False, None)},
+    max_steps=6,
+    fault_spec=FaultSpec(delivery_unknown=True),
+)
+
+D08 = ScenarioProgram(
+    name="D08_safe_transport_retry",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op8", kind="external", cost=15, dedup_capable=True)},
+    satisfier_map={"root": ("ok", True, "T-retry")},
+    max_steps=6,
+    fault_spec=FaultSpec(delivery_unknown=True, safe_retry=True),
+)
+
+D09 = ScenarioProgram(
+    name="D09_duplicate_completion",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op9", kind="external", cost=20)},
+    satisfier_map={"root": ("ok", False, None)},
+    max_steps=6,
+    fault_spec=FaultSpec(duplicate_completion=True),
+)
+
+D10 = ScenarioProgram(
+    name="D10_crash_after_settlement",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op10", kind="external", cost=25)},
+    satisfier_map={"root": ("ok", True, "T-crash")},
+    max_steps=6,
+    fault_spec=FaultSpec(crash_after_settlement=True),
+)
+
+D11 = ScenarioProgram(
+    name="D11_cancel_while_in_flight",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op11", kind="external", cost=40)},
+    max_steps=6,
+    fault_spec=FaultSpec(cancel_in_flight=True),
+)
+
+D12 = ScenarioProgram(
+    name="D12_late_settlement_fatal_closing",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op12", kind="external", cost=50)},
+    satisfier_map={"root": ("err", False, "fatal protocol breach")},
+    on_satisfier_error="abort",
+    max_steps=6,
 )
