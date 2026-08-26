@@ -92,13 +92,25 @@ bk_empty = HarnessBookkeeping(reservations_created_by_cf={})
 survives("I3 control probe (reservation of OTHER operation accepted)",
          lambda x: __import__("invariants").i3_terminal_zero_obligations(x, bk_empty), d3c)
 
-# I6 kill (R28): same CompletionId applied twice
+# I6 kill A (R28): same CompletionId applied twice
 d4 = base_domain()
 d4.applied_completions = ["ha:rcpt-1", "ha:rcpt-1"]
-kill("I6 kill (same CompletionId applied twice)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4)
+kill("I6 kill A (same CompletionId applied twice)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4)
+
+# I6 kill B (R35): applied handle missing application record (completeness gap)
+d4c = base_domain()
+st_app = InFlightLifecycleState("ha", "ra", applied=True, state="Applied")
+d4c.handles["ha"] = st_app
+d4c.applied_completions = []
+kill("I6 kill B (applied handle missing application record)", lambda x: __import__("invariants").i6_apply_at_most_once(x), d4c)
 
 # I6 control probe (R28): two different completions with identical digests
 d4b = base_domain()
+st_a = InFlightLifecycleState("ha", "ra", applied=True, state="Applied")
+st_b = InFlightLifecycleState("hb", "rb", applied=True, state="Applied")
+st_a.completion = __import__("model").CompletionRecord("ha", "rcpt-1", "same-digest", "Success")
+st_b.completion = __import__("model").CompletionRecord("hb", "rcpt-2", "same-digest", "Success")
+d4b.handles = {"ha": st_a, "hb": st_b}
 d4b.applied_completions = ["ha:rcpt-1", "hb:rcpt-2"]
 survives("I6 control probe (distinct completions with identical digest accepted)",
          lambda x: __import__("invariants").i6_apply_at_most_once(x), d4b)
@@ -110,6 +122,17 @@ hs.settlement = __import__("model").SettlementRecord("hs", "rcpt", "usd", 10)
 d5.handles = {"hs": hs}
 d5.scope_spent["usd"] = 99   # ledger says 99, records say 10
 kill("I7 kill (ledger != settled amounts)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5)
+
+# I7 control probe (R36): two distinct handles with the same receipt_id
+d5b = base_domain()
+hs1 = InFlightLifecycleState(handle_id="hs1", request_id="rs1")
+hs2 = InFlightLifecycleState(handle_id="hs2", request_id="rs2")
+hs1.settlement = __import__("model").SettlementRecord("hs1", "same-rcpt", "usd", 10)
+hs2.settlement = __import__("model").SettlementRecord("hs2", "same-rcpt", "usd", 10)
+d5b.handles = {"hs1": hs1, "hs2": hs2}
+d5b.scope_spent["usd"] = 20
+survives("I7 control probe (different handles with same receipt_id accepted)",
+         lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5b)
 
 # I8 kill (R30): attempt actual machine frontier mutation while Closing
 d8 = base_domain()

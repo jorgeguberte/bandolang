@@ -56,19 +56,21 @@ def lowered_observation(d: ConvergeTransactionDomain, bk: HarnessBookkeeping | N
             f"external({rec.op_id})" for rec in d.outbox.values()
             if d.first_emission_flags.get(rec.request_id) and not rec.local_only
         ),
+        "exhaustion_reason": d.exhaustion_reason if status == "Exhausted" else None,
     }
 
 
 def compare(scenario: str, semantic_obs: dict, lowered_obs: dict) -> list[Divergence]:
     """Field-by-field comparison of normalized observations.
     R6 (audit): exact T-value comparison.
-    R14/R17 (audit): compares obligations, commitments, and available consumption."""
+    R14/R17 (audit): compares obligations, commitments, and available consumption.
+    R34 (audit): compares exhaustion_reason on natural exhaustion."""
     divergences = []
     for key in ("status", "value", "error", "step_count",
                 "satisfaction_attempts", "visited", "frontier",
                 "budget_spent", "outstanding_scope_commitment",
                 "unsettled_request_count", "attributable_owner_reserved",
-                "intent_available_consumed", "effects"):
+                "intent_available_consumed", "effects", "exhaustion_reason"):
         s, l = semantic_obs.get(key), lowered_obs.get(key)
         if s != l:
             divergences.append(Divergence(scenario, key, s, l))

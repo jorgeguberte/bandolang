@@ -25,6 +25,7 @@ def next_id(prefix: str) -> str:
 
 class SearchStatus:
     SEARCHING = "Searching"
+    WAITING = "Waiting"       # R31: Waiting(InFlightHandle) state
     CLOSING = "Closing"
     FAILED = "Failed"
     SATISFIED = "Satisfied"
@@ -128,12 +129,27 @@ class InFlightLifecycleState:
 
 
 @dataclass(frozen=True)
+class SpaceOutcome:
+    successors: list[str] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class SatisfierOutcome:
+    node_id: str
+    op_id: str
+    satisfied: bool
+    value: Any = None
+    error: Optional[str] = None
+
+
+@dataclass(frozen=True)
 class CompletionRecord:
-    """Durable record of a completion delivered for a handle."""
+    """Durable record of a completion delivered for a handle (R32)."""
     handle_id: str
     receipt_id: str
     digest: str
     outcome: str              # "Success" | "Failure"
+    semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None
 
 
 @dataclass(frozen=True)
@@ -196,6 +212,7 @@ class ConvergeTransactionDomain:
     # Satisfaction result carried by check_satisfaction (differential parity)
     satisfied_value: object = None
     satisfier_error: str = None
+    exhaustion_reason: Optional[str] = None   # R34: "BudgetDepleted" | "FrontierEmpty" | "FuelExhausted"
 
     def copy(self) -> "ConvergeTransactionDomain":
         """Snapshot for crash/rollback-of-local-state semantics in tests."""
@@ -229,6 +246,7 @@ class ConvergeTransactionDomain:
             protocol_violations=[dict(v) for v in self.protocol_violations],
             satisfied_value=self.satisfied_value,
             satisfier_error=self.satisfier_error,
+            exhaustion_reason=self.exhaustion_reason,
         )
 
 

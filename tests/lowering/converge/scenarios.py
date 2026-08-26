@@ -55,6 +55,8 @@ class ScenarioProgram:
     check_partial_after_fuel: Optional[str] = None
     # R24: effectful satisfier definition (own budget/cost, effects trace)
     effectful_satisfier: Optional[OpDef] = None
+    # R33: explicit PartialOf mapping: node_id -> Partial (only partial nodes are checkable)
+    partial_map: dict[str, Any] = field(default_factory=dict)
 
 
 # =====================================================================
@@ -237,7 +239,7 @@ D15 = ScenarioProgram(
     budget_limit=100,
 )
 
-# R24: effectful satisfier coverage (own budget, effect trace, settlement)
+# R24/R33: effectful satisfier coverage (own budget, effect trace, settlement, explicit PartialOf)
 D16 = ScenarioProgram(
     name="D16_effectful_satisfier",
     initial_frontier=["root"],
@@ -245,6 +247,9 @@ D16 = ScenarioProgram(
     node_ops={
         "root": OpDef("opRoot", kind="local"),
         "cand1": OpDef("opCand1", kind="local"),
+    },
+    partial_map={
+        "cand1": "PartialCandidate1",  # root has PartialOf=None; only cand1 is partial
     },
     satisfier_map={
         "cand1": ("ok", True, "T-verified"),
@@ -254,13 +259,16 @@ D16 = ScenarioProgram(
     effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
 )
 
-# R26: effectful satisfier commit point under DeliveryUnknown -> satisfaction_attempts==1 upon emission
+# R26/R31: effectful satisfier commit point under DeliveryUnknown -> Waiting state with attempts=1
 D17 = ScenarioProgram(
     name="D17_effectful_satisfier_delivery_unknown",
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={
         "root": OpDef("opRoot", kind="local"),
+    },
+    partial_map={
+        "root": "PartialRoot",
     },
     satisfier_map={
         "root": ("ok", True, "T-unreached"),
@@ -269,4 +277,35 @@ D17 = ScenarioProgram(
     budget_limit=100,
     effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
     fault_spec=FaultSpec(delivery_unknown=True),
+)
+
+# R31: sequential Waiting blocks subsequent local runnable nodes
+D18_WAITING = ScenarioProgram(
+    name="D18_sequential_waiting_blocks_local",
+    initial_frontier=["A", "B"],
+    successors={"A": [], "B": []},
+    node_ops={
+        "A": OpDef("opA", kind="external", cost=10),
+        "B": OpDef("opB", kind="local"),
+    },
+    fault_spec=FaultSpec(delivery_unknown=True),
+    max_steps=6,
+    budget_limit=100,
+)
+
+# R32: autonomous crash recovery preserves and applies space successors
+D19_CRASH_RECOVERY = ScenarioProgram(
+    name="D19_external_space_crash_recovery_preserves_successors",
+    initial_frontier=["root"],
+    successors={"root": ["childB"]},
+    node_ops={
+        "root": OpDef("opRoot", kind="external", cost=10),
+        "childB": OpDef("opB", kind="local"),
+    },
+    satisfier_map={
+        "childB": ("ok", True, "T-recovered"),
+    },
+    fault_spec=FaultSpec(crash_after_settlement=True),
+    max_steps=6,
+    budget_limit=100,
 )

@@ -84,18 +84,28 @@ def i4_stage_reject_zero_delta(before: dict, after: dict) -> bool:
 #     request_id; a different id is a new semantic attempt by construction.
 
 
-# I6. Handle.Applied(c) ==> semantic_outcome applied <= 1 per CompletionId (R28)
+# I6. Handle.Applied(c) ==> semantic_outcome applied <= 1 per CompletionId (R28/R35)
 def i6_apply_at_most_once(d: ConvergeTransactionDomain) -> bool:
-    return len(d.applied_completions) == len(set(d.applied_completions))
+    # 1. Uniqueness of application records
+    if len(d.applied_completions) != len(set(d.applied_completions)):
+        return False
+    # 2. Completeness: every handle that is applied must have a corresponding record
+    for hid, st in d.handles.items():
+        if st.applied:
+            c_id = f"{hid}:{st.completion.receipt_id}" if st.completion else hid
+            if c_id not in d.applied_completions:
+                return False
+    return True
 
 
-# I7. SettlementRecord(h) ==> ledger reconciliation count == 1
+# I7. SettlementRecord(h) ==> ledger reconciliation count == 1 per handle (R36)
 def i7_settlement_exactly_once(d: ConvergeTransactionDomain) -> bool:
-    seen_receipts = []
-    for st in d.handles.values():
+    settled_handles = []
+    for hid, st in d.handles.items():
         if st.settlement is not None:
-            seen_receipts.append(st.settlement.receipt_id)
-            # scope_spent must equal sum of settled amounts
+            settled_handles.append(hid)
+    if len(settled_handles) != len(set(settled_handles)):
+        return False
     total_by_resource: dict[str, int] = {}
     for st in d.handles.values():
         if st.settlement:
@@ -104,7 +114,7 @@ def i7_settlement_exactly_once(d: ConvergeTransactionDomain) -> bool:
     for r, total in total_by_resource.items():
         if d.scope_spent.get(r, 0) != total:
             return False
-    return len(seen_receipts) == len(set(seen_receipts))
+    return True
 
 
 # I8. Closing ==> frontier mutations == 0 (frontier frozen during closing)

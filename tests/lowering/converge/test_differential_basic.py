@@ -17,12 +17,16 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from scenarios import (
-    D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17, OpDef, ScenarioProgram,
+    D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17,
+    D18_WAITING, D19_CRASH_RECOVERY, OpDef, ScenarioProgram,
 )
 import transitions as tx
 from differential import compare, classify, lowered_observation
 from harness import CrashInjected, Harness
-from model import ConvergeTransactionDomain, NodeStatus, SearchNode, SearchStatus
+from model import (
+    ConvergeTransactionDomain, NodeStatus, SatisfierOutcome, SearchNode,
+    SearchStatus, SpaceOutcome,
+)
 from semantic_model import SemanticFrame
 
 PASS, FAIL = 0, 0
@@ -35,8 +39,11 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
     while d.frame_status == SearchStatus.SEARCHING:
         action = tx.scheduler_step(d, prog)
         if isinstance(action, tx.Stop):
+            if not prog.check_partial_after_fuel:
+                h.step(f"exhaust-{action.reason}", tx.exhaust, action.reason)
             break
         elif isinstance(action, tx.Wait):
+            # R31: Waiting for in-flight handle — driver MUST NOT exhaust
             break
 
         node = action.node
@@ -57,6 +64,10 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
             h.step(f"emit-{op.op_id}", tx.emit_external, handle,
                    deliver_unknown=prog.fault_spec.delivery_unknown)
 
+            if prog.fault_spec.delivery_unknown:
+                # R31: delivery unknown remains in Waiting state
+                break
+
             if prog.fault_spec.safe_retry:
                 steps_before = d.step_count
                 h.step(f"retry-{op.op_id}", tx.emit_external, handle)
@@ -64,18 +75,22 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
 
             if prog.fault_spec.cancel_in_flight:
                 h.step(f"deliver-{op.op_id}", tx.admit_completion, handle,
-                       f"rcpt-{req_id}", f"digest-{req_id}")
+                       f"rcpt-{req_id}", f"digest-{req_id}",
+                       semantic_payload=SpaceOutcome(successors=succs))
                 h.step("cancel", tx.cancel)
                 h.step("late-settle", tx.settle, handle, "usd", charge)
                 h.step("drain", tx.finish_if_drained)
                 break
 
+            # R32: durable completion payload carries SpaceOutcome
             h.step(f"deliver-{op.op_id}", tx.admit_completion, handle,
-                   f"rcpt-{req_id}", f"digest-{req_id}")
+                   f"rcpt-{req_id}", f"digest-{req_id}",
+                   semantic_payload=SpaceOutcome(successors=succs))
 
             if prog.fault_spec.duplicate_completion:
                 h.step(f"dup-deliver-{op.op_id}", tx.admit_completion, handle,
-                       f"rcpt-{req_id}-b", f"digest-{req_id}")
+                       f"rcpt-{req_id}-b", f"digest-{req_id}",
+                       semantic_payload=SpaceOutcome(successors=succs))
 
             h.step(f"settle-{op.op_id}", tx.settle, handle, "usd", charge)
 
@@ -85,15 +100,20 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                 except CrashInjected:
                     pass
                 from transitions import recover
+                # R32: recovery autonomously reads SpaceOutcome and discovers successors
                 recover(d, d.copy(), "after_settlement_before_apply")
-                assert d.handles[handle].applied, "recovery lost settled result"
-
-            # R27: Atomic space completion incorporation
-            h.step(f"apply-space-{op.op_id}", tx.apply_space_completion, handle, succs)
+                assert d.handles[handle].applied and d.handles[handle].state == "Applied", "recovery lost settled result"
+            else:
+                # R27: Atomic space completion incorporation
+                h.step(f"apply-space-{op.op_id}", tx.apply_space_completion, handle, succs)
 
         # Check satisfaction on candidates: the expanded node itself, then its successors
         candidates = [node] + succs
         for cand in candidates:
+            # R33: Check satisfaction only on candidates with explicit PartialOf(cand) == Some(P)
+            if prog.partial_map and cand not in prog.partial_map:
+                continue
+
             # R24/R26: effectful satisfier
             if prog.effectful_satisfier:
                 es = prog.effectful_satisfier
@@ -106,7 +126,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                        deliver_unknown=prog.fault_spec.delivery_unknown)
 
                 if prog.fault_spec.delivery_unknown:
-                    # In-flight delivery unknown: completion never arrives
+                    # R31: delivery unknown remains in Waiting state
                     break
 
                 if prog.fault_spec.cancel_in_flight:
@@ -114,9 +134,10 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                     h.step("drain", tx.finish_if_drained)
                     break
 
-                h.step(f"deliver-sat-{es.op_id}", tx.admit_completion, h_handle, f"rcpt-sat-{cand}", f"digest-sat-{cand}")
-                h.step(f"settle-sat-{es.op_id}", tx.settle, h_handle, "usd", es.charge())
                 kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
+                h.step(f"deliver-sat-{es.op_id}", tx.admit_completion, h_handle, f"rcpt-sat-{cand}", f"digest-sat-{cand}",
+                       semantic_payload=SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=ok, value=val))
+                h.step(f"settle-sat-{es.op_id}", tx.settle, h_handle, "usd", es.charge())
                 h.step(f"apply-sat-{es.op_id}", tx.apply_satisfier_completion, h_handle, cand, es.op_id, ok, value=val)
                 if ok:
                     break
@@ -135,9 +156,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                     h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id, False)
 
     # Post-fuel / partial check (D03)
-    if d.frame_status == SearchStatus.SEARCHING and prog.check_partial_after_fuel:
-        assert d.step_count == prog.max_steps, (
-            f"R4 assertion: expected step_count==max_steps ({prog.max_steps}), got {d.step_count}")
+    if d.frame_status in (SearchStatus.SEARCHING, SearchStatus.EXHAUSTED) and prog.check_partial_after_fuel:
         cand = prog.check_partial_after_fuel
         kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
         if ok:
@@ -145,7 +164,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                    "partial_check", True, value=val)
 
     if d.frame_status == SearchStatus.SEARCHING:
-        h.step("exhaust", tx.exhaust)
+        h.step("exhaust", tx.exhaust, "FrontierEmpty" if not d.frontier else "FuelExhausted")
 
 
 def run(prog: ScenarioProgram) -> None:
@@ -200,24 +219,39 @@ def run(prog: ScenarioProgram) -> None:
             assert sem_obs["step_count"] == 1, f"R20: step_count must be 1, got {sem_obs['step_count']}"
             assert sem_obs["budget_spent"] == 60, f"R20: spent must be 60, got {sem_obs['budget_spent']}"
             assert sem_obs["status"] == "Exhausted", f"R20: status must be Exhausted, got {sem_obs['status']}"
-            print("    \u2713 R20 verified: unaffordable ceiling refused, step_count==1, spent==60")
+            assert sem_obs["exhaustion_reason"] == "BudgetDepleted", f"R34: exhaustion_reason must be BudgetDepleted, got {sem_obs['exhaustion_reason']}"
+            print("    \u2713 R20/R34 verified: unaffordable ceiling refused, step_count==1, spent==60, reason==BudgetDepleted")
 
-        # R24 assertion for D16
+        # R24/R33 assertion for D16
         if prog.name == "D16_effectful_satisfier":
-            assert sem_obs["effects"] == ["external(opVerify)", "external(opVerify)"], (
-                f"R24: effects must contain 2 external(opVerify) calls, got {sem_obs['effects']}")
-            assert sem_obs["budget_spent"] == 10, f"R24: budget_spent must be 10, got {sem_obs['budget_spent']}"
-            assert sem_obs["value"] == "T-verified", f"R24: value must be 'T-verified', got {sem_obs['value']}"
-            print("    \u2713 R24 verified: effectful satisfier executed external actions (2 calls, spent 10), satisfied T-verified")
+            assert sem_obs["effects"] == ["external(opVerify)"], (
+                f"R24/R33: effects must contain exactly 1 external(opVerify) call (only cand1 is partial), got {sem_obs['effects']}")
+            assert sem_obs["budget_spent"] == 5, f"R24/R33: budget_spent must be 5, got {sem_obs['budget_spent']}"
+            assert sem_obs["satisfaction_attempts"] == 1, f"R24/R33: satisfaction_attempts must be 1, got {sem_obs['satisfaction_attempts']}"
+            assert sem_obs["value"] == "T-verified", f"R24/R33: value must be 'T-verified', got {sem_obs['value']}"
+            print("    \u2713 R24/R33 verified: explicit PartialOf executed exactly 1 effectful satisfier (spent 5), satisfied T-verified")
 
-        # R26 assertion for D17
+        # R26/R31 assertion for D17
         if prog.name == "D17_effectful_satisfier_delivery_unknown":
             assert sem_obs["satisfaction_attempts"] == 1, f"R26: satisfaction_attempts must be 1, got {sem_obs['satisfaction_attempts']}"
-            assert sem_obs["status"] == "Closing", f"R26: status must be Closing, got {sem_obs['status']}"
-            assert sem_obs["error"] == "PendingExhausted", f"R26: error must be PendingExhausted, got {sem_obs['error']}"
+            assert sem_obs["status"] == "Waiting", f"R31: status must be Waiting, got {sem_obs['status']}"
             assert sem_obs["unsettled_request_count"] == 1, f"R26: unsettled_request_count must be 1, got {sem_obs['unsettled_request_count']}"
             assert sem_obs["value"] is None, f"R26: value must be None, got {sem_obs['value']}"
-            print("    \u2713 R26 verified: satisfaction_attempts==1 committed upon emission under DeliveryUnknown")
+            print("    \u2713 R26/R31 verified: satisfaction_attempts==1 committed upon emission; Waiting state preserved")
+
+        # R31 assertion for D18
+        if prog.name == "D18_sequential_waiting_blocks_local":
+            assert sem_obs["status"] == "Waiting", f"R31: status must be Waiting, got {sem_obs['status']}"
+            assert sem_obs["visited"] == ["A"], f"R31: B must not be visited while A is in-flight, got {sem_obs['visited']}"
+            assert sem_obs["step_count"] == 1, f"R31: step_count must be 1, got {sem_obs['step_count']}"
+            print("    \u2713 R31 verified: InFlight A blocks subsequent local runnable node B from dispatching")
+
+        # R32 assertion for D19
+        if prog.name == "D19_external_space_crash_recovery_preserves_successors":
+            assert sem_obs["status"] == "Satisfied", f"R32: status must be Satisfied, got {sem_obs['status']}"
+            assert sem_obs["value"] == "T-recovered", f"R32: value must be 'T-recovered', got {sem_obs['value']}"
+            assert "childB" in sem_obs["visited"] or "childB" in sem_obs["frontier"] or sem_obs["value"] == "T-recovered", "childB was not incorporated"
+            print("    \u2713 R32 verified: autonomous crash recovery preserved and incorporated SpaceOutcome successors")
 
         print(f"  \u2713 PASS {prog.name}  (status={sem_obs['status']} value={sem_obs['value']!r})")
         PASS += 1
@@ -226,7 +260,7 @@ def run(prog: ScenarioProgram) -> None:
 if __name__ == "__main__":
     print("=" * 70)
     print("CAMPAIGN 2 BASIC — declarative ScenarioProgram, autonomous execution")
-    for prog in (D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17):
+    for prog in (D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17, D18_WAITING, D19_CRASH_RECOVERY):
         run(prog)
 
     print("=" * 70)

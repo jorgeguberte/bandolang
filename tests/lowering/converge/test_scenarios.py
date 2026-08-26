@@ -321,9 +321,10 @@ def t12():
         raise AssertionError("second request staged while first request unsettled")
     except tx.TransitionError as e:
         assert_true("sequential in-flight" in str(e), f"wrong refusal message: {e}")
-    # Settle r1 -> now r2 can be staged and emitted
+    # Settle r1 and apply -> now r2 can be staged and emitted
     h.step("deliver-1", tx.admit_completion, h1, "rc1", "d1")
     h.step("settle-1", tx.settle, h1, "usd", 10)
+    h.step("apply-1", tx.apply_space_completion, h1, [])
     h2 = h.step("stage-2-after-settle", tx.stage_local, "n2", "op2", "r2", "usd", 10)
     h.step("emit-2-after-settle", tx.emit_external, "r2")
     assert_true(d.current_in_flight.request_id == "r2", "r2 not admitted after settlement")
@@ -376,22 +377,22 @@ def t14():
 
 @scenario("T15_CRASH_DURING_SPACE_APPLY_RECOVERY")
 def t15():
-    """R27: Crash during atomic space apply recovery: domain restores durable state and re-drives atomic apply."""
+    """R27/R32: Autonomous crash recovery for space completion from durable SpaceOutcome."""
+    from model import SpaceOutcome
     d, h = new_domain()
     h.step("stage", tx.stage_local, "n15", "op15", "r15", "usd", 20)
     handle = h.step("emit", tx.emit_external, "r15")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-15", "digest-15")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-15", "digest-15",
+           semantic_payload=SpaceOutcome(successors=["succA", "succB"]))
     h.step("settle", tx.settle, handle, "usd", 20)
 
     # Durable pre-apply snapshot
     pre_snap = h.snapshot()
 
-    # Simulate crash before apply commits
+    # Simulate crash before apply commits; recover autonomously reads SpaceOutcome:
     d_rec = pre_snap.copy()
-    h_rec = Harness(d_rec)
-
-    # Recovery atomically incorporates successors + Applied
-    h_rec.step("apply-space-atomic", tx.apply_space_completion, handle, ["succA", "succB"])
+    from transitions import recover
+    recover(d_rec, pre_snap, "after_settlement_before_apply")
     assert_true(d_rec.handles[handle].applied and d_rec.handles[handle].state == "Applied", "handle not Applied")
     assert_true("succA" in d_rec.nodes and "succB" in d_rec.nodes, "successors not in nodes")
     assert_true("succA" in d_rec.frontier and "succB" in d_rec.frontier, "successors not in frontier")
@@ -399,20 +400,22 @@ def t15():
 
 @scenario("T16_CRASH_DURING_SATISFIER_APPLY_RECOVERY")
 def t16():
-    """R27: Crash during atomic satisfier apply recovery: domain restores durable state and re-drives atomic satisfier apply."""
+    """R27/R32: Autonomous crash recovery for satisfier completion from durable SatisfierOutcome."""
+    from model import SatisfierOutcome
     d, h = new_domain()
     h.step("stage", tx.stage_local, "cand16", "opSat", "r16", "usd", 5, is_expansion=False)
     handle = h.step("emit", tx.emit_external, "r16")
-    h.step("deliver", tx.admit_completion, handle, "rcpt-16", "digest-16")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-16", "digest-16",
+           semantic_payload=SatisfierOutcome(node_id="cand16", op_id="opSat", satisfied=True, value="T-sat-val"))
     h.step("settle", tx.settle, handle, "usd", 5)
 
     # Durable pre-apply snapshot
     pre_snap = h.snapshot()
 
-    # Recovery atomically incorporates satisfaction + Applied
+    # Simulate crash before apply commits; recover autonomously reads SatisfierOutcome:
     d_rec = pre_snap.copy()
-    h_rec = Harness(d_rec)
-    h_rec.step("apply-sat-atomic", tx.apply_satisfier_completion, handle, "cand16", "opSat", True, "T-sat-val")
+    from transitions import recover
+    recover(d_rec, pre_snap, "after_settlement_before_apply")
     assert_true(d_rec.handles[handle].applied and d_rec.handles[handle].state == "Applied", "handle not Applied")
     assert_true(d_rec.frame_status == SearchStatus.SATISFIED, "frame not Satisfied")
     assert_true(d_rec.satisfied_value == "T-sat-val", "satisfied value missing")

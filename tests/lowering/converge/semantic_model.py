@@ -98,9 +98,10 @@ class SemanticFrame:
             self.status = Status.CANCELLED
             self.outcome = SemanticOutcome(Status.CANCELLED)
 
-    def exhaust(self) -> None:
-        """Natural exhaustion."""
-        if self.status == Status.SEARCHING:
+    def exhaust(self, reason: str = "FrontierEmpty") -> None:
+        """Natural exhaustion (R34)."""
+        if self.status in (Status.SEARCHING, "Waiting"):
+            self.exhaustion_reason = reason
             self.status = Status.EXHAUSTED
             self.outcome = SemanticOutcome(Status.EXHAUSTED)
 
@@ -110,11 +111,13 @@ class SemanticFrame:
         """Execute a ScenarioProgram purely via semantic search semantics."""
         self.max_steps = prog.max_steps
         self.budget_limit = prog.budget_limit
+        self.exhaustion_reason = None
 
         for n in prog.initial_frontier:
             self.frontier.append(n)
             self.nodes[n] = "Frontier"
 
+        runnable_idx = 0
         while self.status == Status.SEARCHING:
             if self.step_count >= self.max_steps or not self.frontier:
                 break
@@ -137,6 +140,17 @@ class SemanticFrame:
             succs = list(prog.successors.get(node, []))
             self.expand(node, op, succs)
 
+            # R31: External dispatch with DeliveryUnknown transitions to Waiting state
+            if prog.fault_spec.delivery_unknown and op.kind == "external":
+                self.status = "Waiting"
+                self.outcome = SemanticOutcome("Waiting")
+                self.budget_spent = 0
+                self.outstanding_scope_commitment = op.cost
+                self.unsettled_request_count = 1
+                self.attributable_owner_reserved = op.cost
+                self.intent_available_consumed = op.cost
+                return self.outcome
+
             # Check for environmental cancellation
             if prog.fault_spec.cancel_in_flight:
                 self.cancel()
@@ -145,6 +159,10 @@ class SemanticFrame:
             # Candidates to check: the expanded node itself, then its successors
             candidates = [node] + succs
             for cand in candidates:
+                # R33: Check satisfaction only on nodes with explicit PartialOf(cand) == Some(P)
+                if prog.partial_map and cand not in prog.partial_map:
+                    continue
+
                 # R24/R26: effectful satisfier
                 if prog.effectful_satisfier:
                     es_cost = prog.effectful_satisfier.cost
@@ -155,9 +173,9 @@ class SemanticFrame:
                     self.effects.append(f"external({prog.effectful_satisfier.op_id})")
 
                     if prog.fault_spec.delivery_unknown:
-                        # DeliveryUnknown: request emitted, remains in-flight without receipt
-                        self.status = "Closing"
-                        self.outcome = SemanticOutcome("Closing", error="PendingExhausted")
+                        # R31: DeliveryUnknown leaves frame in Waiting state
+                        self.status = "Waiting"
+                        self.outcome = SemanticOutcome("Waiting")
                         self.outstanding_scope_commitment = es_cost
                         self.unsettled_request_count = 1
                         self.attributable_owner_reserved = es_cost
@@ -177,10 +195,17 @@ class SemanticFrame:
 
         # Post-fuel / partial check (D03)
         if self.status == Status.SEARCHING and prog.check_partial_after_fuel:
-            self.check_satisfaction(prog.check_partial_after_fuel, prog.satisfier_map, prog.on_satisfier_error)
+            if self.check_satisfaction(prog.check_partial_after_fuel, prog.satisfier_map, prog.on_satisfier_error):
+                return self.outcome
 
         if self.status == Status.SEARCHING:
-            self.exhaust()
+            if self.step_count >= self.max_steps:
+                reason = "FuelExhausted"
+            elif runnable_idx is None:
+                reason = "BudgetDepleted"
+            else:
+                reason = "FrontierEmpty"
+            self.exhaust(reason)
 
         return self.outcome
 
@@ -201,4 +226,5 @@ class SemanticFrame:
             "attributable_owner_reserved": getattr(self, "attributable_owner_reserved", 0),
             "intent_available_consumed": getattr(self, "intent_available_consumed", self.budget_spent),
             "effects": sorted(self.effects),
+            "exhaustion_reason": getattr(self, "exhaustion_reason", None) if self.status == "Exhausted" else None,
         }
