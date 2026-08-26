@@ -36,6 +36,7 @@ class FaultSpec:
     delivery_unknown: bool = False
     delivery_unknown_ops: tuple[str, ...] = ()  # R41: targeted op_ids that suffer DeliveryUnknown
     safe_retry: bool = False
+    double_delivery_unknown: bool = False       # R60: second retry attempt also fails with DeliveryUnknown
     duplicate_completion: bool = False
     crash_after_settlement: bool = False
     cancel_in_flight: bool = False
@@ -406,27 +407,25 @@ D23_EFFECTFUL_SATISFIER_ERR_ABORT = ScenarioProgram(
     effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
 )
 
-# R52: effectful satisfier Err(e) with retry policy continues search to next candidate
+# R52/R59: effectful satisfier Err(e) with retry policy retries the candidate until success
 D24_EFFECTFUL_SATISFIER_ERR_RETRY = ScenarioProgram(
     name="D24_effectful_satisfier_err_retry",
     initial_frontier=["root"],
-    successors={"root": ["cand1", "cand2"]},
+    successors={"root": ["cand1"]},
     node_ops={
         "root": OpDef("opRoot", kind="local"),
         "cand1": OpDef("opCand1", kind="local"),
-        "cand2": OpDef("opCand2", kind="local"),
     },
     partial_map={
         "cand1": "P1",
-        "cand2": "P2",
     },
     satisfier_map={
-        "cand1": ("err", False, "transient verification failure"),
-        "cand2": ("ok", True, "T-recovered-after-retry"),
+        "cand1": [("err", False, "transient verification failure"), ("ok", True, "T-recovered-on-retry-2")],
     },
     on_satisfier_error="retry",
     max_steps=6,
     budget_limit=100,
+    max_satisfaction_attempts=2,
     effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
 )
 
@@ -449,4 +448,50 @@ D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN = ScenarioProgram(
     budget_limit=100,
     effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
     fault_spec=FaultSpec(delivery_unknown_ops=("opVerify",)),
+)
+
+# R59: satisfier retry attempt limit prevents second attempt on transient failure
+D26_SATISFIER_RETRY_LIMIT_BLOCKS_RETRY = ScenarioProgram(
+    name="D26_satisfier_retry_limit_blocks_retry",
+    initial_frontier=["root"],
+    successors={"root": ["cand1"]},
+    node_ops={
+        "root": OpDef("opRoot", kind="local"),
+        "cand1": OpDef("opCand1", kind="local"),
+    },
+    partial_map={
+        "cand1": "P1",
+    },
+    satisfier_map={
+        "cand1": [("err", False, "transient failure"), ("ok", True, "T-unreached")],
+    },
+    on_satisfier_error="retry",
+    max_steps=6,
+    budget_limit=100,
+    max_satisfaction_attempts=1,
+    effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
+)
+
+# R60: safe retry allowed on idempotent-only operation (dedup_capable=False, idempotent=True)
+D27_IDEMPOTENT_SAFE_RETRY = ScenarioProgram(
+    name="D27_idempotent_safe_retry",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("opIdemp", kind="external", cost=15, dedup_capable=False, idempotent=True)},
+    partial_map={"root": "P_root"},
+    satisfier_map={"root": ("ok", True, "T-idempotent-retry")},
+    max_steps=6,
+    fault_spec=FaultSpec(delivery_unknown=True, safe_retry=True),
+)
+
+# R60: double DeliveryUnknown on retry leaves frame in Waiting with transport_attempts==2
+D28_DOUBLE_DELIVERY_UNKNOWN_REMAINS_WAITING = ScenarioProgram(
+    name="D28_double_delivery_unknown_remains_waiting",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("opA", kind="external", cost=10, dedup_capable=True)},
+    partial_map={},
+    fault_spec=FaultSpec(delivery_unknown=True, safe_retry=True, double_delivery_unknown=True),
+    max_steps=6,
+    budget_limit=100,
 )

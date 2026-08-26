@@ -52,10 +52,19 @@ class ClosingReason:
 # Records
 # ---------------------------------------------------------------------
 
+class SatisfactionState:
+    UNTESTED = "Untested"
+    SATISFIED = "Satisfied"
+    CHECKED_NOT_SATISFIED = "CheckedNotSatisfied"
+    RETRYABLE_FAILURE = "RetryableFailure"
+
+
 @dataclass(frozen=True)
 class SearchNode:
     node_id: str
     status: str
+    satisfaction_state: str = SatisfactionState.UNTESTED
+    satisfaction_retries: int = 0
 
 
 @dataclass(frozen=True)
@@ -114,6 +123,14 @@ class OutboxRecord:
     is_expansion: bool = True       # True for space expansion, False for effectful satisfier
 
 
+@dataclass(frozen=True)
+class ExecutionReceipt:
+    """R57: Durable execution receipt carrying authoritative usage/accounting facts from adapter."""
+    receipt_id: str
+    resource: str
+    amount: int
+
+
 @dataclass
 class InFlightLifecycleState:
     handle_id: str
@@ -144,12 +161,13 @@ class SatisfierOutcome:
 
 @dataclass(frozen=True)
 class CompletionRecord:
-    """Durable record of a completion delivered for a handle (R32)."""
+    """Durable record of a completion delivered for a handle (R32/R56/R57)."""
     handle_id: str
     receipt_id: str
     digest: str
     outcome: str              # "Success" | "Failure"
     semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None
+    receipt: Optional[ExecutionReceipt] = None
 
 
 @dataclass(frozen=True)

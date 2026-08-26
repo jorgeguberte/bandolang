@@ -509,6 +509,76 @@ def t19():
     assert_true("BAD_SUCC" not in d.nodes, "volatile BAD_SUCC leaked into nodes")
 
 
+@scenario("T20_PENDING_CANCELLED_LATE_SATISFACTION_DISCARDED")
+def t20():
+    """R58: Late satisfaction arriving during Closing(PendingCancelled) is discarded; frame drains to Cancelled."""
+    from model import SatisfierOutcome
+    d, h = new_domain()
+    h.step("stage", tx.stage_local, "root", "opSat", "r20", "usd", 5, is_expansion=False)
+    handle = h.step("emit", tx.emit_external, "r20")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-20",
+           semantic_payload=SatisfierOutcome("root", "opSat", True, "T-late"))
+    h.step("cancel", tx.cancel)
+    assert_true(d.frame_status == SearchStatus.CLOSING, "expected Closing")
+    assert_true(d.closing_reason.kind == "PendingCancelled", "expected PendingCancelled")
+
+    h.step("late-settle", tx.settle, handle, "usd", 5)
+    # Apply satisfier completion during Closing — must safely discard satisfaction outcome!
+    h.step("apply-late-satisfaction", tx.apply_satisfier_completion, handle)
+    assert_true(d.frame_status == SearchStatus.CLOSING, "status changed during Closing")
+
+    h.step("drain", tx.finish_if_drained)
+    assert_true(d.frame_status == SearchStatus.CANCELLED, f"expected Cancelled, got {d.frame_status}")
+    assert_true(d.satisfied_value is None, f"satisfied_value leaked: {d.satisfied_value}")
+
+
+@scenario("T21_PENDING_FAILURE_LATE_SPACE_DISCARDED")
+def t21():
+    """R58: Late space outcome arriving during Closing(PendingFailure) is discarded; frontier unchanged."""
+    from model import SpaceOutcome
+    d, h = new_domain()
+    h.step("stage", tx.stage_local, "n21", "op21", "r21", "usd", 10)
+    handle = h.step("emit", tx.emit_external, "r21")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-21",
+           semantic_payload=SpaceOutcome(successors=["LATE_CHILD"]))
+    h.step("fatal-close", tx.fatal_close, "InvariantBreach")
+    assert_true(d.frame_status == SearchStatus.CLOSING, "expected Closing")
+    assert_true(d.closing_reason.kind == "PendingFailure", "expected PendingFailure")
+
+    h.step("late-settle", tx.settle, handle, "usd", 10)
+    # Apply space completion during Closing — must discard successors without error
+    h.step("apply-late-space", tx.apply_space_completion, handle)
+    assert_true("LATE_CHILD" not in d.frontier, "LATE_CHILD mutated frontier during Closing")
+
+    h.step("drain", tx.finish_if_drained)
+    assert_true(d.frame_status == SearchStatus.FAILED, f"expected Failed, got {d.frame_status}")
+
+
+@scenario("T22_RECOVERY_WHILE_CLOSING_DISCARDS_SEMANTIC_PAYLOAD")
+def t22():
+    """R58: Crash recovery while Closing forward-applies settled handles without mutating frontier or changing Closing reason."""
+    from model import SpaceOutcome
+    d, h = new_domain()
+    h.step("stage", tx.stage_local, "n22", "op22", "r22", "usd", 10)
+    handle = h.step("emit", tx.emit_external, "r22")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-22",
+           semantic_payload=SpaceOutcome(successors=["CRASH_CHILD"]))
+    h.step("cancel", tx.cancel)
+    h.step("late-settle", tx.settle, handle, "usd", 10)
+    snapshot = h.snapshot()
+
+    # Recover from snapshot while Closing
+    from transitions import recover
+    recover(d, snapshot, "after_settlement_before_apply")
+
+    assert_true(d.frame_status == SearchStatus.CLOSING, "frame_status corrupted during recovery")
+    assert_true(d.closing_reason.kind == "PendingCancelled", "closing_reason corrupted during recovery")
+    assert_true("CRASH_CHILD" not in d.frontier, "CRASH_CHILD incorporated during Closing recovery")
+    h_rec = Harness(d)
+    h_rec.step("drain", tx.finish_if_drained)
+    assert_true(d.frame_status == SearchStatus.CANCELLED, f"expected Cancelled, got {d.frame_status}")
+
+
 # =====================================================================
 print("\n" + "=" * 70)
 print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed ({PASS + FAIL} total)")

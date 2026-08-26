@@ -144,15 +144,25 @@ class SemanticFrame:
             op_is_delivery_unknown = prog.fault_spec.delivery_unknown or (op.op_id in prog.fault_spec.delivery_unknown_ops)
             self.expand(node, op, succs, delivery_unknown=op_is_delivery_unknown)
 
-            # R31/R41/R51: External dispatch with DeliveryUnknown transitions to Waiting state unless safe_retry succeeds
+            # R31/R41/R51/R60: External dispatch with DeliveryUnknown transitions to Waiting state unless safe_retry succeeds
             if op_is_delivery_unknown and op.kind == "external":
-                if prog.fault_spec.safe_retry and op.dedup_capable:
-                    # R51: Safe transport retry succeeds on second attempt
-                    self.budget_spent += op.charge()
-                    for s in succs:
-                        if s not in self.nodes:
-                            self.nodes[s] = "Frontier"
-                            self.frontier.append(s)
+                if prog.fault_spec.safe_retry and (op.dedup_capable or op.idempotent):
+                    if prog.fault_spec.double_delivery_unknown:
+                        # R60: second retry attempt also suffers DeliveryUnknown -> remains Waiting
+                        self.status = "Waiting"
+                        self.outcome = SemanticOutcome("Waiting")
+                        self.outstanding_scope_commitment = op.cost
+                        self.unsettled_request_count = 1
+                        self.attributable_owner_reserved = op.cost
+                        self.intent_available_consumed = self.budget_spent + op.cost
+                        return self.outcome
+                    else:
+                        # R51: Safe transport retry succeeds on second attempt
+                        self.budget_spent += op.charge()
+                        for s in succs:
+                            if s not in self.nodes:
+                                self.nodes[s] = "Frontier"
+                                self.frontier.append(s)
                 else:
                     self.status = "Waiting"
                     self.outcome = SemanticOutcome("Waiting")
@@ -174,55 +184,76 @@ class SemanticFrame:
                 if cand not in prog.partial_map:
                     continue
 
-                # R42/R49: Check satisfaction attempt limit
-                if self.satisfaction_attempts >= prog.max_satisfaction_attempts:
-                    continue
+                cand_attempts = 0
+                while True:
+                    # R42/R49/R59: Check satisfaction attempt limit
+                    if self.satisfaction_attempts >= prog.max_satisfaction_attempts:
+                        break
 
-                # R24/R26/R52/R55: effectful satisfier
-                if prog.effectful_satisfier:
-                    es = prog.effectful_satisfier
-                    es_cost = es.cost
-                    if self.budget_spent + es_cost > self.budget_limit:
-                        continue
-                    # R26: satisfaction attempt committed upon emission
-                    self.satisfaction_attempts += 1
-                    self.effects.append(f"external({es.op_id})")
+                    # R24/R26/R52/R55/R59/R60: effectful satisfier
+                    if prog.effectful_satisfier:
+                        es = prog.effectful_satisfier
+                        es_cost = es.cost
+                        if self.budget_spent + es_cost > self.budget_limit:
+                            break
+                        # R26: satisfaction attempt committed upon emission
+                        self.satisfaction_attempts += 1
+                        cand_attempts += 1
+                        self.effects.append(f"external({es.op_id})")
 
-                    es_is_delivery_unknown = prog.fault_spec.delivery_unknown or (es.op_id in prog.fault_spec.delivery_unknown_ops)
-                    if es_is_delivery_unknown:
-                        if prog.fault_spec.safe_retry and es.dedup_capable:
+                        es_is_delivery_unknown = prog.fault_spec.delivery_unknown or (es.op_id in prog.fault_spec.delivery_unknown_ops)
+                        if es_is_delivery_unknown:
+                            if prog.fault_spec.safe_retry and (es.dedup_capable or es.idempotent):
+                                if prog.fault_spec.double_delivery_unknown:
+                                    self.status = "Waiting"
+                                    self.outcome = SemanticOutcome("Waiting")
+                                    self.outstanding_scope_commitment = es_cost
+                                    self.unsettled_request_count = 1
+                                    self.attributable_owner_reserved = es_cost
+                                    self.intent_available_consumed = self.budget_spent + es_cost
+                                    return self.outcome
+                                else:
+                                    self.budget_spent += es.charge()
+                            else:
+                                # R31: DeliveryUnknown leaves frame in Waiting state
+                                self.status = "Waiting"
+                                self.outcome = SemanticOutcome("Waiting")
+                                self.outstanding_scope_commitment = es_cost
+                                self.unsettled_request_count = 1
+                                self.attributable_owner_reserved = es_cost
+                                self.intent_available_consumed = self.budget_spent + es_cost
+                                return self.outcome
+                        else:
                             self.budget_spent += es.charge()
+
+                        map_entry = prog.satisfier_map.get(cand, ("ok", False, None))
+                        if isinstance(map_entry, list):
+                            idx = min(cand_attempts - 1, len(map_entry) - 1)
+                            kind, ok, val = map_entry[idx]
                         else:
-                            # R31: DeliveryUnknown leaves frame in Waiting state
-                            self.status = "Waiting"
-                            self.outcome = SemanticOutcome("Waiting")
-                            self.outstanding_scope_commitment = es_cost
-                            self.unsettled_request_count = 1
-                            self.attributable_owner_reserved = es_cost
-                            self.intent_available_consumed = self.budget_spent + es_cost
+                            kind, ok, val = map_entry
+
+                        if kind == "err":
+                            # R52/R59: effectful satisfier Err(e) honors on_satisfier_error policy
+                            self.satisfier_error = val
+                            if prog.on_satisfier_error == "abort":
+                                self.status = "Failed"
+                                self.outcome = SemanticOutcome("Failed", error=val)
+                                return self.outcome
+                            else:
+                                # R59 retry policy: loop again to retry candidate if attempts < max
+                                continue
+                        elif ok:
+                            self.status = Status.SATISFIED
+                            self.outcome = SemanticOutcome(Status.SATISFIED, val)
                             return self.outcome
+                        else:
+                            # Not satisfied (Ok None)
+                            break
                     else:
-                        self.budget_spent += es.charge()
-
-                    kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
-                    if kind == "err":
-                        # R52: effectful satisfier Err(e) honors on_satisfier_error policy
-                        self.satisfier_error = val
-                        if prog.on_satisfier_error == "abort":
-                            self.status = "Failed"
-                            self.outcome = SemanticOutcome("Failed", error=val)
+                        if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
                             return self.outcome
-                        else:
-                            # retry policy: candidate failed, continue to next candidate
-                            continue
-                    elif ok:
-                        self.status = Status.SATISFIED
-                        self.outcome = SemanticOutcome(Status.SATISFIED, val)
-                        return self.outcome
-                    continue
-
-                if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
-                    return self.outcome
+                        break
 
         # Post-fuel / partial check (D03 / R49)
         if self.status == Status.SEARCHING and prog.check_partial_after_fuel:

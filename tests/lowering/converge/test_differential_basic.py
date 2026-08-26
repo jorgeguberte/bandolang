@@ -21,13 +21,15 @@ from scenarios import (
     D18_WAITING, D19_CRASH_RECOVERY, D20_TARGETED_DELIVERY_UNKNOWN,
     D21_SATISFACTION_LIMIT, D22_DELIVERY_UNKNOWN_NO_SUCCESSORS,
     D23_EFFECTFUL_SATISFIER_ERR_ABORT, D24_EFFECTFUL_SATISFIER_ERR_RETRY,
-    D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN, OpDef, ScenarioProgram,
+    D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN,
+    D26_SATISFIER_RETRY_LIMIT_BLOCKS_RETRY, D27_IDEMPOTENT_SAFE_RETRY,
+    D28_DOUBLE_DELIVERY_UNKNOWN_REMAINS_WAITING, OpDef, ScenarioProgram,
 )
 import transitions as tx
 from differential import compare, classify, lowered_observation
 from harness import CrashInjected, Harness
 from model import (
-    ConvergeTransactionDomain, NodeStatus, SatisfierOutcome, SearchNode,
+    ConvergeTransactionDomain, ExecutionReceipt, NodeStatus, SatisfierOutcome, SearchNode,
     SearchStatus, SpaceOutcome,
 )
 from semantic_model import SemanticFrame
@@ -70,35 +72,45 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                    deliver_unknown=op_is_delivery_unknown)
 
             if op_is_delivery_unknown:
-                if prog.fault_spec.safe_retry and op.dedup_capable:
-                    # R51: Safe transport retry on the same request_id succeeds!
-                    steps_before = d.step_count
-                    h.step(f"retry-{op.op_id}", tx.emit_external, handle, deliver_unknown=False)
-                    assert d.step_count == steps_before, "retry consumed fuel"
+                if prog.fault_spec.safe_retry and (op.dedup_capable or op.idempotent):
+                    if prog.fault_spec.double_delivery_unknown:
+                        # R60: second retry attempt also suffers DeliveryUnknown -> remains Waiting
+                        h.step(f"retry-{op.op_id}", tx.emit_external, handle, deliver_unknown=True)
+                        break
+                    else:
+                        # R51/R60: Safe transport retry succeeds!
+                        steps_before = d.step_count
+                        h.step(f"retry-{op.op_id}", tx.emit_external, handle, deliver_unknown=False)
+                        assert d.step_count == steps_before, "retry consumed fuel"
                 else:
                     # R31: delivery unknown remains in Waiting state
                     break
 
+            rcpt_space = ExecutionReceipt(f"rcpt-{req_id}", "usd", charge)
             if prog.fault_spec.cancel_in_flight:
                 h.step(f"deliver-{op.op_id}", tx.admit_completion, handle,
                        f"rcpt-{req_id}",
-                       semantic_payload=SpaceOutcome(successors=succs))
+                       semantic_payload=SpaceOutcome(successors=succs),
+                       receipt=rcpt_space)
                 h.step("cancel", tx.cancel)
-                h.step("late-settle", tx.settle, handle, "usd", charge)
+                h.step("late-settle", tx.settle, handle)
                 h.step("drain", tx.finish_if_drained)
                 break
 
-            # R32/R46: durable completion payload carries SpaceOutcome with canonical digest
+            # R32/R46/R56/R57: durable completion payload carries SpaceOutcome with canonical digest and ExecutionReceipt
             h.step(f"deliver-{op.op_id}", tx.admit_completion, handle,
                    f"rcpt-{req_id}",
-                   semantic_payload=SpaceOutcome(successors=succs))
+                   semantic_payload=SpaceOutcome(successors=succs),
+                   receipt=rcpt_space)
 
             if prog.fault_spec.duplicate_completion:
                 h.step(f"dup-deliver-{op.op_id}", tx.admit_completion, handle,
                        f"rcpt-{req_id}",
-                       semantic_payload=SpaceOutcome(successors=succs))
+                       semantic_payload=SpaceOutcome(successors=succs),
+                       receipt=rcpt_space)
 
-            h.step(f"settle-{op.op_id}", tx.settle, handle, "usd", charge)
+            # R57: settle derives amount and resource authoritatively from receipt
+            h.step(f"settle-{op.op_id}", tx.settle, handle)
 
             if prog.fault_spec.crash_after_settlement:
                 try:
@@ -120,66 +132,101 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
             if cand not in prog.partial_map:
                 continue
 
-            # R42/R49: Check satisfaction attempt limit
-            if d.satisfaction_attempts >= prog.max_satisfaction_attempts:
-                continue
+            cand_attempts = 0
+            while True:
+                # R42/R49/R59: Check satisfaction attempt limit
+                if d.satisfaction_attempts >= prog.max_satisfaction_attempts:
+                    break
 
-            # R24/R26/R52/R55: effectful satisfier
-            if prog.effectful_satisfier:
-                es = prog.effectful_satisfier
-                if not tx.classify_runnable(d, es.cost, "usd"):
-                    continue
-                h_req = f"req:{es.op_id}:{cand}"
-                h_handle = h.step(f"stage-sat-{es.op_id}", tx.stage_local, cand, es.op_id, h_req,
-                                  "usd", es.cost, is_expansion=False)
-
-                es_is_delivery_unknown = prog.fault_spec.delivery_unknown or (es.op_id in prog.fault_spec.delivery_unknown_ops)
-                h.step(f"emit-sat-{es.op_id}", tx.emit_external, h_handle,
-                       deliver_unknown=es_is_delivery_unknown)
-
-                if es_is_delivery_unknown:
-                    if prog.fault_spec.safe_retry and es.dedup_capable:
-                        h.step(f"retry-sat-{es.op_id}", tx.emit_external, h_handle, deliver_unknown=False)
-                    else:
-                        # R31: delivery unknown remains in Waiting state
+                # R24/R26/R52/R55/R59/R60: effectful satisfier
+                if prog.effectful_satisfier:
+                    es = prog.effectful_satisfier
+                    if not tx.classify_runnable(d, es.cost, "usd"):
                         break
+                    cand_attempts += 1
+                    h_req = f"req:{es.op_id}:{cand}:{cand_attempts}"
+                    h_handle = h.step(f"stage-sat-{es.op_id}-{cand_attempts}", tx.stage_local, cand, es.op_id, h_req,
+                                      "usd", es.cost, is_expansion=False)
 
-                if prog.fault_spec.cancel_in_flight:
-                    h.step("cancel", tx.cancel)
-                    h.step("drain", tx.finish_if_drained)
-                    break
+                    es_is_delivery_unknown = prog.fault_spec.delivery_unknown or (es.op_id in prog.fault_spec.delivery_unknown_ops)
+                    h.step(f"emit-sat-{es.op_id}-{cand_attempts}", tx.emit_external, h_handle,
+                           deliver_unknown=es_is_delivery_unknown)
 
-                kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
-                if kind == "err":
-                    sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=False, value=None, error=val)
-                elif ok:
-                    sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=True, value=val, error=None)
-                else:
-                    sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=False, value=None, error=None)
+                    if es_is_delivery_unknown:
+                        if prog.fault_spec.safe_retry and (es.dedup_capable or es.idempotent):
+                            if prog.fault_spec.double_delivery_unknown:
+                                h.step(f"retry-sat-{es.op_id}-{cand_attempts}", tx.emit_external, h_handle, deliver_unknown=True)
+                                break
+                            else:
+                                h.step(f"retry-sat-{es.op_id}-{cand_attempts}", tx.emit_external, h_handle, deliver_unknown=False)
+                        else:
+                            # R31: delivery unknown remains in Waiting state
+                            break
 
-                h.step(f"deliver-sat-{es.op_id}", tx.admit_completion, h_handle, f"rcpt-sat-{cand}",
-                       semantic_payload=sat_payload)
-                h.step(f"settle-sat-{es.op_id}", tx.settle, h_handle, "usd", es.charge())
-                # R45/R52: apply_satisfier_completion reads durable SatisfierOutcome and frame error policy
-                h.step(f"apply-sat-{es.op_id}", tx.apply_satisfier_completion, h_handle)
-                if kind == "err" and prog.on_satisfier_error == "abort":
-                    h.step("drain", tx.finish_if_drained)
-                    break
-                elif ok:
-                    break
-            else:
-                kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
-                if kind == "err":
-                    h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id,
-                           False, error=val, abort_on_error=(prog.on_satisfier_error == "abort"))
-                    if prog.on_satisfier_error == "abort":
+                    if prog.fault_spec.cancel_in_flight:
+                        h.step("cancel", tx.cancel)
                         h.step("drain", tx.finish_if_drained)
                         break
-                elif ok:
-                    h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id, True, value=val)
-                    break
+
+                    map_entry = prog.satisfier_map.get(cand, ("ok", False, None))
+                    if isinstance(map_entry, list):
+                        idx = min(cand_attempts - 1, len(map_entry) - 1)
+                        kind, ok, val = map_entry[idx]
+                    else:
+                        kind, ok, val = map_entry
+
+                    if kind == "err":
+                        sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=False, value=None, error=val)
+                    elif ok:
+                        sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=True, value=val, error=None)
+                    else:
+                        sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=False, value=None, error=None)
+
+                    rcpt_sat = ExecutionReceipt(f"rcpt-sat-{cand}-{cand_attempts}", "usd", es.charge())
+                    h.step(f"deliver-sat-{es.op_id}-{cand_attempts}", tx.admit_completion, h_handle, f"rcpt-sat-{cand}-{cand_attempts}",
+                           semantic_payload=sat_payload, receipt=rcpt_sat)
+                    # R57: settle derives charge authoritatively from receipt
+                    h.step(f"settle-sat-{es.op_id}-{cand_attempts}", tx.settle, h_handle)
+                    # R45/R52: apply_satisfier_completion reads durable SatisfierOutcome and frame error policy
+                    h.step(f"apply-sat-{es.op_id}-{cand_attempts}", tx.apply_satisfier_completion, h_handle)
+                    if kind == "err":
+                        if prog.on_satisfier_error == "abort":
+                            h.step("drain", tx.finish_if_drained)
+                            break
+                        else:
+                            # R59: retry candidate
+                            continue
+                    elif ok:
+                        break
+                    else:
+                        break
                 else:
-                    h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id, False)
+                    kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
+                    if kind == "err":
+                        h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id,
+                               False, error=val, abort_on_error=(prog.on_satisfier_error == "abort"))
+                        if prog.on_satisfier_error == "abort":
+                            h.step("drain", tx.finish_if_drained)
+                            break
+                    elif ok:
+                        h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id, True, value=val)
+                        break
+                    else:
+                        h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id, False)
+                    break
+
+    # Post-fuel / partial check (D03 / R49)
+    if d.frame_status in (SearchStatus.SEARCHING, SearchStatus.EXHAUSTED) and prog.check_partial_after_fuel:
+        if (d.satisfaction_attempts < prog.max_satisfaction_attempts and
+            prog.check_partial_after_fuel in prog.partial_map):
+            cand = prog.check_partial_after_fuel
+            kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
+            if ok:
+                h.step(f"check-partial-{cand}", tx.check_satisfaction, cand,
+                       "partial_check", True, value=val)
+
+    if d.frame_status == SearchStatus.SEARCHING:
+        h.step("exhaust", tx.exhaust, "FrontierEmpty" if not d.frontier else "FuelExhausted")
 
     # Post-fuel / partial check (D03 / R49)
     if d.frame_status in (SearchStatus.SEARCHING, SearchStatus.EXHAUSTED) and prog.check_partial_after_fuel:
@@ -310,12 +357,12 @@ def run(prog: ScenarioProgram) -> None:
             assert sem_obs["error"] == "sensor failure", f"R52: error must be 'sensor failure', got {sem_obs['error']}"
             print("    \u2713 R52 verified: effectful satisfier Err(e) with abort policy transitions to Failed(e)")
 
-        # R52 assertion for D24
+        # R52/R59 assertion for D24
         if prog.name == "D24_effectful_satisfier_err_retry":
             assert sem_obs["status"] == "Satisfied", f"R52: status must be Satisfied, got {sem_obs['status']}"
-            assert sem_obs["value"] == "T-recovered-after-retry", f"R52: value must be 'T-recovered-after-retry', got {sem_obs['value']}"
+            assert sem_obs["value"] == "T-recovered-on-retry-2", f"R52: value must be 'T-recovered-on-retry-2', got {sem_obs['value']}"
             assert sem_obs["satisfaction_attempts"] == 2, f"R52: attempts must be 2, got {sem_obs['satisfaction_attempts']}"
-            print("    \u2713 R52 verified: effectful satisfier Err(e) with retry policy continued to cand2 -> Satisfied")
+            print("    \u2713 R52/R59 verified: effectful satisfier Err(e) with retry policy retried cand1 -> Satisfied(T-recovered-on-retry-2)")
 
         # R55 assertion for D25
         if prog.name == "D25_targeted_effectful_satisfier_delivery_unknown":
@@ -323,6 +370,24 @@ def run(prog: ScenarioProgram) -> None:
             assert sem_obs["satisfaction_attempts"] == 1, f"R55: attempts must be 1, got {sem_obs['satisfaction_attempts']}"
             assert sem_obs["outstanding_scope_commitment"] == 5, f"R55: commitment must be 5, got {sem_obs['outstanding_scope_commitment']}"
             print("    \u2713 R55 verified: targeted delivery_unknown_ops on effectful satisfier opVerify leaves frame in Waiting")
+
+        # R59 assertion for D26
+        if prog.name == "D26_satisfier_retry_limit_blocks_retry":
+            assert sem_obs["status"] == "Exhausted", f"R59: status must be Exhausted, got {sem_obs['status']}"
+            assert sem_obs["satisfaction_attempts"] == 1, f"R59: attempts must be 1 (retry blocked), got {sem_obs['satisfaction_attempts']}"
+            print("    \u2713 R59 verified: max_satisfaction_attempts==1 blocked candidate retry -> Exhausted")
+
+        # R60 assertion for D27
+        if prog.name == "D27_idempotent_safe_retry":
+            assert sem_obs["status"] == "Satisfied", f"R60: status must be Satisfied, got {sem_obs['status']}"
+            assert sem_obs["value"] == "T-idempotent-retry", f"R60: value must be 'T-idempotent-retry', got {sem_obs['value']}"
+            print("    \u2713 R60 verified: safe retry on idempotent-only operation succeeded -> Satisfied")
+
+        # R60 assertion for D28
+        if prog.name == "D28_double_delivery_unknown_remains_waiting":
+            assert sem_obs["status"] == "Waiting", f"R60: status must be Waiting, got {sem_obs['status']}"
+            assert d.handles[list(d.handles.keys())[0]].transport_attempts == 2, f"R60: transport_attempts must be 2, got {d.handles[list(d.handles.keys())[0]].transport_attempts}"
+            print("    \u2713 R60 verified: double DeliveryUnknown leaves frame in Waiting with transport_attempts==2")
 
         print(f"  \u2713 PASS {prog.name}  (status={sem_obs['status']} value={sem_obs['value']!r})")
         PASS += 1
@@ -335,7 +400,9 @@ if __name__ == "__main__":
                  D18_WAITING, D19_CRASH_RECOVERY, D20_TARGETED_DELIVERY_UNKNOWN,
                  D21_SATISFACTION_LIMIT, D22_DELIVERY_UNKNOWN_NO_SUCCESSORS,
                  D23_EFFECTFUL_SATISFIER_ERR_ABORT, D24_EFFECTFUL_SATISFIER_ERR_RETRY,
-                 D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN):
+                 D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN,
+                 D26_SATISFIER_RETRY_LIMIT_BLOCKS_RETRY, D27_IDEMPOTENT_SAFE_RETRY,
+                 D28_DOUBLE_DELIVERY_UNKNOWN_REMAINS_WAITING):
         run(prog)
 
     print("=" * 70)

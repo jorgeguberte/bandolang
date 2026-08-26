@@ -164,9 +164,9 @@ d5b.scope_spent["usd"] = 20
 survives("I7 control probe (different handles with same receipt_id accepted)",
          lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5b)
 
-# R50: Exact canonical digest property tests (order sensitivity & op_id sensitivity)
+# R50/R56: Exact canonical digest property tests (order, op_id, and collision freedom)
 from transitions import canonical_digest
-from model import SpaceOutcome, SatisfierOutcome
+from model import SpaceOutcome, SatisfierOutcome, ExecutionReceipt
 digest_order1 = canonical_digest("rcpt", "Success", SpaceOutcome(successors=["B", "C"]))
 digest_order2 = canonical_digest("rcpt", "Success", SpaceOutcome(successors=["C", "B"]))
 assert digest_order1 != digest_order2, "R50: successor order must change canonical digest"
@@ -174,7 +174,30 @@ assert digest_order1 != digest_order2, "R50: successor order must change canonic
 digest_op1 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="n", op_id="opVerifyA", satisfied=True, value="val"))
 digest_op2 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="n", op_id="opVerifyB", satisfied=True, value="val"))
 assert digest_op1 != digest_op2, "R50: op_id must change canonical digest"
-print("  ✓ R50 exact canonical digest verified: successor order and op_id are strictly bound")
+
+digest_colon1 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="a:b", op_id="c", satisfied=True, value="val"))
+digest_colon2 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="a", op_id="b:c", satisfied=True, value="val"))
+assert digest_colon1 != digest_colon2, "R56: colon structure must not collide in canonical digest"
+
+digest_none1 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="a", op_id="b", satisfied=True, value=None))
+digest_none2 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="a", op_id="b", satisfied=True, value="None"))
+assert digest_none1 != digest_none2, "R56: None vs 'None' string must not collide in canonical digest"
+print("  ✓ R50/R56 exact canonical digest verified: order, op_id, and typed structure are strictly bound")
+
+# R57: Durable ExecutionReceipt authority test
+d_settle = base_domain()
+h_st = InFlightLifecycleState(handle_id="h_settle", request_id="r_settle", state="Delivered", reserved_amount=10)
+h_st.completion = __import__("model").CompletionRecord(
+    handle_id="h_settle", receipt_id="rcpt", digest="d", outcome="Success",
+    receipt=ExecutionReceipt("rcpt", "usd", 7),
+)
+d_settle.handles["h_settle"] = h_st
+try:
+    __import__("transitions").settle(d_settle, "h_settle", "usd", 0)
+    raise AssertionError("caller override of durable receipt amount was permitted")
+except __import__("transitions").TransitionError as e:
+    assert "SettlementAmountMismatch" in str(e), f"wrong refusal: {e}"
+print("  ✓ R57 settlement authority verified: caller cannot override durable ExecutionReceipt amount")
 
 # I8 kill (R30): attempt actual machine frontier mutation while Closing
 d8 = base_domain()

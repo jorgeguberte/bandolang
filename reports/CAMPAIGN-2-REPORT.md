@@ -1,67 +1,68 @@
-# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 10
+# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 11
 
-> **REISSUE 10 after tenth adversarial audit round (R50–R55).**
-> The tenth audit completed the deep binding, fault targeting, error handling, and recovery isolation guarantees:
-> 1. R50: Exact canonical digest binding (order-preserving on successors, full field inclusion including `op_id`).
-> 2. R51: Real differential safe retry (D08 verified with transport retry on identical `request_id` reaching `Satisfied(T-retry)`).
-> 3. R52: Effectful satisfier `Err(e)` error semantics (`OnSatisfierError` as durable machine frame state; D23 abort and D24 retry verified).
-> 4. R53: Snapshot-authoritative recovery (T19 verified: volatile live RAM mutations cannot corrupt durable snapshot redrive).
-> 5. R54: I7 ghost-spend detector (checks union of resources; scope_spent without settlement records fails).
-> 6. R55: Unified targeted faults (`delivery_unknown_ops` applies uniformly to both space and satisfier operations; D25 verified).
-> All 67 test cases pass across all 4 test suites without divergence or false positives.
+> **REISSUE 11 after eleventh adversarial audit round (R56–R60).**
+> The eleventh audit resolved structural authority, typed canonical encoding, Closing barrier, and retry semantics:
+> 1. R56: Injective recursive canonical JSON encoding for completion digests (eliminates textual separator/None collisions).
+> 2. R57: Durable `ExecutionReceipt` carrying authoritative usage/accounting facts; `settle()` derives charges authoritatively, preventing caller override.
+> 3. R58: Closing semantic barrier enforced: late typed completions during `Closing` safely discard semantic payloads without mutating frontiers or overriding `PendingCancelled`/`PendingFailure` (T20, T21, T22 verified).
+> 4. R59: Real `SatisfactionState` retry of the same candidate across transient `Err(e)` failures (D24 retry and D26 limit-blocked verified).
+> 5. R60: Decoupled retry capability (`dedup_capable or idempotent`) from environment transport outcomes (D27 idempotent retry and D28 double DeliveryUnknown verified).
+> All 73 test cases pass across all 4 test suites without divergence or false positives.
 
-## Audit repairs applied (Round 10: R50–R55)
+## Audit repairs applied (Round 11: R56–R60)
 
 ```text
-R50 Exact Canonical Digest Binding
-    FIXED — `canonical_digest` preserves exact successor order in SpaceOutcome and includes
-    all fields (including `op_id`) in SatisfierOutcome. Verified with negative order and op_id mutation kills.
+R56 Injective Canonical JSON Completion Digest
+    FIXED — `canonical_digest` uses typed canonical JSON structure with version tags.
+    Eliminated colon-delimiter collisions and `None` vs `"None"` string collisions.
+    Verified with negative collision mutation tests.
 
-R51 Real Differential Safe Retry (D08)
-    FIXED — D08 executes transport retry upon initial DeliveryUnknown on dedup-capable external operations.
-    The second attempt succeeds on the exact same request_id -> reaches Satisfied(T-retry).
+R57 Settlement & Receipt Authority Binding
+    FIXED — `ExecutionReceipt` is durable state on `CompletionRecord`.
+    `settle(handle)` derives resource and amount authoritatively from the receipt,
+    rejecting arbitrary caller overrides with `SettlementAmountMismatch`.
 
-R52 Effectful Satisfier Err(e) & Durable Error Policy (D23, D24)
-    FIXED — `on_satisfier_error` policy is durable machine/frame state (`d.on_satisfier_error`),
-    not caller arguments. Handled `Err(e)` in both semantic and lowered models.
-    Added D23 (abort -> Failed(e)) and D24 (retry -> next candidate Satisfied).
+R58 Closing Semantic Barrier (T20, T21, T22)
+    FIXED — `apply_space_completion` and `apply_satisfier_completion` safely discard
+    semantic payloads during `Closing` (no frontier mutation, no override of PendingCancelled/PendingFailure).
+    Added T20 (PendingCancelled + late satisfaction => Cancelled),
+    T21 (PendingFailure + late space => Failed), and
+    T22 (recovery of settled typed completion while Closing => preserves Closing reason).
 
-R53 Snapshot-Authoritative Crash Recovery (T19)
-    FIXED — `recover()` redrives exclusively on the durable snapshot state before authoritatively
-    updating volatile RAM. Added T19 regression scenario proving that post-crash live RAM corruption
-    is discarded during recovery.
+R59 Real SatisfactionState & Candidate Retry (D24, D26)
+    FIXED — `SatisfactionState` modeled with transient error retries on the same candidate.
+    D24 tests transient failure on attempt 1 retrying and satisfying on attempt 2.
+    D26 tests max_satisfaction_attempts=1 blocking the second attempt -> Exhausted.
 
-R54 I7 Ghost-Spend Detection
-    FIXED — I7 compares `scope_spent` against settlement totals over the full union of resources.
-    Added I7 kill D (scope_spent with zero settlements => FAIL).
-
-R55 Unified Targeted Faults (D25)
-    FIXED — `delivery_unknown_ops` applies uniformly to all external operations (expansion and satisfier).
-    Added D25 verifying targeted DeliveryUnknown on effectful satisfier `opVerify`.
+R60 Decoupled Retry Capability & Environmental Fault Sequences (D27, D28)
+    FIXED — Retry allowed if `dedup_capable or idempotent`.
+    Added D27 (idempotent-only safe retry => Satisfied) and
+    D28 (double DeliveryUnknown on retry leaves frame in Waiting with transport_attempts==2).
 ```
 
 ## Complete verification results
 
 ```text
 Campaign 1 (Lowered Safety & Crash Recovery):
-    21/21 PASS (T01–T11, T04A/B, T07B real recovery, T12 sequential stage guard,
+    24/24 PASS (T01–T11, T04A/B, T07B real recovery, T12 sequential stage guard,
                 T13 pending exhaust drain, T14 settlement ceiling bounds,
                 T15 autonomous space apply recovery, T16 autonomous satisfier apply recovery,
                 T17 request_id reuse rejection, T18 generic apply bypass refused,
-                T19 snapshot-authoritative recovery)
+                T19 snapshot-authoritative recovery, T20 late satisfaction discarded during Closing,
+                T21 late space discarded during Closing, T22 recovery while Closing discards payload)
 
 Invariant Kill Tests (Mutation Testing & Bijection):
     21/21 PASS (I1 frame-wide, I3 scope kill, I3 attributable kill, I3 control probe,
                 I6 CompletionId uniqueness kill, I6 ghost record kill, I6 completeness gap kill,
                 I6 identical digest probe, I7 ledger vs records kill, I7 duplicate reconciliation kill,
                 I7 ghost reconciliation kill, I7 ghost scope_spent kill, I7 identical receipt probe,
-                R50 exact canonical digest binding tests, I8 closing mutation kill,
-                I8 clean closing probe, I9 forged visit kill, I9 clean history probe,
-                I10 scope limit kill, I10 IntentFrame conservation kill,
+                R50/R56 canonical digest order/op_id/collision tests, R57 settlement authority test,
+                I8 closing mutation kill, I8 clean closing probe, I9 forged visit kill,
+                I9 clean history probe, I10 scope limit kill, I10 IntentFrame conservation kill,
                 I10 spent>avail control probe)
 
 Campaign 2 Basic (Declarative Search Programs):
-    19/19 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
+    22/22 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
                 D03 max_steps + partial [R4 verified], D04 Ok(None), D05 Err+abort,
                 D06 external, D13 ceiling vs actual charge [R12/R14 verified],
                 D14 budget headroom depletion [R15/R34 verified],
@@ -74,22 +75,27 @@ Campaign 2 Basic (Declarative Search Programs):
                 D21 multi-candidate satisfaction attempt limit exhaustion [R42/R49 verified],
                 D22 DeliveryUnknown prevents premature successor discovery [R47 verified],
                 D23 effectful satisfier Err(e) with abort policy [R52 verified],
-                D24 effectful satisfier Err(e) with retry policy [R52 verified],
-                D25 targeted effectful satisfier DeliveryUnknown [R55 verified])
+                D24 effectful satisfier transient retry on same candidate [R52/R59 verified],
+                D25 targeted effectful satisfier DeliveryUnknown [R55 verified],
+                D26 satisfier retry attempt limit blocks second attempt [R59 verified],
+                D27 safe retry on idempotent-only operation [R60 verified],
+                D28 double DeliveryUnknown on retry leaves frame in Waiting [R60 verified])
 
 Campaign 2 Fault (Environmental Fault Injections):
-    6/6 PASS   (D07 DeliveryUnknown [Waiting verified], D08 safe retry [R51 verified],
-                D09 duplicate completion with same receipt_id, D10 crash-after-settlement forward recovery,
-                D11 cancel-in-flight [R2 Cancelled verified],
+    6/6 PASS   (D07 DeliveryUnknown [Waiting verified],
+                D08 safe transport retry real [Satisfied(T-retry) verificado],
+                D09 duplicate completion com mesmo receipt_id,
+                D10 crash-after-settlement forward recovery,
+                D11 cancel-in-flight [R2 Cancelled verificado],
                 D12 late settlement fatal closing)
 
 Semantic model:
     REAL / AUTONOMOUS (purely declarative search space execution)
 
 Lowered model:
-    REAL / ADVERSARIALLY HARDENED (exact canonical bound completion digests, two-way bijection invariants,
-    independent reconciliation tracking, ghost-spend checks, snapshot-authoritative recovery,
-    request_id reuse protection)
+    REAL / ADVERSARIALLY HARDENED (exact canonical JSON digests, durable ExecutionReceipt authority,
+    Closing semantic barrier, true two-way bijection invariants, independent reconciliation tracking,
+    ghost-spend checks, snapshot-authoritative recovery, request_id reuse protection)
 
 Differential counterexamples:
     NONE IN TESTED REGIME
@@ -109,16 +115,16 @@ Design
     ADVERSARIALLY REVIEWED
 
 Executable lowered state-machine model
-    REAL / ADVERSARIALLY HARDENED (21/21 adversarial scenarios)
+    REAL / ADVERSARIALLY HARDENED (24/24 adversarial scenarios)
 
 Executable semantic model
-    REAL / AUTONOMOUS (25/25 differential programs)
+    REAL / AUTONOMOUS (28/28 differential programs)
 
 Invariant checker
     SELF-TESTED (21/21 mutation kill tests & control probes)
 
 Differential semantic preservation
-    VERIFIED IN TESTED REGIME (audited across 10 adversarial review rounds, R1–R55 fixed)
+    VERIFIED IN TESTED REGIME (audited across 11 adversarial review rounds, R1–R60 fixed)
 
 Actual compiler/lowering implementation
     NOT YET VERIFIED
@@ -135,7 +141,8 @@ best_partial / lineage / Ψ
 ```text
 Item 3 (CFG / Result / Error Model)
     UNBLOCKED per campaign plan — Phase D lowering safety, Waiting lifecycle,
-    budget conservation, snapshot-authoritative recovery, invariant two-way bijection,
-    effectful satisfier error semantics, and differential preservation have survived
-    10 adversarial audit rounds.
+    Closing semantic barrier, budget conservation, durable receipt authority,
+    snapshot-authoritative recovery, invariant two-way bijection,
+    effectful satisfier retry semantics, and differential preservation have survived
+    11 adversarial audit rounds.
 ```

@@ -1,14 +1,18 @@
-"""transitions.py — the lowered transitions of soma.converge.
+"""transitions.py — transition functions of the converge lowering state machine.
 
-Each transition enforces the frozen normative principles. Faults are injected
+Every transition takes domain d, validates pre-state, mutates d, and returns.
+All state mutations belong HERE. Harness instrumentation is recorded
 by the harness, never by these functions.
 """
+from __future__ import annotations
+
+import json
 from dataclasses import replace
 from typing import Any, Optional
 
 from model import (
     ClosingReason, CompletionRecord, Continue, ConvergeTransactionDomain,
-    DispatchRecord, InFlightLifecycleState, NodeStatus, OutboxRecord,
+    DispatchRecord, ExecutionReceipt, InFlightLifecycleState, NodeStatus, OutboxRecord,
     Reservation, SatisfierOutcome, SchedulerAction, SearchNode, SearchStatus,
     SettlementRecord, SpaceOutcome, Stop, VisitedRecord, Wait, next_id,
 )
@@ -16,15 +20,22 @@ from model import (
 
 class TransitionError(Exception):
     """A transition refused by the frozen protocol."""
+    pass
 
 
 class FatalInvariantViolation(Exception):
     """Protocol-level violation requiring durable evidence + Closing(PendingFailure)."""
+    pass
 
 
-# ---------------------------------------------------------------------
-# StageLocal — reserve resources and write outbox. NOT a semantic dispatch.
-# ---------------------------------------------------------------------
+def _active_in_flight_for_op(d: ConvergeTransactionDomain, op_id: str) -> bool:
+    for rec in d.outbox.values():
+        if rec.op_id == op_id:
+            st = d.handles.get(rec.request_id)
+            if st and st.state in ("InFlight", "DeliveryUnknown"):
+                return True
+    return False
+
 
 # ---------------------------------------------------------------------
 # DISPATCH_LOCAL — real local/pure expansion (R19).
@@ -67,21 +78,27 @@ def discover_successors(d: ConvergeTransactionDomain, succs: list[str]) -> None:
             d.frontier.append(s)
 
 
-def classify_runnable(d: ConvergeTransactionDomain, op_cost: int, resource: str = "usd") -> bool:
-    """R20: Check whether an operation ceiling can be afforded under current headroom."""
-    available = d.intent_available.get(resource, 0)
-    scope_head = d.scope_limit.get(resource, 0) - d.scope_spent.get(resource, 0) - d.scope_committed.get(resource, 0)
-    return (op_cost <= available and op_cost <= scope_head)
+def classify_runnable(d: ConvergeTransactionDomain, cost: int, resource: str = "usd") -> bool:
+    """Check budget affordability. External ops require cost <= available headroom."""
+    if cost == 0:
+        return True
+    spent = d.scope_spent.get(resource, 0)
+    committed = d.scope_committed.get(resource, 0)
+    limit = d.scope_limit.get(resource, 0)
+    avail_scope = limit - spent - committed
+    avail_intent = d.intent_available.get(resource, 0)
+    return avail_scope >= cost and avail_intent >= cost
 
 
 def scheduler_step(d: ConvergeTransactionDomain, prog: Any) -> SchedulerAction:
     """R25/R31: Machine-owned scheduling decisions.
     Checks unsettled in-flight handles first -> returns Wait(reason).
-    Driver never writes/pops frontier."""
+    Checks fuel/frontier/budget -> returns Continue(...) or Stop(reason).
+    """
     unsettled = [s for s in d.handles.values() if s.settlement is None and s.state != "Aborted"]
     if unsettled:
         d.frame_status = SearchStatus.WAITING
-        return Wait(f"InFlight({unsettled[0].handle_id})")
+        return Wait(reason=f"InFlight({unsettled[0].handle_id})")
 
     if d.step_count >= prog.max_steps:
         return Stop("FuelExhausted")
@@ -89,52 +106,23 @@ def scheduler_step(d: ConvergeTransactionDomain, prog: Any) -> SchedulerAction:
         return Stop("FrontierEmpty")
 
     for n in d.frontier:
-        op = prog.node_ops.get(n)
-        if op is None:
-            from scenarios import OpDef
-            op = OpDef(op_id=f"op:{n}")
-        cost = op.cost if op.kind == "external" else 0
+        op = prog.node_ops.get(n, None) if hasattr(prog, "node_ops") else None
+        cost = op.cost if op and op.kind == "external" else 0
         if classify_runnable(d, cost, "usd"):
-            return Continue(node=n, op_id=op.op_id, kind=op.kind)
+            return Continue(n, op.op_id if op else f"op:{n}", op.kind if op else "local")
 
     return Stop("BudgetDepleted")
-
-
-def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
-                       satisfied: bool, value: object = None,
-                       error: str = None, abort_on_error: bool = False) -> None:
-    """CheckSatisfaction on a node WITHOUT dispatching/expanding it.
-
-    Frozen ConvergeFrame v0 semantics: CheckSatisfaction evaluates whether
-    a candidate in the frontier or current expansion satisfies the goal.
-    It does NOT consume fuel and does NOT record visitation.
-
-    R1 (audit): the ONLY place satisfaction_attempts increments.
-    R3 (audit): Ok(Some(T)) performs the normative Satisfied transition itself.
-    """
-    if d.frame_status != SearchStatus.SEARCHING:
-        raise TransitionError("CheckSatisfaction outside Searching frame")
-    d.satisfaction_attempts += 1
-    if satisfied:
-        d.satisfied_value = value
-        d.frame_status = SearchStatus.SATISFIED      # R3: normative transition
-        d.current_in_flight = None                   # search consumed its request
-        return
-    if error is not None:
-        d.satisfier_error = error
-        if abort_on_error:
-            fatal_close(d, error)
 
 
 def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                 request_id: str, resource: str, amount: int,
                 dedup_capable: bool = False, idempotent: bool = False,
                 local_only: bool = False, is_expansion: bool = True) -> str:
-    # R43: reject request_id reuse for a new request before any mutation or reservation
+    """R17: stage_local creates InFlightHandle atomically with outbox record."""
+    # R43: reject request_id reuse before any reservation/mutation
     if request_id in d.outbox:
         raise TransitionError(f"RequestIdAlreadyUsed: cannot stage new request with historical request_id '{request_id}'")
 
-    # Sequential in-flight: cannot stage a new request if an unsettled handle exists
     unsettled = [s for s in d.handles.values() if s.settlement is None and s.state != "Aborted"]
     if unsettled:
         raise TransitionError("sequential in-flight: previous request still unsettled (I1/R7)")
@@ -142,37 +130,44 @@ def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("StageLocal outside Searching frame")
 
-    # I4 guard: rejection must leave committed/reserved deltas at zero.
-    # R12/R15: headroom accounts for both committed AND spent in BudgetScope
-    available = d.intent_available.get(resource, 0)
-    scope_head = d.scope_limit.get(resource, 0) - d.scope_spent.get(resource, 0) - d.scope_committed.get(resource, 0)
-    if amount > available or amount > scope_head or amount < 0:
-        raise TransitionError("StageLocal.Rejected")   # caller sees rejection; no deltas move
+    if amount < 0:
+        raise TransitionError("negative amount")
 
-    d.intent_available[resource] = available - amount
+    avail = d.intent_available.get(resource, 0)
+    if avail < amount:
+        raise TransitionError(f"insufficient available intent: {avail} < {amount}")
+
+    spent = d.scope_spent.get(resource, 0)
+    committed = d.scope_committed.get(resource, 0)
+    limit = d.scope_limit.get(resource, 0)
+    if spent + committed + amount > limit:
+        raise TransitionError("budget limit exceeded")
+
+    d.intent_available[resource] = avail - amount
     d.intent_reserved[resource] = d.intent_reserved.get(resource, 0) + amount
-    d.scope_committed[resource] = d.scope_committed.get(resource, 0) + amount
-    d.outbox[request_id] = OutboxRecord(
-        request_id=request_id, op_id=op_id, payload_digest=f"digest({node_id})",
+    d.scope_committed[resource] = committed + amount
+
+    handle_id = next_id("h")
+    digest = f"payload:{op_id}"
+    rec = OutboxRecord(
+        request_id=request_id, op_id=op_id, payload_digest=digest,
         dedup_capable=dedup_capable, idempotent=idempotent,
         node_id=node_id, local_only=local_only,
         reserved_resource=resource, reserved_amount=amount,
         is_expansion=is_expansion,
     )
+    d.outbox[request_id] = rec
 
-    # R15: StageLocal creates stable InFlightHandle atomically with reservation and outbox
-    handle_id = next_id("h")
     st = InFlightLifecycleState(
         handle_id=handle_id, request_id=request_id, state="Staged",
         reserved_resource=resource, reserved_amount=amount,
     )
     d.handles[handle_id] = st
-    d.current_in_flight = st
     return handle_id
 
 
 # ---------------------------------------------------------------------
-# EmitExternal — first logical emission consumes fuel; transport retries do not.
+# EMIT_EXTERNAL — the boundary transition that performs logical dispatch
 # ---------------------------------------------------------------------
 
 def emit_external(d: ConvergeTransactionDomain, request_or_handle_id: str,
@@ -180,59 +175,47 @@ def emit_external(d: ConvergeTransactionDomain, request_or_handle_id: str,
     if d.frame_status not in (SearchStatus.SEARCHING, SearchStatus.WAITING):
         raise TransitionError("EmitExternal outside Searching/Waiting frame")
 
-    # Find the handle by handle_id or request_id
     st = d.handles.get(request_or_handle_id)
     if st is None:
-        hid = _find_handle_by_request(d, request_or_handle_id)
-        if hid:
-            st = d.handles.get(hid)
+        st = next((s for s in d.handles.values() if s.request_id == request_or_handle_id), None)
+    if st is None:
+        raise TransitionError("unknown request/handle")
 
-    request_id = st.request_id if st else request_or_handle_id
+    request_id = st.request_id
+    handle_id = st.handle_id
     rec = d.outbox.get(request_id)
     if rec is None:
-        raise TransitionError("no staged record for request")
+        raise TransitionError("outbox record missing")
 
-    if st is None:
-        handle_id = next_id("h")
-        st = InFlightLifecycleState(
-            handle_id=handle_id, request_id=request_id,
-            reserved_resource=rec.reserved_resource, reserved_amount=rec.reserved_amount,
-        )
-        d.handles[handle_id] = st
-    else:
-        handle_id = st.handle_id
-
-    if request_id not in d.first_emission_flags:
+    is_first = request_id not in d.first_emission_flags
+    if is_first:
         d.first_emission_flags[request_id] = True
-        st.state = "InFlight"
+
         if rec.is_expansion:
-            # First logical emission of a space expansion: consumes step fuel,
-            # advances node to EXPANDING, records visitation (I9, T03).
             d.step_count += 1
             node_id = rec.node_id or _node_for_op(d, rec.op_id)
             d.nodes[node_id] = SearchNode(node_id, NodeStatus.EXPANDING)
             visit_key = f"{rec.op_id}:{node_id}"
             visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
             d.visited.append(VisitedRecord(visit_key, node_id, rec.op_id, visit_no))
-            # R29: bind VisitedRecord to explicit DispatchRecord for external expansion
             d.dispatches.append(DispatchRecord(node_id, rec.op_id, visit_no, "External"))
+
             if node_id in d.frontier:
                 d.frontier.remove(node_id)
         else:
-            # R26: Effectful CheckSatisfaction commit point -> satisfaction_attempts increments here
             d.satisfaction_attempts += 1
+
+        st.state = "DeliveryUnknown" if deliver_unknown else "InFlight"
     else:
-        # Transport retry (T04): only legal with adapter guarantees (T04B).
-        if st is not None and st.delivery_unknown:
-            if not (rec.dedup_capable or rec.idempotent):
-                raise TransitionError("BLIND RETRY PROHIBITED (T04B)")
-            st.transport_attempts += 1
-        else:
-            raise TransitionError("re-emission without DeliveryUnknown")
+        if not (rec.dedup_capable or rec.idempotent):
+            raise TransitionError("BLIND RETRY: unsafe retry without adapter dedup/idempotence guarantee")
+        if not st.delivery_unknown and st.state != "DeliveryUnknown":
+            raise TransitionError("retry of non-DeliveryUnknown request")
+        st.transport_attempts += 1
+        st.state = "DeliveryUnknown" if deliver_unknown else "InFlight"
 
     st.delivery_unknown = deliver_unknown
     d.current_in_flight = st
-    # R31: External dispatch transitions frame into Waiting state
     d.frame_status = SearchStatus.WAITING
     return handle_id
 
@@ -246,32 +229,38 @@ def _find_handle_by_request(d: ConvergeTransactionDomain, request_id: str) -> st
 
 def _node_for_op(d: ConvergeTransactionDomain, op_id: str) -> str:
     for nid, node in d.nodes.items():
-        if op_id in nid:
+        if node.status in (NodeStatus.FRONTIER, NodeStatus.EXPANDING):
             return nid
     return f"node:{op_id}"
 
 
 # ---------------------------------------------------------------------
-# Completion admission — durable records; equivocation detected here (T07/T07B)
+# Completion admission — durable records; equivocation detected here (T07/T07B/R46/R56/R57)
 # ---------------------------------------------------------------------
 
 def canonical_digest(receipt_id: str, outcome: str = "Success",
-                     semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None) -> str:
-    """R46/R50: Deterministic canonical digest binding receipt_id, outcome, and all payload fields."""
+                     semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None,
+                     receipt: Optional[ExecutionReceipt] = None) -> str:
+    """R46/R50/R56/R57: Exact canonical JSON digest binding receipt_id, outcome, payload, and receipt."""
     if isinstance(semantic_payload, SpaceOutcome):
         # R50: preserve exact successor order
-        p_str = f"Space({list(semantic_payload.successors)})"
+        p_obj = ["Space", list(semantic_payload.successors)]
     elif isinstance(semantic_payload, SatisfierOutcome):
-        # R50: include node_id, op_id, satisfied, value, error
-        p_str = f"Satisfier({semantic_payload.node_id}:{semantic_payload.op_id}:{semantic_payload.satisfied}:{semantic_payload.value}:{semantic_payload.error})"
+        # R50: include all fields (node_id, op_id, satisfied, value, error)
+        p_obj = ["Satisfier", semantic_payload.node_id, semantic_payload.op_id,
+                 semantic_payload.satisfied, semantic_payload.value, semantic_payload.error]
     else:
-        p_str = "None"
-    return f"digest({receipt_id}:{outcome}:{p_str})"
+        p_obj = None
+
+    rcpt_obj = [receipt.receipt_id, receipt.resource, receipt.amount] if receipt is not None else None
+    canon_structure = ["v1", receipt_id, outcome, p_obj, rcpt_obj]
+    return "digest:" + json.dumps(canon_structure, sort_keys=True, separators=(',', ':'))
 
 
 def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
                      receipt_id: str, digest: Optional[str] = None, outcome: str = "Success",
-                     semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None) -> None:
+                     semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None,
+                     receipt: Optional[ExecutionReceipt] = None) -> None:
     st = d.handles.get(handle_id)
     if st is None:
         raise TransitionError("completion for unknown handle")
@@ -279,21 +268,24 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
     if outcome == "Failure" and semantic_payload is not None:
         raise TransitionError("Failure outcome cannot carry success semantic payload (R37)")
 
-    expected_digest = canonical_digest(receipt_id, outcome, semantic_payload)
+    expected_digest = canonical_digest(receipt_id, outcome, semantic_payload, receipt)
     if digest is not None and digest != expected_digest:
-        # R46: digest must bind outcome and semantic_payload
-        raise TransitionError(f"DigestPayloadMismatch: digest '{digest}' does not bind payload (expected '{expected_digest}') (R46)")
+        # R46/R56: digest must bind outcome, semantic_payload, and receipt
+        raise TransitionError(f"DigestPayloadMismatch: digest '{digest}' does not bind payload (expected '{expected_digest}') (R46/R56)")
     digest = expected_digest
 
     existing = next((c for c in d.completions.values() if c.handle_id == handle_id), None)
     if existing is not None:
-        # R37: Equivocation check binds receipt_id, digest, outcome, AND semantic_payload
-        if (existing.digest != digest or
+        # R37/R46/R56: Equivocation check binds receipt_id, digest, outcome, semantic_payload, AND receipt
+        if (existing.receipt_id != receipt_id or
+            existing.digest != digest or
             existing.semantic_payload != semantic_payload or
+            existing.receipt != receipt or
             existing.outcome != outcome):
             fatal_close(d, f"receipt equivocation on {handle_id}")
             raise FatalInvariantViolation(f"receipt equivocation on {handle_id}")
         else:
+            # Idempotent duplicate delivery of identical completion
             return
 
     if st.state not in ("InFlight", "DeliveryUnknown"):
@@ -301,17 +293,21 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
 
     comp = CompletionRecord(handle_id=handle_id, receipt_id=receipt_id,
                             digest=digest, outcome=outcome,
-                            semantic_payload=semantic_payload)
+                            semantic_payload=semantic_payload,
+                            receipt=receipt)
     d.completions[f"{handle_id}:{receipt_id}"] = comp
     st.completion = comp
     st.state = "Delivered"
 
 
 # ---------------------------------------------------------------------
-# settle — ledger reconciliation exactly once (I7); works from Delivered
+# settle — ledger reconciliation exactly once (I7/R57); works from Delivered
 # ---------------------------------------------------------------------
 
-def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: int) -> None:
+def settle(d: ConvergeTransactionDomain, handle_id: str,
+           resource: Optional[str] = None, amount: Optional[int] = None) -> None:
+    """R57: Settle handle. Resource and amount are authoritatively derived from st.completion.receipt
+    when present, preventing arbitrary caller accounting overrides."""
     st = d.handles.get(handle_id)
     if st is None:
         raise TransitionError("settlement for unknown handle")
@@ -320,6 +316,20 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
 
     if st.state != "Delivered":
         raise TransitionError(f"settle called in invalid state '{st.state}' — must be Delivered")
+
+    if st.completion is not None and st.completion.receipt is not None:
+        # R57: authoritative durable receipt
+        rec_res = st.completion.receipt.resource
+        rec_amount = st.completion.receipt.amount
+        if amount is not None and amount != rec_amount:
+            raise TransitionError(f"SettlementAmountMismatch: caller amount {amount} != durable receipt amount {rec_amount} (R57)")
+        if resource is not None and resource != rec_res:
+            raise TransitionError(f"SettlementResourceMismatch: caller resource {resource} != durable receipt resource {rec_res} (R57)")
+        resource = rec_res
+        amount = rec_amount
+    else:
+        resource = resource or st.reserved_resource or "usd"
+        amount = amount if amount is not None else st.reserved_amount
 
     ceiling = st.reserved_amount
     ceiling_res = st.reserved_resource or resource
@@ -358,7 +368,7 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
 
 
 # ---------------------------------------------------------------------
-# apply — semantic incorporation, exactly once per completion (I6, R27, R38)
+# apply — semantic incorporation, exactly once per completion (I6, R27, R38, R45, R58)
 # ---------------------------------------------------------------------
 
 def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
@@ -380,13 +390,14 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
     st.state = "Applied"
     c_id = f"{handle_id}:{st.completion.receipt_id}" if st.completion else handle_id
     d.applied_completions.append(c_id)
+    if d.frame_status == SearchStatus.WAITING:
+        d.frame_status = SearchStatus.SEARCHING
     return True
 
 
 def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool:
-    """R27/R45: Atomic space completion incorporation.
-
-    Autonomously reads and applies durable SpaceOutcome from st.completion.semantic_payload.
+    """R27/R45/R58: Atomic space completion incorporation.
+    R58: If frame is Closing or Terminal, semantic payload is safely discarded without mutating frontier.
     """
     st = d.handles.get(handle_id)
     if st is None:
@@ -397,6 +408,14 @@ def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool
         raise TransitionError(f"apply_space_completion called in invalid state '{st.state}' — must be Settled")
     if st.completion is None or not isinstance(st.completion.semantic_payload, SpaceOutcome):
         raise TransitionError("apply_space_completion called on handle without durable SpaceOutcome")
+
+    if d.frame_status in (SearchStatus.CLOSING, SearchStatus.FAILED, SearchStatus.CANCELLED, SearchStatus.EXHAUSTED):
+        # R58: Semantic payload discarded during Closing/Terminal — accounting settled, search not advanced
+        st.applied = True
+        st.state = "Applied"
+        c_id = f"{handle_id}:{st.completion.receipt_id}"
+        d.applied_completions.append(c_id)
+        return True
 
     # Discover successors into frontier & nodes from durable payload
     discover_successors(d, st.completion.semantic_payload.successors)
@@ -411,10 +430,8 @@ def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool
 
 
 def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool:
-    """R27/R45/R52: Atomic satisfier completion incorporation.
-
-    Autonomously reads and applies durable SatisfierOutcome from st.completion.semantic_payload.
-    Reads on_satisfier_error policy directly from durable frame state (R52).
+    """R27/R45/R52/R58: Atomic satisfier completion incorporation.
+    R58: If frame is Closing or Terminal, late satisfaction NEVER overrides PendingCancelled/PendingFailure/PendingExhausted.
     """
     st = d.handles.get(handle_id)
     if st is None:
@@ -425,6 +442,14 @@ def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str) -> 
         raise TransitionError(f"apply_satisfier_completion called in invalid state '{st.state}' — must be Settled")
     if st.completion is None or not isinstance(st.completion.semantic_payload, SatisfierOutcome):
         raise TransitionError("apply_satisfier_completion called on handle without durable SatisfierOutcome")
+
+    if d.frame_status in (SearchStatus.CLOSING, SearchStatus.FAILED, SearchStatus.CANCELLED, SearchStatus.EXHAUSTED):
+        # R58: Late satisfaction discarded during Closing — does not override Closing reason
+        st.applied = True
+        st.state = "Applied"
+        c_id = f"{handle_id}:{st.completion.receipt_id}"
+        d.applied_completions.append(c_id)
+        return True
 
     so = st.completion.semantic_payload
     if so.satisfied:
@@ -550,3 +575,23 @@ def recover(d: ConvergeTransactionDomain, snapshot: ConvergeTransactionDomain,
         # R22: Transactional atomicity — reset uncommitted partial RAM state back to pre-state snapshot
         d.__dict__.clear()
         d.__dict__.update(snapshot.copy().__dict__)
+
+
+def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
+                       satisfied: bool, value: object = None, error: str = None,
+                       abort_on_error: bool = True) -> bool:
+    """Check satisfaction for local satisfiers."""
+    if d.frame_status not in (SearchStatus.SEARCHING, SearchStatus.WAITING):
+        return False
+    d.satisfaction_attempts += 1
+    if satisfied:
+        d.satisfied_value = value
+        d.frame_status = SearchStatus.SATISFIED
+        d.current_in_flight = None
+        return True
+    elif error is not None:
+        d.satisfier_error = error
+        if abort_on_error:
+            fatal_close(d, error)
+        return False
+    return False
