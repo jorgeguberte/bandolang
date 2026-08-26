@@ -495,3 +495,46 @@ D28_DOUBLE_DELIVERY_UNKNOWN_REMAINS_WAITING = ScenarioProgram(
     max_steps=6,
     budget_limit=100,
 )
+
+# R61: node in CheckedNotSatisfied is never re-checked upon subsequent expansion
+D29_CHECKED_NOT_SATISFIED_NEVER_RECHECKED = ScenarioProgram(
+    name="D29_checked_not_satisfied_never_rechecked",
+    initial_frontier=["root"],
+    successors={"root": ["B"], "B": []},
+    node_ops={
+        "root": OpDef("opRoot", kind="local"),
+        "B": OpDef("opB", kind="local"),
+    },
+    partial_map={
+        "B": "P_B",
+    },
+    satisfier_map={
+        "B": ("ok", False, None),
+    },
+    max_steps=6,
+    budget_limit=100,
+)
+
+# R63: post-fuel candidate evaluating to Ok(None) increments attempts and exhausts
+D31_POST_FUEL_CHECK_NONE_EXHAUSTS = ScenarioProgram(
+    name="D31_post_fuel_check_none_exhausts",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("opRoot", kind="local")},
+    partial_map={"cand": "P_cand"},
+    satisfier_map={"cand": ("ok", False, None)},
+    max_steps=1,
+    budget_limit=100,
+    check_partial_after_fuel="cand",
+)
+
+# R64: space expansion returning StepFailure (DynamicGateRejection) terminates frame as Failed
+D32_DYNAMIC_GATE_REJECTION_STEP_FAILURE = ScenarioProgram(
+    name="D32_dynamic_gate_rejection_step_failure",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("opGate", kind="external", cost=10)},
+    partial_map={},
+    max_steps=6,
+    budget_limit=100,
+)

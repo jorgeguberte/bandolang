@@ -189,7 +189,7 @@ d_settle = base_domain()
 h_st = InFlightLifecycleState(handle_id="h_settle", request_id="r_settle", state="Delivered", reserved_amount=10)
 h_st.completion = __import__("model").CompletionRecord(
     handle_id="h_settle", receipt_id="rcpt", digest="d", outcome="Success",
-    receipt=ExecutionReceipt("rcpt", "usd", 7),
+    receipt=ExecutionReceipt("r_settle", "rcpt", "usd", 7),
 )
 d_settle.handles["h_settle"] = h_st
 try:

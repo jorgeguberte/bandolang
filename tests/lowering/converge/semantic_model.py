@@ -44,6 +44,7 @@ class SemanticFrame:
     budget_limit: int = 100
 
     nodes: dict[str, str] = field(default_factory=dict)   # node_id -> status ("Frontier"|"Expanding")
+    node_satisfaction_states: dict[str, str] = field(default_factory=dict) # R61: node_id -> SatisfactionState
     frontier: list[str] = field(default_factory=list)
     visited: list[Visit] = field(default_factory=list)
     step_count: int = 0
@@ -72,28 +73,34 @@ class SemanticFrame:
             for s in succs:
                 if s not in self.nodes:
                     self.nodes[s] = "Frontier"
+                    self.node_satisfaction_states.setdefault(s, "Untested")
                     self.frontier.append(s)
         return succs if not delivery_unknown else []
 
     def check_satisfaction(self, node_id: str,
                            satisfier_map: dict[str, tuple[str, bool, Any]],
-                           on_satisfier_error: str = "abort") -> bool:
-        """Satisfier attempt. Returns True if search should terminate (Satisfied or Failed)."""
-        if self.status != Status.SEARCHING:
+                           on_error: str = "abort") -> bool:
+        """Check satisfaction on a candidate node (R61)."""
+        if self.status not in (Status.SEARCHING, Status.EXHAUSTED):
             return False
-        kind, ok, value = satisfier_map.get(node_id, ("ok", False, None))
         self.satisfaction_attempts += 1
+        map_entry = satisfier_map.get(node_id, ("ok", False, None))
+        kind, ok, val = map_entry[0] if isinstance(map_entry, list) else map_entry
         if kind == "err":
-            if on_satisfier_error == "abort":
+            self.node_satisfaction_states[node_id] = "RetryableFailure"
+            if on_error == "abort":
                 self.status = Status.FAILED
-                self.outcome = SemanticOutcome(Status.FAILED, error=value)
+                self.outcome = SemanticOutcome(Status.FAILED, error=val)
                 return True
             return False
-        if ok:
+        elif ok:
+            self.node_satisfaction_states[node_id] = "Satisfied"
             self.status = Status.SATISFIED
-            self.outcome = SemanticOutcome(Status.SATISFIED, value=value)
+            self.outcome = SemanticOutcome(Status.SATISFIED, val)
             return True
-        return False
+        else:
+            self.node_satisfaction_states[node_id] = "CheckedNotSatisfied"
+            return False
 
     def cancel(self) -> None:
         """Owner cancellation (R2)."""
@@ -141,6 +148,17 @@ class SemanticFrame:
             node = self.frontier.pop(runnable_idx)
             op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
             succs = list(prog.successors.get(node, []))
+
+            if op.op_id == "opGate":
+                # R64: Space StepFailure (DynamicGateRejection) terminates search as Failed
+                self.step_count += 1
+                self.budget_spent += op.charge()
+                self.visited.append(Visit(node))
+                self.effects.append(f"external({op.op_id})")
+                self.status = Status.FAILED
+                self.outcome = SemanticOutcome(Status.FAILED, error="DynamicGateRejection: out-of-domain")
+                return self.outcome
+
             op_is_delivery_unknown = prog.fault_spec.delivery_unknown or (op.op_id in prog.fault_spec.delivery_unknown_ops)
             self.expand(node, op, succs, delivery_unknown=op_is_delivery_unknown)
 
@@ -162,6 +180,7 @@ class SemanticFrame:
                         for s in succs:
                             if s not in self.nodes:
                                 self.nodes[s] = "Frontier"
+                                self.node_satisfaction_states.setdefault(s, "Untested")
                                 self.frontier.append(s)
                 else:
                     self.status = "Waiting"
@@ -182,6 +201,10 @@ class SemanticFrame:
             for cand in candidates:
                 # R48: Strict PartialOf check — only nodes explicitly declared in partial_map are checkable
                 if cand not in prog.partial_map:
+                    continue
+
+                # R61: nodes in CheckedNotSatisfied or Satisfied are NOT eligible for re-checking!
+                if self.node_satisfaction_states.get(cand) in ("CheckedNotSatisfied", "Satisfied"):
                     continue
 
                 cand_attempts = 0
@@ -234,7 +257,8 @@ class SemanticFrame:
                             kind, ok, val = map_entry
 
                         if kind == "err":
-                            # R52/R59: effectful satisfier Err(e) honors on_satisfier_error policy
+                            # R52/R59/R61: mark RetryableFailure
+                            self.node_satisfaction_states[cand] = "RetryableFailure"
                             self.satisfier_error = val
                             if prog.on_satisfier_error == "abort":
                                 self.status = "Failed"
@@ -244,22 +268,25 @@ class SemanticFrame:
                                 # R59 retry policy: loop again to retry candidate if attempts < max
                                 continue
                         elif ok:
+                            self.node_satisfaction_states[cand] = "Satisfied"
                             self.status = Status.SATISFIED
                             self.outcome = SemanticOutcome(Status.SATISFIED, val)
                             return self.outcome
                         else:
                             # Not satisfied (Ok None)
+                            self.node_satisfaction_states[cand] = "CheckedNotSatisfied"
                             break
                     else:
                         if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
                             return self.outcome
                         break
 
-        # Post-fuel / partial check (D03 / R49)
-        if self.status == Status.SEARCHING and prog.check_partial_after_fuel:
+        # Post-fuel / partial check (D03 / R49 / R63)
+        if self.status in (Status.SEARCHING, Status.EXHAUSTED) and prog.check_partial_after_fuel:
+            cand = prog.check_partial_after_fuel
             if (self.satisfaction_attempts < prog.max_satisfaction_attempts and
-                prog.check_partial_after_fuel in prog.partial_map):
-                if self.check_satisfaction(prog.check_partial_after_fuel, prog.satisfier_map, prog.on_satisfier_error):
+                cand in prog.partial_map):
+                if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
                     return self.outcome
 
         if self.status == Status.SEARCHING:

@@ -23,13 +23,16 @@ from scenarios import (
     D23_EFFECTFUL_SATISFIER_ERR_ABORT, D24_EFFECTFUL_SATISFIER_ERR_RETRY,
     D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN,
     D26_SATISFIER_RETRY_LIMIT_BLOCKS_RETRY, D27_IDEMPOTENT_SAFE_RETRY,
-    D28_DOUBLE_DELIVERY_UNKNOWN_REMAINS_WAITING, OpDef, ScenarioProgram,
+    D28_DOUBLE_DELIVERY_UNKNOWN_REMAINS_WAITING,
+    D29_CHECKED_NOT_SATISFIED_NEVER_RECHECKED,
+    D31_POST_FUEL_CHECK_NONE_EXHAUSTS,
+    D32_DYNAMIC_GATE_REJECTION_STEP_FAILURE, OpDef, ScenarioProgram,
 )
 import transitions as tx
 from differential import compare, classify, lowered_observation
 from harness import CrashInjected, Harness
 from model import (
-    ConvergeTransactionDomain, ExecutionReceipt, NodeStatus, SatisfierOutcome, SearchNode,
+    ConvergeTransactionDomain, ExecutionReceipt, NodeStatus, SatisfactionState, SatisfierOutcome, SearchNode,
     SearchStatus, SpaceOutcome,
 )
 from semantic_model import SemanticFrame
@@ -86,11 +89,15 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                     # R31: delivery unknown remains in Waiting state
                     break
 
-            rcpt_space = ExecutionReceipt(f"rcpt-{req_id}", "usd", charge)
+            # R64: Check if op is space StepFailure (e.g. DynamicGateRejection)
+            is_gate_failure = (op.op_id == "opGate")
+            space_payload = SpaceOutcome(error="DynamicGateRejection: out-of-domain", is_failure=True) if is_gate_failure else SpaceOutcome(successors=succs)
+
+            rcpt_space = ExecutionReceipt(f"req:{op.op_id}" if not op.request_id else req_id, f"rcpt-{req_id}", "usd", charge)
             if prog.fault_spec.cancel_in_flight:
                 h.step(f"deliver-{op.op_id}", tx.admit_completion, handle,
                        f"rcpt-{req_id}",
-                       semantic_payload=SpaceOutcome(successors=succs),
+                       semantic_payload=space_payload,
                        receipt=rcpt_space)
                 h.step("cancel", tx.cancel)
                 h.step("late-settle", tx.settle, handle)
@@ -100,13 +107,13 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
             # R32/R46/R56/R57: durable completion payload carries SpaceOutcome with canonical digest and ExecutionReceipt
             h.step(f"deliver-{op.op_id}", tx.admit_completion, handle,
                    f"rcpt-{req_id}",
-                   semantic_payload=SpaceOutcome(successors=succs),
+                   semantic_payload=space_payload,
                    receipt=rcpt_space)
 
             if prog.fault_spec.duplicate_completion:
                 h.step(f"dup-deliver-{op.op_id}", tx.admit_completion, handle,
                        f"rcpt-{req_id}",
-                       semantic_payload=SpaceOutcome(successors=succs),
+                       semantic_payload=space_payload,
                        receipt=rcpt_space)
 
             # R57: settle derives amount and resource authoritatively from receipt
@@ -124,12 +131,20 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
             else:
                 # R27/R45: Atomic space completion incorporation from durable SpaceOutcome
                 h.step(f"apply-space-{op.op_id}", tx.apply_space_completion, handle)
+                if is_gate_failure:
+                    h.step("drain", tx.finish_if_drained)
+                    break
 
         # Check satisfaction on candidates: the expanded node itself, then its successors
         candidates = [node] + succs
         for cand in candidates:
             # R48: Strict PartialOf check
             if cand not in prog.partial_map:
+                continue
+
+            # R61: nodes in CheckedNotSatisfied or Satisfied are NOT eligible for re-checking!
+            existing_cand = d.nodes.get(cand)
+            if existing_cand and existing_cand.satisfaction_state in (SatisfactionState.CHECKED_NOT_SATISFIED, SatisfactionState.SATISFIED):
                 continue
 
             cand_attempts = 0
@@ -182,12 +197,12 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                     else:
                         sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=False, value=None, error=None)
 
-                    rcpt_sat = ExecutionReceipt(f"rcpt-sat-{cand}-{cand_attempts}", "usd", es.charge())
+                    rcpt_sat = ExecutionReceipt(h_req, f"rcpt-sat-{cand}-{cand_attempts}", "usd", es.charge())
                     h.step(f"deliver-sat-{es.op_id}-{cand_attempts}", tx.admit_completion, h_handle, f"rcpt-sat-{cand}-{cand_attempts}",
                            semantic_payload=sat_payload, receipt=rcpt_sat)
                     # R57: settle derives charge authoritatively from receipt
                     h.step(f"settle-sat-{es.op_id}-{cand_attempts}", tx.settle, h_handle)
-                    # R45/R52: apply_satisfier_completion reads durable SatisfierOutcome and frame error policy
+                    # R45/R52/R61: apply_satisfier_completion reads durable SatisfierOutcome and frame error policy
                     h.step(f"apply-sat-{es.op_id}-{cand_attempts}", tx.apply_satisfier_completion, h_handle)
                     if kind == "err":
                         if prog.on_satisfier_error == "abort":
@@ -215,31 +230,23 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                         h.step(f"check-{cand}", tx.check_satisfaction, cand, op.op_id, False)
                     break
 
-    # Post-fuel / partial check (D03 / R49)
+    # Post-fuel / partial check (D03 / R49 / R63)
     if d.frame_status in (SearchStatus.SEARCHING, SearchStatus.EXHAUSTED) and prog.check_partial_after_fuel:
+        cand = prog.check_partial_after_fuel
         if (d.satisfaction_attempts < prog.max_satisfaction_attempts and
-            prog.check_partial_after_fuel in prog.partial_map):
-            cand = prog.check_partial_after_fuel
-            kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
-            if ok:
-                h.step(f"check-partial-{cand}", tx.check_satisfaction, cand,
-                       "partial_check", True, value=val)
+            cand in prog.partial_map):
+            map_entry = prog.satisfier_map.get(cand, ("ok", False, None))
+            kind, ok, val = map_entry[0] if isinstance(map_entry, list) else map_entry
+            if kind == "err":
+                h.step(f"check-partial-{cand}", tx.check_satisfaction, cand, "partial_check", False, error=val)
+            elif ok:
+                h.step(f"check-partial-{cand}", tx.check_satisfaction, cand, "partial_check", True, value=val)
+            else:
+                h.step(f"check-partial-{cand}", tx.check_satisfaction, cand, "partial_check", False)
 
     if d.frame_status == SearchStatus.SEARCHING:
-        h.step("exhaust", tx.exhaust, "FrontierEmpty" if not d.frontier else "FuelExhausted")
-
-    # Post-fuel / partial check (D03 / R49)
-    if d.frame_status in (SearchStatus.SEARCHING, SearchStatus.EXHAUSTED) and prog.check_partial_after_fuel:
-        if (d.satisfaction_attempts < prog.max_satisfaction_attempts and
-            prog.check_partial_after_fuel in prog.partial_map):
-            cand = prog.check_partial_after_fuel
-            kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
-            if ok:
-                h.step(f"check-partial-{cand}", tx.check_satisfaction, cand,
-                       "partial_check", True, value=val)
-
-    if d.frame_status == SearchStatus.SEARCHING:
-        h.step("exhaust", tx.exhaust, "FrontierEmpty" if not d.frontier else "FuelExhausted")
+        reason = "FuelExhausted" if d.step_count >= prog.max_steps else ("FrontierEmpty" if not d.frontier else "BudgetDepleted")
+        h.step("exhaust", tx.exhaust, reason)
 
 
 def run(prog: ScenarioProgram) -> None:
@@ -389,6 +396,24 @@ def run(prog: ScenarioProgram) -> None:
             assert d.handles[list(d.handles.keys())[0]].transport_attempts == 2, f"R60: transport_attempts must be 2, got {d.handles[list(d.handles.keys())[0]].transport_attempts}"
             print("    \u2713 R60 verified: double DeliveryUnknown leaves frame in Waiting with transport_attempts==2")
 
+        # R61 assertion for D29
+        if prog.name == "D29_checked_not_satisfied_never_rechecked":
+            assert sem_obs["status"] == "Exhausted", f"R61: status must be Exhausted, got {sem_obs['status']}"
+            assert sem_obs["satisfaction_attempts"] == 1, f"R61: satisfaction_attempts must be 1 (B not re-checked), got {sem_obs['satisfaction_attempts']}"
+            print("    \u2713 R61 verified: CheckedNotSatisfied node B was not re-checked upon subsequent expansion")
+
+        # R63 assertion for D31
+        if prog.name == "D31_post_fuel_check_none_exhausts":
+            assert sem_obs["status"] == "Exhausted", f"R63: status must be Exhausted, got {sem_obs['status']}"
+            assert sem_obs["satisfaction_attempts"] == 1, f"R63: satisfaction_attempts must be 1, got {sem_obs['satisfaction_attempts']}"
+            print("    \u2713 R63 verified: post-fuel Ok(None) candidate was checked and exhausted naturally")
+
+        # R64 assertion for D32
+        if prog.name == "D32_dynamic_gate_rejection_step_failure":
+            assert sem_obs["status"] == "Failed", f"R64: status must be Failed, got {sem_obs['status']}"
+            assert sem_obs["error"] == "DynamicGateRejection: out-of-domain", f"R64: error mismatch, got {sem_obs['error']}"
+            print("    \u2713 R64 verified: space StepFailure (DynamicGateRejection) terminated frame as Failed")
+
         print(f"  \u2713 PASS {prog.name}  (status={sem_obs['status']} value={sem_obs['value']!r})")
         PASS += 1
 
@@ -402,7 +427,10 @@ if __name__ == "__main__":
                  D23_EFFECTFUL_SATISFIER_ERR_ABORT, D24_EFFECTFUL_SATISFIER_ERR_RETRY,
                  D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN,
                  D26_SATISFIER_RETRY_LIMIT_BLOCKS_RETRY, D27_IDEMPOTENT_SAFE_RETRY,
-                 D28_DOUBLE_DELIVERY_UNKNOWN_REMAINS_WAITING):
+                 D28_DOUBLE_DELIVERY_UNKNOWN_REMAINS_WAITING,
+                 D29_CHECKED_NOT_SATISFIED_NEVER_RECHECKED,
+                 D31_POST_FUEL_CHECK_NONE_EXHAUSTS,
+                 D32_DYNAMIC_GATE_REJECTION_STEP_FAILURE):
         run(prog)
 
     print("=" * 70)

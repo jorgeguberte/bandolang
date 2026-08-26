@@ -125,7 +125,8 @@ class OutboxRecord:
 
 @dataclass(frozen=True)
 class ExecutionReceipt:
-    """R57: Durable execution receipt carrying authoritative usage/accounting facts from adapter."""
+    """R57/R62: Durable execution receipt carrying authoritative usage/accounting facts from adapter."""
+    request_id: str
     receipt_id: str
     resource: str
     amount: int
@@ -141,6 +142,7 @@ class InFlightLifecycleState:
     completion: Optional["CompletionRecord"] = None
     settlement: Optional["SettlementRecord"] = None
     applied: bool = False
+    semantic_disposition: Optional[str] = None # R58: "Applied" | "DiscardedDueToClosing"
     reserved_resource: str = "usd"
     reserved_amount: int = 0
 
@@ -148,6 +150,8 @@ class InFlightLifecycleState:
 @dataclass(frozen=True)
 class SpaceOutcome:
     successors: list[str] = field(default_factory=list)
+    error: Optional[str] = None       # R64: error message for StepFailure (e.g. DynamicGateRejection)
+    is_failure: bool = False
 
 
 @dataclass(frozen=True)
@@ -232,6 +236,7 @@ class ConvergeTransactionDomain:
     satisfied_value: object = None
     satisfier_error: str = None
     on_satisfier_error: str = "abort"         # R52: durable machine/frame error policy ("abort" | "retry")
+    on_step_failure: str = "abort"            # R64: durable machine/frame space failure policy ("abort" | "prune")
     exhaustion_reason: Optional[str] = None   # R34: "BudgetDepleted" | "FrontierEmpty" | "FuelExhausted"
 
     def copy(self) -> "ConvergeTransactionDomain":
@@ -268,6 +273,7 @@ class ConvergeTransactionDomain:
             satisfied_value=self.satisfied_value,
             satisfier_error=self.satisfier_error,
             on_satisfier_error=self.on_satisfier_error,
+            on_step_failure=self.on_step_failure,
             exhaustion_reason=self.exhaustion_reason,
         )
 
@@ -283,6 +289,7 @@ class InFlightCopy:
         c.completion = s.completion
         c.settlement = s.settlement
         c.applied = s.applied
+        c.semantic_disposition = s.semantic_disposition
         return c
 
 

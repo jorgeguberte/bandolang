@@ -13,7 +13,7 @@ from typing import Any, Optional
 from model import (
     ClosingReason, CompletionRecord, Continue, ConvergeTransactionDomain,
     DispatchRecord, ExecutionReceipt, InFlightLifecycleState, NodeStatus, OutboxRecord,
-    Reservation, SatisfierOutcome, SchedulerAction, SearchNode, SearchStatus,
+    Reservation, SatisfactionState, SatisfierOutcome, SchedulerAction, SearchNode, SearchStatus,
     SettlementRecord, SpaceOutcome, Stop, VisitedRecord, Wait, next_id,
 )
 
@@ -53,7 +53,10 @@ def dispatch_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
         raise TransitionError("sequential in-flight: previous request still unsettled (I1/R7)")
 
     d.step_count += 1
-    d.nodes[node_id] = SearchNode(node_id, NodeStatus.EXPANDING)
+    existing_node = d.nodes.get(node_id)
+    sat_state = existing_node.satisfaction_state if existing_node else SatisfactionState.UNTESTED
+    sat_retries = existing_node.satisfaction_retries if existing_node else 0
+    d.nodes[node_id] = SearchNode(node_id, NodeStatus.EXPANDING, sat_state, sat_retries)
     visit_key = f"{op_id}:{node_id}"
     visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
     d.visited.append(VisitedRecord(visit_key, node_id, op_id, visit_no))
@@ -194,7 +197,10 @@ def emit_external(d: ConvergeTransactionDomain, request_or_handle_id: str,
         if rec.is_expansion:
             d.step_count += 1
             node_id = rec.node_id or _node_for_op(d, rec.op_id)
-            d.nodes[node_id] = SearchNode(node_id, NodeStatus.EXPANDING)
+            existing_node = d.nodes.get(node_id)
+            sat_state = existing_node.satisfaction_state if existing_node else SatisfactionState.UNTESTED
+            sat_retries = existing_node.satisfaction_retries if existing_node else 0
+            d.nodes[node_id] = SearchNode(node_id, NodeStatus.EXPANDING, sat_state, sat_retries)
             visit_key = f"{rec.op_id}:{node_id}"
             visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
             d.visited.append(VisitedRecord(visit_key, node_id, rec.op_id, visit_no))
@@ -235,24 +241,22 @@ def _node_for_op(d: ConvergeTransactionDomain, op_id: str) -> str:
 
 
 # ---------------------------------------------------------------------
-# Completion admission — durable records; equivocation detected here (T07/T07B/R46/R56/R57)
+# Completion admission — durable records; equivocation detected here (T07/T07B/R46/R56/R57/R62)
 # ---------------------------------------------------------------------
 
 def canonical_digest(receipt_id: str, outcome: str = "Success",
                      semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None,
                      receipt: Optional[ExecutionReceipt] = None) -> str:
-    """R46/R50/R56/R57: Exact canonical JSON digest binding receipt_id, outcome, payload, and receipt."""
+    """R46/R50/R56/R57/R62: Injective canonical JSON digest binding receipt_id, outcome, payload, and receipt."""
     if isinstance(semantic_payload, SpaceOutcome):
-        # R50: preserve exact successor order
-        p_obj = ["Space", list(semantic_payload.successors)]
+        p_obj = ["Space", list(semantic_payload.successors), semantic_payload.error, semantic_payload.is_failure]
     elif isinstance(semantic_payload, SatisfierOutcome):
-        # R50: include all fields (node_id, op_id, satisfied, value, error)
         p_obj = ["Satisfier", semantic_payload.node_id, semantic_payload.op_id,
                  semantic_payload.satisfied, semantic_payload.value, semantic_payload.error]
     else:
         p_obj = None
 
-    rcpt_obj = [receipt.receipt_id, receipt.resource, receipt.amount] if receipt is not None else None
+    rcpt_obj = [receipt.request_id, receipt.receipt_id, receipt.resource, receipt.amount] if receipt is not None else None
     canon_structure = ["v1", receipt_id, outcome, p_obj, rcpt_obj]
     return "digest:" + json.dumps(canon_structure, sort_keys=True, separators=(',', ':'))
 
@@ -265,8 +269,15 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
     if st is None:
         raise TransitionError("completion for unknown handle")
 
-    if outcome == "Failure" and semantic_payload is not None:
+    if outcome == "Failure" and semantic_payload is not None and not getattr(semantic_payload, "is_failure", False):
         raise TransitionError("Failure outcome cannot carry success semantic payload (R37)")
+
+    # R62: ExecutionReceipt is mandatory for external completions and must match request_id and receipt_id
+    if receipt is not None:
+        if receipt.request_id != st.request_id:
+            raise TransitionError(f"ReceiptRequestIdMismatch: receipt.request_id '{receipt.request_id}' != handle.request_id '{st.request_id}' (R62)")
+        if receipt.receipt_id != receipt_id:
+            raise TransitionError(f"ReceiptIdMismatch: receipt.receipt_id '{receipt.receipt_id}' != completion.receipt_id '{receipt_id}' (R62)")
 
     expected_digest = canonical_digest(receipt_id, outcome, semantic_payload, receipt)
     if digest is not None and digest != expected_digest:
@@ -276,7 +287,7 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
 
     existing = next((c for c in d.completions.values() if c.handle_id == handle_id), None)
     if existing is not None:
-        # R37/R46/R56: Equivocation check binds receipt_id, digest, outcome, semantic_payload, AND receipt
+        # R37/R46/R56/R62: Equivocation check binds receipt_id, digest, outcome, semantic_payload, AND receipt
         if (existing.receipt_id != receipt_id or
             existing.digest != digest or
             existing.semantic_payload != semantic_payload or
@@ -301,13 +312,12 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
 
 
 # ---------------------------------------------------------------------
-# settle — ledger reconciliation exactly once (I7/R57); works from Delivered
+# settle — ledger reconciliation exactly once (I7/R57/R62); works from Delivered
 # ---------------------------------------------------------------------
 
 def settle(d: ConvergeTransactionDomain, handle_id: str,
            resource: Optional[str] = None, amount: Optional[int] = None) -> None:
-    """R57: Settle handle. Resource and amount are authoritatively derived from st.completion.receipt
-    when present, preventing arbitrary caller accounting overrides."""
+    """R57/R62: Settle handle. Resource and amount are authoritatively derived from st.completion.receipt."""
     st = d.handles.get(handle_id)
     if st is None:
         raise TransitionError("settlement for unknown handle")
@@ -318,7 +328,6 @@ def settle(d: ConvergeTransactionDomain, handle_id: str,
         raise TransitionError(f"settle called in invalid state '{st.state}' — must be Delivered")
 
     if st.completion is not None and st.completion.receipt is not None:
-        # R57: authoritative durable receipt
         rec_res = st.completion.receipt.resource
         rec_amount = st.completion.receipt.amount
         if amount is not None and amount != rec_amount:
@@ -368,7 +377,35 @@ def settle(d: ConvergeTransactionDomain, handle_id: str,
 
 
 # ---------------------------------------------------------------------
-# apply — semantic incorporation, exactly once per completion (I6, R27, R38, R45, R58)
+# ConfirmedNotDelivered transition (R65)
+# ---------------------------------------------------------------------
+
+def confirmed_not_delivered(d: ConvergeTransactionDomain, handle_id: str) -> None:
+    """R65: Transport layer confirms request was not delivered.
+    Releases all reservations and commitments with 0 spend; returns frame to Searching/Closing."""
+    st = d.handles.get(handle_id)
+    if st is None:
+        raise TransitionError("unknown handle")
+    if st.state not in ("InFlight", "DeliveryUnknown"):
+        raise TransitionError(f"confirmed_not_delivered called in invalid state '{st.state}'")
+
+    ceiling = st.reserved_amount
+    ceiling_res = st.reserved_resource or "usd"
+
+    d.intent_reserved[ceiling_res] = max(0, d.intent_reserved.get(ceiling_res, 0) - ceiling)
+    d.intent_available[ceiling_res] = d.intent_available.get(ceiling_res, 0) + ceiling
+    d.scope_committed[ceiling_res] = max(0, d.scope_committed.get(ceiling_res, 0) - ceiling)
+
+    st.state = "ConfirmedNotDelivered"
+    if d.current_in_flight == st:
+        d.current_in_flight = None
+
+    if d.frame_status == SearchStatus.WAITING:
+        d.frame_status = SearchStatus.SEARCHING
+
+
+# ---------------------------------------------------------------------
+# apply — semantic incorporation, exactly once per completion (I6, R27, R38, R45, R58, R61, R64)
 # ---------------------------------------------------------------------
 
 def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
@@ -387,6 +424,7 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
                                               SearchStatus.FAILED, SearchStatus.EXHAUSTED):
         raise TransitionError("I8: frontier mutation during Closing")
     st.applied = True
+    st.semantic_disposition = "Applied"
     st.state = "Applied"
     c_id = f"{handle_id}:{st.completion.receipt_id}" if st.completion else handle_id
     d.applied_completions.append(c_id)
@@ -396,13 +434,14 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
 
 
 def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool:
-    """R27/R45/R58: Atomic space completion incorporation.
+    """R27/R45/R58/R64: Atomic space completion incorporation.
     R58: If frame is Closing or Terminal, semantic payload is safely discarded without mutating frontier.
+    R64: Handles typed StepFailure outcomes with on_step_failure policy.
     """
     st = d.handles.get(handle_id)
     if st is None:
         raise TransitionError("apply for unknown handle")
-    if st.applied:
+    if st.applied or st.semantic_disposition is not None:
         return False
     if st.state != "Settled":
         raise TransitionError(f"apply_space_completion called in invalid state '{st.state}' — must be Settled")
@@ -411,16 +450,29 @@ def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool
 
     if d.frame_status in (SearchStatus.CLOSING, SearchStatus.FAILED, SearchStatus.CANCELLED, SearchStatus.EXHAUSTED):
         # R58: Semantic payload discarded during Closing/Terminal — accounting settled, search not advanced
+        st.semantic_disposition = "DiscardedDueToClosing"
+        st.state = "Closed"
+        return True
+
+    payload = st.completion.semantic_payload
+    if payload.is_failure:
+        # R64: Space StepFailure
+        st.semantic_disposition = "StepFailure"
         st.applied = True
         st.state = "Applied"
         c_id = f"{handle_id}:{st.completion.receipt_id}"
         d.applied_completions.append(c_id)
+        if d.on_step_failure == "abort":
+            fatal_close(d, payload.error or "StepFailure")
+        elif d.frame_status == SearchStatus.WAITING:
+            d.frame_status = SearchStatus.SEARCHING
         return True
 
     # Discover successors into frontier & nodes from durable payload
-    discover_successors(d, st.completion.semantic_payload.successors)
+    discover_successors(d, payload.successors)
 
     st.applied = True
+    st.semantic_disposition = "Applied"
     st.state = "Applied"
     c_id = f"{handle_id}:{st.completion.receipt_id}"
     d.applied_completions.append(c_id)
@@ -430,13 +482,14 @@ def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool
 
 
 def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool:
-    """R27/R45/R52/R58: Atomic satisfier completion incorporation.
-    R58: If frame is Closing or Terminal, late satisfaction NEVER overrides PendingCancelled/PendingFailure/PendingExhausted.
+    """R27/R45/R52/R58/R61: Atomic satisfier completion incorporation.
+    R58: If frame is Closing, late satisfaction is safely discarded and never overrides Closing reason.
+    R61: Updates node satisfaction_state machine-side (CheckedNotSatisfied, RetryableFailure, Satisfied).
     """
     st = d.handles.get(handle_id)
     if st is None:
         raise TransitionError("apply for unknown handle")
-    if st.applied:
+    if st.applied or st.semantic_disposition is not None:
         return False
     if st.state != "Settled":
         raise TransitionError(f"apply_satisfier_completion called in invalid state '{st.state}' — must be Settled")
@@ -444,28 +497,37 @@ def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str) -> 
         raise TransitionError("apply_satisfier_completion called on handle without durable SatisfierOutcome")
 
     if d.frame_status in (SearchStatus.CLOSING, SearchStatus.FAILED, SearchStatus.CANCELLED, SearchStatus.EXHAUSTED):
-        # R58: Late satisfaction discarded during Closing — does not override Closing reason
-        st.applied = True
-        st.state = "Applied"
-        c_id = f"{handle_id}:{st.completion.receipt_id}"
-        d.applied_completions.append(c_id)
+        # R58: Late satisfaction discarded during Closing
+        st.semantic_disposition = "DiscardedDueToClosing"
+        st.state = "Closed"
         return True
 
     so = st.completion.semantic_payload
+    node_id = so.node_id
+    existing_node = d.nodes.get(node_id)
+    cur_status = existing_node.status if existing_node else NodeStatus.FRONTIER
+
     if so.satisfied:
+        d.nodes[node_id] = SearchNode(node_id, cur_status, SatisfactionState.SATISFIED)
         d.satisfied_value = so.value
         d.frame_status = SearchStatus.SATISFIED
         d.current_in_flight = None
     elif so.error is not None:
+        retries = (existing_node.satisfaction_retries + 1) if existing_node else 1
+        d.nodes[node_id] = SearchNode(node_id, cur_status, SatisfactionState.RETRYABLE_FAILURE, retries)
         d.satisfier_error = so.error
         if d.on_satisfier_error == "abort":
             fatal_close(d, so.error)
         elif d.frame_status == SearchStatus.WAITING:
             d.frame_status = SearchStatus.SEARCHING
-    elif d.frame_status == SearchStatus.WAITING:
-        d.frame_status = SearchStatus.SEARCHING
+    else:
+        retries = existing_node.satisfaction_retries if existing_node else 0
+        d.nodes[node_id] = SearchNode(node_id, cur_status, SatisfactionState.CHECKED_NOT_SATISFIED, retries)
+        if d.frame_status == SearchStatus.WAITING:
+            d.frame_status = SearchStatus.SEARCHING
 
     st.applied = True
+    st.semantic_disposition = "Applied"
     st.state = "Applied"
     c_id = f"{handle_id}:{st.completion.receipt_id}"
     d.applied_completions.append(c_id)
@@ -512,7 +574,7 @@ def exhaust(d: ConvergeTransactionDomain, reason: str = "FrontierEmpty") -> None
     d.exhaustion_reason = reason
     if d.frame_status not in (SearchStatus.SEARCHING, SearchStatus.WAITING):
         return
-    unsettled = [s for s in d.handles.values() if s.settlement is None]
+    unsettled = [s for s in d.handles.values() if s.settlement is None and s.state != "ConfirmedNotDelivered"]
     pending_scope = any(v > 0 for v in d.scope_committed.values())
     if unsettled or pending_scope:
         # R13: must close as PendingExhausted and drain obligations before terminalizing
@@ -528,7 +590,7 @@ def finish_if_drained(d: ConvergeTransactionDomain) -> bool:
     if d.frame_status != SearchStatus.CLOSING:
         return False
     unsettled = [s for s in d.handles.values()
-                 if s.settlement is None and s.state != "Aborted"]
+                 if s.settlement is None and s.state not in ("Aborted", "ConfirmedNotDelivered")]
     pending_scope = any(v > 0 for v in d.scope_committed.values())
     if unsettled or pending_scope:
         return False
@@ -580,18 +642,27 @@ def recover(d: ConvergeTransactionDomain, snapshot: ConvergeTransactionDomain,
 def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                        satisfied: bool, value: object = None, error: str = None,
                        abort_on_error: bool = True) -> bool:
-    """Check satisfaction for local satisfiers."""
+    """Check satisfaction for local satisfiers (R61)."""
     if d.frame_status not in (SearchStatus.SEARCHING, SearchStatus.WAITING):
         return False
     d.satisfaction_attempts += 1
+    existing_node = d.nodes.get(node_id)
+    cur_status = existing_node.status if existing_node else NodeStatus.FRONTIER
+
     if satisfied:
+        d.nodes[node_id] = SearchNode(node_id, cur_status, SatisfactionState.SATISFIED)
         d.satisfied_value = value
         d.frame_status = SearchStatus.SATISFIED
         d.current_in_flight = None
         return True
     elif error is not None:
+        retries = (existing_node.satisfaction_retries + 1) if existing_node else 1
+        d.nodes[node_id] = SearchNode(node_id, cur_status, SatisfactionState.RETRYABLE_FAILURE, retries)
         d.satisfier_error = error
         if abort_on_error:
             fatal_close(d, error)
         return False
-    return False
+    else:
+        retries = existing_node.satisfaction_retries if existing_node else 0
+        d.nodes[node_id] = SearchNode(node_id, cur_status, SatisfactionState.CHECKED_NOT_SATISFIED, retries)
+        return False

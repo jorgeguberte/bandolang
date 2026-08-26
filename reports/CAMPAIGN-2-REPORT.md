@@ -1,68 +1,69 @@
-# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 11
+# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 12
 
-> **REISSUE 11 after eleventh adversarial audit round (R56–R60).**
-> The eleventh audit resolved structural authority, typed canonical encoding, Closing barrier, and retry semantics:
-> 1. R56: Injective recursive canonical JSON encoding for completion digests (eliminates textual separator/None collisions).
-> 2. R57: Durable `ExecutionReceipt` carrying authoritative usage/accounting facts; `settle()` derives charges authoritatively, preventing caller override.
-> 3. R58: Closing semantic barrier enforced: late typed completions during `Closing` safely discard semantic payloads without mutating frontiers or overriding `PendingCancelled`/`PendingFailure` (T20, T21, T22 verified).
-> 4. R59: Real `SatisfactionState` retry of the same candidate across transient `Err(e)` failures (D24 retry and D26 limit-blocked verified).
-> 5. R60: Decoupled retry capability (`dedup_capable or idempotent`) from environment transport outcomes (D27 idempotent retry and D28 double DeliveryUnknown verified).
-> All 73 test cases pass across all 4 test suites without divergence or false positives.
+> **REISSUE 12 after twelfth adversarial audit round (R61–R65).**
+> The twelfth audit finalized the machine-owned operational states, receipt identity binding, post-fuel unification, space step failures, and confirmed-not-delivered transitions:
+> 1. R61: Machine-owned `SatisfactionState` (`Untested`, `CheckedNotSatisfied`, `RetryableFailure`, `Satisfied`) stored directly on `SearchNode` and updated by transitions. `CheckedNotSatisfied` nodes are never re-checked upon subsequent expansion (D29 verified; T23 verified crash survival).
+> 2. R62: Mandatory `ExecutionReceipt` bound to `request_id` and `receipt_id`. `settle()` derives charges authoritatively with zero caller accounting parameters across all 26 Campaign 1 scenarios.
+> 3. R63: Unified post-fuel `CheckSatisfaction` path without caller-side filtering (D31 Ok(None) verified).
+> 4. R58/Semantic Disposition: Explicit `semantic_disposition` ("Applied" vs "DiscardedDueToClosing" vs "StepFailure") on `InFlightLifecycleState`.
+> 5. R64: Typed Space `StepFailure` outcome handling `DynamicGateRejection` with `on_step_failure` policy (D32 verified).
+> 6. R65: `ConfirmedNotDelivered` transition releasing reservations and commitments with 0 spend and returning to `Searching` (T24 verified).
+> All 78 test cases pass across all 4 test suites without divergence or false positives.
 
-## Audit repairs applied (Round 11: R56–R60)
+## Audit repairs applied (Round 12: R61–R65)
 
 ```text
-R56 Injective Canonical JSON Completion Digest
-    FIXED — `canonical_digest` uses typed canonical JSON structure with version tags.
-    Eliminated colon-delimiter collisions and `None` vs `"None"` string collisions.
-    Verified with negative collision mutation tests.
+R61 Machine-Owned SatisfactionState (D29, T23)
+    FIXED — `SearchNode` stores `satisfaction_state` and `satisfaction_retries`.
+    `apply_satisfier_completion` and `check_satisfaction` update node satisfaction states machine-side.
+    Nodes in `CheckedNotSatisfied` or `Satisfied` are ineligible for subsequent re-checking.
+    Added D29 (CheckedNotSatisfied node not re-checked on subsequent expansion) and
+    T23 (RetryableFailure state survives crash and redrives second attempt).
 
-R57 Settlement & Receipt Authority Binding
-    FIXED — `ExecutionReceipt` is durable state on `CompletionRecord`.
-    `settle(handle)` derives resource and amount authoritatively from the receipt,
-    rejecting arbitrary caller overrides with `SettlementAmountMismatch`.
+R62 Mandatory ExecutionReceipt Bound to Request ID
+    FIXED — `ExecutionReceipt` carrying (request_id, receipt_id, resource, amount) is mandatory
+    on all external completions. `admit_completion()` verifies receipt identity matching.
+    `settle(handle)` derives resource and amount authoritatively without caller parameters across all scenarios.
 
-R58 Closing Semantic Barrier (T20, T21, T22)
-    FIXED — `apply_space_completion` and `apply_satisfier_completion` safely discard
-    semantic payloads during `Closing` (no frontier mutation, no override of PendingCancelled/PendingFailure).
-    Added T20 (PendingCancelled + late satisfaction => Cancelled),
-    T21 (PendingFailure + late space => Failed), and
-    T22 (recovery of settled typed completion while Closing => preserves Closing reason).
+R63 Unified Post-Fuel CheckSatisfaction (D31)
+    FIXED — Removed duplicate driver post-fuel block. Driver invokes machine `check_satisfaction`
+    uniformly regardless of outcome. Added D31 testing post-fuel Ok(None) candidate exhaustion.
 
-R59 Real SatisfactionState & Candidate Retry (D24, D26)
-    FIXED — `SatisfactionState` modeled with transient error retries on the same candidate.
-    D24 tests transient failure on attempt 1 retrying and satisfying on attempt 2.
-    D26 tests max_satisfaction_attempts=1 blocking the second attempt -> Exhausted.
+R64 Typed Space StepFailure & DynamicGateRejection (D32)
+    FIXED — `SpaceOutcome` supports `is_failure=True` with error payload.
+    `apply_space_completion()` handles StepFailure under `on_step_failure` policy.
+    Added D32 verifying DynamicGateRejection StepFailure terminating as Failed.
 
-R60 Decoupled Retry Capability & Environmental Fault Sequences (D27, D28)
-    FIXED — Retry allowed if `dedup_capable or idempotent`.
-    Added D27 (idempotent-only safe retry => Satisfied) and
-    D28 (double DeliveryUnknown on retry leaves frame in Waiting with transport_attempts==2).
+R65 ConfirmedNotDelivered Transition (T24)
+    FIXED — `confirmed_not_delivered(d, handle)` releases reservations and committed scope
+    with 0 spend and restores frame to Searching/Closing. Added T24 regression scenario.
 ```
 
 ## Complete verification results
 
 ```text
 Campaign 1 (Lowered Safety & Crash Recovery):
-    24/24 PASS (T01–T11, T04A/B, T07B real recovery, T12 sequential stage guard,
+    26/26 PASS (T01–T11, T04A/B, T07B real recovery, T12 sequential stage guard,
                 T13 pending exhaust drain, T14 settlement ceiling bounds,
                 T15 autonomous space apply recovery, T16 autonomous satisfier apply recovery,
                 T17 request_id reuse rejection, T18 generic apply bypass refused,
                 T19 snapshot-authoritative recovery, T20 late satisfaction discarded during Closing,
-                T21 late space discarded during Closing, T22 recovery while Closing discards payload)
+                T21 late space discarded during Closing, T22 recovery while Closing discards payload,
+                T23 satisfaction retry survives crash, T24 confirmed not delivered)
 
 Invariant Kill Tests (Mutation Testing & Bijection):
     21/21 PASS (I1 frame-wide, I3 scope kill, I3 attributable kill, I3 control probe,
                 I6 CompletionId uniqueness kill, I6 ghost record kill, I6 completeness gap kill,
                 I6 identical digest probe, I7 ledger vs records kill, I7 duplicate reconciliation kill,
                 I7 ghost reconciliation kill, I7 ghost scope_spent kill, I7 identical receipt probe,
-                R50/R56 canonical digest order/op_id/collision tests, R57 settlement authority test,
+                R50/R56 canonical digest order/op_id/type collision tests,
+                R57/R62 durable ExecutionReceipt authority test,
                 I8 closing mutation kill, I8 clean closing probe, I9 forged visit kill,
                 I9 clean history probe, I10 scope limit kill, I10 IntentFrame conservation kill,
                 I10 spent>avail control probe)
 
 Campaign 2 Basic (Declarative Search Programs):
-    22/22 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
+    25/25 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
                 D03 max_steps + partial [R4 verified], D04 Ok(None), D05 Err+abort,
                 D06 external, D13 ceiling vs actual charge [R12/R14 verified],
                 D14 budget headroom depletion [R15/R34 verified],
@@ -75,27 +76,30 @@ Campaign 2 Basic (Declarative Search Programs):
                 D21 multi-candidate satisfaction attempt limit exhaustion [R42/R49 verified],
                 D22 DeliveryUnknown prevents premature successor discovery [R47 verified],
                 D23 effectful satisfier Err(e) with abort policy [R52 verified],
-                D24 effectful satisfier transient retry on same candidate [R52/R59 verified],
+                D24 effectful satisfier transient retry on same candidate [R52/R59/R61 verified],
                 D25 targeted effectful satisfier DeliveryUnknown [R55 verified],
-                D26 satisfier retry attempt limit blocks second attempt [R59 verified],
+                D26 satisfier retry attempt limit blocks second attempt [R59/R61 verified],
                 D27 safe retry on idempotent-only operation [R60 verified],
-                D28 double DeliveryUnknown on retry leaves frame in Waiting [R60 verified])
+                D28 double DeliveryUnknown on retry leaves frame in Waiting [R60 verified],
+                D29 CheckedNotSatisfied node is not re-checked on subsequent expansion [R61 verified],
+                D31 post-fuel Ok(None) candidate exhausts naturally [R63 verified],
+                D32 space StepFailure DynamicGateRejection terminates as Failed [R64 verified])
 
 Campaign 2 Fault (Environmental Fault Injections):
     6/6 PASS   (D07 DeliveryUnknown [Waiting verified],
-                D08 safe transport retry real [Satisfied(T-retry) verificado],
-                D09 duplicate completion com mesmo receipt_id,
+                D08 safe transport retry real [Satisfied(T-retry) verified],
+                D09 duplicate completion with same receipt_id,
                 D10 crash-after-settlement forward recovery,
-                D11 cancel-in-flight [R2 Cancelled verificado],
+                D11 cancel-in-flight [R2 Cancelled verified],
                 D12 late settlement fatal closing)
 
 Semantic model:
     REAL / AUTONOMOUS (purely declarative search space execution)
 
 Lowered model:
-    REAL / ADVERSARIALLY HARDENED (exact canonical JSON digests, durable ExecutionReceipt authority,
-    Closing semantic barrier, true two-way bijection invariants, independent reconciliation tracking,
-    ghost-spend checks, snapshot-authoritative recovery, request_id reuse protection)
+    REAL / ADVERSARIALLY HARDENED (machine-owned SatisfactionState, mandatory ExecutionReceipt authority,
+    Closing semantic barrier, space StepFailure handling, ConfirmedNotDelivered transitions,
+    exact canonical JSON digests, true two-way bijection invariants, snapshot-authoritative recovery)
 
 Differential counterexamples:
     NONE IN TESTED REGIME
@@ -115,16 +119,16 @@ Design
     ADVERSARIALLY REVIEWED
 
 Executable lowered state-machine model
-    REAL / ADVERSARIALLY HARDENED (24/24 adversarial scenarios)
+    REAL / ADVERSARIALLY HARDENED (26/26 adversarial scenarios)
 
 Executable semantic model
-    REAL / AUTONOMOUS (28/28 differential programs)
+    REAL / AUTONOMOUS (31/31 differential programs)
 
 Invariant checker
     SELF-TESTED (21/21 mutation kill tests & control probes)
 
 Differential semantic preservation
-    VERIFIED IN TESTED REGIME (audited across 11 adversarial review rounds, R1–R60 fixed)
+    VERIFIED IN TESTED REGIME (audited across 12 adversarial review rounds, R1–R65 fixed)
 
 Actual compiler/lowering implementation
     NOT YET VERIFIED
@@ -141,8 +145,7 @@ best_partial / lineage / Ψ
 ```text
 Item 3 (CFG / Result / Error Model)
     UNBLOCKED per campaign plan — Phase D lowering safety, Waiting lifecycle,
-    Closing semantic barrier, budget conservation, durable receipt authority,
-    snapshot-authoritative recovery, invariant two-way bijection,
-    effectful satisfier retry semantics, and differential preservation have survived
-    11 adversarial audit rounds.
+    Closing semantic barrier, budget conservation, mandatory ExecutionReceipt authority,
+    machine-owned SatisfactionState, space StepFailure recovery, ConfirmedNotDelivered,
+    and differential preservation have survived 12 adversarial audit rounds.
 ```
