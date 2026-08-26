@@ -383,12 +383,15 @@ def run(prog: ScenarioProgram) -> None:
             assert sem_obs["value"] == "T-prune-success", f"R69: value mismatch, got {sem_obs['value']}"
             print("    \u2713 R69 verified: space StepFailure with prune policy pruned failed node and search continued -> Satisfied")
 
-        # A2 assertion for D34
+        # A2/A2-S assertion for D34: verifies trajectory and exact semantic attempt progression
         if prog.name == "D34_space_step_failure_requeue_retries_with_new_request":
             assert sem_obs["status"] == "Satisfied", f"A2: status must be Satisfied, got {sem_obs['status']}"
             assert sem_obs["value"] == "T-requeue-success", f"A2: value mismatch, got {sem_obs['value']}"
             assert sem_obs["step_count"] == 2, f"A2: step_count must be 2 (attempt 1 failed, attempt 2 succeeded), got {sem_obs['step_count']}"
-            print("    \u2713 A2 verified: space StepFailure with requeue policy retried with fresh request_id -> Satisfied(T-requeue-success)")
+            assert sem_obs["visited"] == ["root", "root"], f"A2: visited must record both semantic attempts ['root', 'root'], got {sem_obs['visited']}"
+            assert sem_obs["effects"] == ["external(opRoot)", "external(opRoot)"], f"A2: effects must record both attempts, got {sem_obs['effects']}"
+            assert sem_obs["budget_spent"] == 20, f"A2: budget_spent must be 20 (10 per attempt), got {sem_obs['budget_spent']}"
+            print("    \u2713 A2/A2-S verified: space StepFailure with requeue policy retried with fresh request_id -> Satisfied(T-requeue-success)")
 
         print(f"  \u2713 PASS {prog.name}  (status={sem_obs['status']} value={sem_obs['value']!r})")
         PASS += 1

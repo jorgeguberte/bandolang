@@ -42,9 +42,10 @@ class SemanticFrame:
     max_steps: int = 6
     budget_limit: int = 100
 
-    nodes: dict[str, str] = field(default_factory=dict)   # node_id -> status ("Frontier"|"Expanding"|"Pruned")
+    nodes: dict[str, str] = field(default_factory=dict)   # node_id -> status ("Frontier"|"Expanding"|"Pruned"|"Queued")
     node_satisfaction_states: dict[str, str] = field(default_factory=dict) # R61: node_id -> SatisfactionState
     node_satisfaction_retries: dict[str, int] = field(default_factory=dict)
+    node_space_attempts: dict[str, int] = field(default_factory=dict) # A2-S: per-node expansion attempt counter
     frontier: list[str] = field(default_factory=list)
     visited: list[Visit] = field(default_factory=list)
     step_count: int = 0
@@ -230,9 +231,17 @@ class SemanticFrame:
                     op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
                     succs = list(prog.successors.get(node, []))
 
-                    # R64/R69: declarative space fault handling
-                    if op.op_id in prog.space_faults:
-                        fault_msg = prog.space_faults[op.op_id]
+                    # R64/R69/A2-S: declarative space fault handling resolved by semantic attempt
+                    self.node_space_attempts[node] = self.node_space_attempts.get(node, 0) + 1
+                    attempt_no = self.node_space_attempts[node]
+                    fault_spec_val = prog.space_faults.get(op.op_id)
+                    if isinstance(fault_spec_val, list):
+                        fault_idx = min(attempt_no - 1, len(fault_spec_val) - 1)
+                        fault_msg = fault_spec_val[fault_idx]
+                    else:
+                        fault_msg = fault_spec_val
+
+                    if fault_msg is not None:
                         self.step_count += 1
                         self.budget_spent += op.charge()
                         self.visited.append(Visit(node))
@@ -243,6 +252,11 @@ class SemanticFrame:
                             return self.outcome
                         elif prog.on_step_failure == "prune":
                             self.nodes[node] = "Pruned"
+                            continue
+                        elif prog.on_step_failure == "requeue":
+                            self.nodes[node] = "Queued"
+                            if node not in self.frontier:
+                                self.frontier.append(node)
                             continue
 
                     op_is_delivery_unknown = prog.fault_spec.delivery_unknown or (op.op_id in prog.fault_spec.delivery_unknown_ops)

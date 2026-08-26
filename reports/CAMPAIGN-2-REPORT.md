@@ -1,12 +1,12 @@
-# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 14 (FINAL PHASE-D ACCEPTANCE)
+# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 15 (FINAL PHASE-D ACCEPTANCE)
 
-> **REISSUE 14 after Final Phase-D Acceptance gate (A1 + A2).**
-> The final acceptance gate resolved the 2 remaining operational requirements:
-> 1. A1: Transition-level satisfaction attempt limit enforcement persisted in domain configuration (`d.max_satisfaction_attempts`). Both `check_satisfaction` and `stage_local(is_expansion=False)` reject attempts exceeding the ceiling with strict zero delta (negative kills verified).
-> 2. A2: Space `StepFailure` with `on_step_failure="requeue"` marks failed node as `Queued`, restores it to the frontier, and allows subsequent semantic attempts to execute under a fresh `request_id` (D34 verified: step_count=2, fresh request identity, satisfied `T-requeue-success`).
+> **REISSUE 15 after Final Phase-D Acceptance with A2-S aligned reference model.**
+> 1. A1: Transition-level satisfaction attempt limit enforcement persisted in domain configuration (`d.max_satisfaction_attempts`). Both `check_satisfaction` and `stage_local(is_expansion=False)` reject attempts exceeding the ceiling with strict zero delta (negative mutation tests verified).
+> 2. A2 / A2-S: `SemanticFrame` and `Lowered` models align exactly on space `StepFailure` with `on_step_failure="requeue"`. Step failures consume exactly 1 semantic step, debit cost/effect once, mark node `Queued`, restore node to `frontier` without calling `expand()` or incorporating successors prematurely. Next scheduler selection executes a genuinely new semantic attempt with a fresh `request_id` (`req:opRoot:root:2`) and succeeds.
+> D34 verifies exact trajectory parity: step_count=2, visited=['root', 'root'], effects=['external(opRoot)', 'external(opRoot)'], budget_spent=20, and final `Satisfied("T-requeue-success")`.
 > All 81 test cases pass across all 4 test suites without divergence or false positives.
 
-## Audit repairs applied (Final Acceptance: A1 + A2)
+## Audit repairs applied (Final Acceptance: A1 + A2 / A2-S)
 
 ```text
 A1 Transition-Level Satisfaction Attempt Ceiling
@@ -15,10 +15,12 @@ A1 Transition-Level Satisfaction Attempt Ceiling
     before any state or accounting mutation and raise `TransitionError("SatisfactionLimitReached")`.
     Direct negative mutation tests prove strict rejection with zero delta on counters and reservations.
 
-A2 Space StepFailure Requeue Policy & Fresh Request Identity (D34)
-    FIXED — Implemented `on_step_failure="requeue"` in `apply_space_completion()`: sets node status
-    to `Queued`, restores node to `frontier`, and resets frame to `Searching`. Subsequent semantic attempt
-    stages with a fresh `request_id` (`req:opRoot:node:2`) and succeeds. Added D34 regression test.
+A2 / A2-S Space StepFailure Requeue Policy Parity (D34)
+    FIXED — `SemanticFrame` owns per-node expansion attempt counters and resolves sequence-valued
+    `space_faults` per attempt. On `StepFailure` with `requeue`: consumes 1 step, marks node `Queued`,
+    restores to `frontier`, and continues without premature successor discovery. Lowered machine stages
+    fresh `request_id` on attempt 2 and discovers successors only upon success.
+    D34 trajectory assertions prove strict parity on step_count (2), visited, effects, and spent budget.
 ```
 
 ## Complete verification results
@@ -69,7 +71,7 @@ Campaign 2 Basic (Declarative Search Programs):
                 D31 post-fuel Ok(None) candidate in graph exhausts naturally [R63/R68 verified],
                 D32 declarative space StepFailure DynamicGateRejection terminates as Failed [R64/R69 verified],
                 D33 space StepFailure with prune policy allows search to continue -> Satisfied [R69 verified],
-                D34 space StepFailure with requeue policy retries with fresh request_id -> Satisfied [A2 verified])
+                D34 space StepFailure with requeue policy retries with fresh request_id -> Satisfied [A2/A2-S verified])
 
 Campaign 2 Fault (Environmental Fault Injections):
     6/6 PASS   (D07 DeliveryUnknown [Waiting verified],
@@ -114,7 +116,7 @@ Invariant checker
     SELF-TESTED (21/21 mutation kill tests & control probes)
 
 Differential semantic preservation
-    VERIFIED IN TESTED REGIME (audited across 14 adversarial review rounds, R1–R70 + A1–A2 fixed)
+    VERIFIED IN TESTED REGIME (audited across 14 adversarial review rounds, R1–R70 + A1–A2/A2-S fixed)
 
 Actual compiler/lowering implementation
     NOT YET VERIFIED
@@ -133,6 +135,6 @@ Item 3 (CFG / Result / Error Model)
     UNBLOCKED per campaign plan — Phase D lowering safety, Waiting lifecycle,
     Closing semantic barrier, budget conservation, mandatory ExecutionReceipt authority,
     machine-owned RunnableAction model (ActionExpand | ActionCheckSatisfaction),
-    transition-level attempt limits (A1), declarative StepFailure requeue with fresh request identity (A2),
+    transition-level attempt limits (A1), declarative StepFailure requeue with fresh request identity (A2/A2-S),
     ConfirmedNotDelivered, and differential preservation have survived 14 adversarial audit rounds with zero bypasses.
 ```
