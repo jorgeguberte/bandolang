@@ -48,14 +48,15 @@ class ScenarioProgram:
     initial_frontier: list[str]
     successors: dict[str, list[str]] = field(default_factory=dict)
     node_ops: dict[str, OpDef] = field(default_factory=dict)
-    # satisfier_map: node_id -> ("ok", True/False, val) | ("err", False, error_msg)
-    satisfier_map: dict[str, tuple[str, bool, Any]] = field(default_factory=dict)
+    # satisfier_map: node_id -> ("ok", True/False, val) | ("err", False, error_msg) | list of such tuples for retries
+    satisfier_map: dict[str, Any] = field(default_factory=dict)
     on_satisfier_error: str = "abort"      # "abort" | "retry"
+    # R64/R69: space StepFailure fault map and policy
+    space_faults: dict[str, str] = field(default_factory=dict) # op_id -> StepFailure error msg
+    on_step_failure: str = "abort"         # "abort" | "prune" | "requeue"
     max_steps: int = 6
     budget_limit: int = 100
     fault_spec: FaultSpec = field(default_factory=FaultSpec)
-    # For D03: check a specific partial candidate after expansion fuel is exhausted
-    check_partial_after_fuel: Optional[str] = None
     # R24: effectful satisfier definition (own budget/cost, effects trace)
     effectful_satisfier: Optional[OpDef] = None
     # R33/R48: explicit PartialOf mapping: node_id -> Partial (only partial nodes are checkable)
@@ -90,7 +91,7 @@ D02 = ScenarioProgram(
     max_steps=6,
 )
 
-# R4: max_steps reached, partial checked after fuel ends
+# R4/R68: max_steps reached on expansion, remaining untested partial candidate in graph is scheduled and satisfies
 D03 = ScenarioProgram(
     name="D03_max_steps_partial_still_checked",
     initial_frontier=["P"],
@@ -99,14 +100,12 @@ D03 = ScenarioProgram(
         "P": OpDef("opP", kind="external", cost=10),
         "Q": OpDef("opQ", kind="external", cost=10),
     },
-    partial_map={"P": "P_P", "Q": "P_Q", "partial_candidate": "P_cand"},
+    partial_map={"P": "P_P", "Q": "P_Q"},
     satisfier_map={
         "P": ("ok", False, None),
-        "Q": ("ok", False, None),
-        "partial_candidate": ("ok", True, "T-partial"),
+        "Q": ("ok", True, "T-partial"),
     },
-    max_steps=2,
-    check_partial_after_fuel="partial_candidate",
+    max_steps=1,
 )
 
 D04 = ScenarioProgram(
@@ -159,10 +158,10 @@ D07 = ScenarioProgram(
 D08 = ScenarioProgram(
     name="D08_safe_transport_retry",
     initial_frontier=["root"],
-    successors={"root": []},
+    successors={"root": ["succ8"]},
     node_ops={"root": OpDef("op8", kind="external", cost=15, dedup_capable=True)},
-    partial_map={"root": "P_root"},
-    satisfier_map={"root": ("ok", True, "T-retry")},
+    partial_map={"root": "P_root", "succ8": "P_succ8"},
+    satisfier_map={"root": ("ok", False, None), "succ8": ("ok", True, "T-retry")},
     max_steps=6,
     fault_spec=FaultSpec(delivery_unknown=True, safe_retry=True),
 )
@@ -476,10 +475,10 @@ D26_SATISFIER_RETRY_LIMIT_BLOCKS_RETRY = ScenarioProgram(
 D27_IDEMPOTENT_SAFE_RETRY = ScenarioProgram(
     name="D27_idempotent_safe_retry",
     initial_frontier=["root"],
-    successors={"root": []},
+    successors={"root": ["succIdemp"]},
     node_ops={"root": OpDef("opIdemp", kind="external", cost=15, dedup_capable=False, idempotent=True)},
-    partial_map={"root": "P_root"},
-    satisfier_map={"root": ("ok", True, "T-idempotent-retry")},
+    partial_map={"root": "P_root", "succIdemp": "P_succ"},
+    satisfier_map={"root": ("ok", False, None), "succIdemp": ("ok", True, "T-idempotent-retry")},
     max_steps=6,
     fault_spec=FaultSpec(delivery_unknown=True, safe_retry=True),
 )
@@ -515,26 +514,44 @@ D29_CHECKED_NOT_SATISFIED_NEVER_RECHECKED = ScenarioProgram(
     budget_limit=100,
 )
 
-# R63: post-fuel candidate evaluating to Ok(None) increments attempts and exhausts
+# R63/R68: post-fuel candidate in graph evaluating to Ok(None) increments attempts and exhausts naturally
 D31_POST_FUEL_CHECK_NONE_EXHAUSTS = ScenarioProgram(
     name="D31_post_fuel_check_none_exhausts",
     initial_frontier=["root"],
-    successors={"root": []},
-    node_ops={"root": OpDef("opRoot", kind="local")},
-    partial_map={"cand": "P_cand"},
-    satisfier_map={"cand": ("ok", False, None)},
+    successors={"root": ["child1"], "child1": []},
+    node_ops={"root": OpDef("opRoot", kind="local"), "child1": OpDef("opChild1", kind="local")},
+    partial_map={"child1": "P_child1"},
+    satisfier_map={"child1": ("ok", False, None)},
     max_steps=1,
     budget_limit=100,
-    check_partial_after_fuel="cand",
 )
 
-# R64: space expansion returning StepFailure (DynamicGateRejection) terminates frame as Failed
+# R64/R69: declarative space StepFailure (DynamicGateRejection) with abort policy terminates frame as Failed
 D32_DYNAMIC_GATE_REJECTION_STEP_FAILURE = ScenarioProgram(
     name="D32_dynamic_gate_rejection_step_failure",
     initial_frontier=["root"],
     successors={"root": []},
     node_ops={"root": OpDef("opGate", kind="external", cost=10)},
+    space_faults={"opGate": "DynamicGateRejection: out-of-domain"},
+    on_step_failure="abort",
     partial_map={},
+    max_steps=6,
+    budget_limit=100,
+)
+
+# R64/R69: declarative space StepFailure with prune policy prunes failed node and continues search on remaining frontier
+D33_SPACE_STEP_FAILURE_PRUNE_CONTINUES = ScenarioProgram(
+    name="D33_space_step_failure_prune_continues",
+    initial_frontier=["rootA", "rootB"],
+    successors={"rootA": [], "rootB": []},
+    node_ops={
+        "rootA": OpDef("opGateA", kind="external", cost=10),
+        "rootB": OpDef("opB", kind="local"),
+    },
+    space_faults={"opGateA": "DynamicGateRejection: out-of-domain"},
+    on_step_failure="prune",
+    partial_map={"rootB": "P_rootB"},
+    satisfier_map={"rootB": ("ok", True, "T-prune-success")},
     max_steps=6,
     budget_limit=100,
 )

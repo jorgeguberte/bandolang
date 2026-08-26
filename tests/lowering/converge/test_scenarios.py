@@ -634,8 +634,9 @@ def t23():
 
 @scenario("T24_CONFIRMED_NOT_DELIVERED")
 def t24():
-    """R65: Transport layer confirms request was not delivered; releases obligations back to domain."""
+    """R65/R70: Transport layer confirms request was not delivered; releases obligations and continues cleanly."""
     d, h = new_domain()
+    d.on_step_failure = "prune"
     h.step("stage", tx.stage_local, "node:op24", "op24", "r24", "usd", 20)
     handle = h.step("emit", tx.emit_external, "r24", deliver_unknown=True)
     assert_true(d.frame_status == SearchStatus.WAITING, "expected Waiting")
@@ -649,6 +650,31 @@ def t24():
     assert_true(d.intent_available["usd"] == 100, "available not restored on ConfirmedNotDelivered")
     assert_true(d.scope_committed["usd"] == 0, "committed not released on ConfirmedNotDelivered")
     assert_true(d.frame_status == SearchStatus.SEARCHING, "frame not returned to Searching")
+
+    # Search continues cleanly to natural exhaustion
+    h.step("exhaust", tx.exhaust, "FrontierEmpty")
+    assert_true(d.frame_status == SearchStatus.EXHAUSTED, "expected Exhausted after clean drain")
+
+
+@scenario("T25_CONFIRMED_NOT_DELIVERED_WHILE_CLOSING")
+def t25():
+    """R70: ConfirmedNotDelivered arriving while Closing releases accounting and drains cleanly."""
+    d, h = new_domain()
+    h.step("stage", tx.stage_local, "node:op25", "op25", "r25", "usd", 30)
+    handle = h.step("emit", tx.emit_external, "r25", deliver_unknown=True)
+    h.step("cancel", tx.cancel)
+    assert_true(d.frame_status == SearchStatus.CLOSING, "expected Closing")
+    assert_true(d.closing_reason.kind == "PendingCancelled", "expected PendingCancelled")
+
+    # ConfirmedNotDelivered fires during Closing
+    h.step("confirm-not-delivered-closing", tx.confirmed_not_delivered, handle)
+    assert_true(d.handles[handle].state == "ConfirmedNotDelivered", "state not ConfirmedNotDelivered")
+    assert_true(d.intent_reserved["usd"] == 0, "reserved not released")
+    assert_true(d.scope_committed["usd"] == 0, "committed not released")
+
+    # Drain to terminal Cancelled
+    h.step("drain", tx.finish_if_drained)
+    assert_true(d.frame_status == SearchStatus.CANCELLED, f"expected Cancelled, got {d.frame_status}")
 
 
 # =====================================================================

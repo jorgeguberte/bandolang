@@ -43,7 +43,8 @@ def assert_clean(d: ConvergeTransactionDomain, bk: HarnessBookkeeping | None = N
 # I1. current_in_flight != None ==> at most one unsettled semantic request
 #     for the ENTIRE ConvergeFrame (R7: any request, not just the current one)
 def i1_unique_unsettled(d: ConvergeTransactionDomain) -> bool:
-    unsettled = [s for s in d.handles.values() if s.settlement is None]
+    unsettled = [s for s in d.handles.values()
+                 if s.settlement is None and s.state not in ("Aborted", "ConfirmedNotDelivered")]
     return len(unsettled) <= 1
 
 
@@ -52,7 +53,7 @@ def i2_terminal_no_inflight(d: ConvergeTransactionDomain) -> bool:
     if d.frame_status not in TERMINAL:
         return True
     return d.current_in_flight is None and not any(
-        s.settlement is None and s.state != "Aborted" for s in d.handles.values())
+        s.settlement is None and s.state not in ("Aborted", "ConfirmedNotDelivered") for s in d.handles.values())
 
 
 # I3. ConvergeFrame terminal ==> scope_committed == 0 AND no outstanding

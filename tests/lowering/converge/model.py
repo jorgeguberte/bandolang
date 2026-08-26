@@ -15,7 +15,7 @@ from typing import Any, Optional
 _ids = itertools.count(1)
 
 
-def next_id(prefix: str) -> str:
+def next_id(prefix: str = "id") -> str:
     return f"{prefix}-{next(_ids)}"
 
 
@@ -38,8 +38,11 @@ TERMINAL = {SearchStatus.FAILED, SearchStatus.SATISFIED,
 
 
 class NodeStatus:
+    QUEUED = "Queued"
     FRONTIER = "Frontier"
     EXPANDING = "Expanding"
+    EXPANDED = "Expanded"
+    PRUNED = "Pruned"
 
 
 @dataclass(frozen=True)
@@ -62,7 +65,7 @@ class SatisfactionState:
 @dataclass(frozen=True)
 class SearchNode:
     node_id: str
-    status: str
+    status: str = NodeStatus.FRONTIER
     satisfaction_state: str = SatisfactionState.UNTESTED
     satisfaction_retries: int = 0
 
@@ -86,27 +89,41 @@ class DispatchRecord:
 
 
 # ---------------------------------------------------------------------
-# Scheduler decisions (R25)
+# Scheduler decisions (R25/R67: unified RunnableAction model)
 # ---------------------------------------------------------------------
 
 @dataclass(frozen=True)
-class Continue:
-    node: str
+class ActionExpand:
+    node_id: str
     op_id: str
     kind: str
+    cost: int = 0
 
 
 @dataclass(frozen=True)
-class Wait:
+class ActionCheckSatisfaction:
+    node_id: str
+    partial: Any
+    op_id: str
+    kind: str
+    cost: int = 0
+
+
+@dataclass(frozen=True)
+class ActionWait:
     reason: str
 
 
 @dataclass(frozen=True)
-class Stop:
+class ActionStop:
     reason: str     # "BudgetDepleted" | "FrontierEmpty" | "FuelExhausted"
 
 
-SchedulerAction = Continue | Wait | Stop
+SchedulerAction = ActionExpand | ActionCheckSatisfaction | ActionWait | ActionStop
+# Aliases for backward compatibility in fixtures
+Continue = ActionExpand
+Wait = ActionWait
+Stop = ActionStop
 
 
 @dataclass(frozen=True)

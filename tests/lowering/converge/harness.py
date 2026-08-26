@@ -52,6 +52,11 @@ class Harness:
             for hid, st in self.d.handles.items():
                 if st.state == "Aborted":
                     self.bk.reservations_created_by_cf.pop(st.request_id, None)
+        elif getattr(fn, "__name__", "") == "confirmed_not_delivered" and len(args) >= 1:
+            handle_id = args[0]
+            st = self.d.handles.get(handle_id)
+            if st:
+                self.bk.reservations_created_by_cf.pop(st.request_id, None)
 
         self.result.steps.append(name)
         self.result.invariant_checks += 1

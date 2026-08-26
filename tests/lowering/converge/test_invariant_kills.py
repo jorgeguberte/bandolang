@@ -184,7 +184,7 @@ digest_none2 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="a",
 assert digest_none1 != digest_none2, "R56: None vs 'None' string must not collide in canonical digest"
 print("  ✓ R50/R56 exact canonical digest verified: order, op_id, and typed structure are strictly bound")
 
-# R57: Durable ExecutionReceipt authority test
+# R57/R62: Durable ExecutionReceipt authority and mandatory validation tests
 d_settle = base_domain()
 h_st = InFlightLifecycleState(handle_id="h_settle", request_id="r_settle", state="Delivered", reserved_amount=10)
 h_st.completion = __import__("model").CompletionRecord(
@@ -193,11 +193,38 @@ h_st.completion = __import__("model").CompletionRecord(
 )
 d_settle.handles["h_settle"] = h_st
 try:
-    __import__("transitions").settle(d_settle, "h_settle", "usd", 0)
-    raise AssertionError("caller override of durable receipt amount was permitted")
+    __import__("transitions").settle(d_settle, "h_settle")
+except Exception as e:
+    raise AssertionError(f"valid settlement failed: {e}")
+assert d_settle.scope_spent["usd"] == 7, "durable receipt amount was not settled"
+
+# Negative R62: missing receipt MUST FAIL
+d_no_rcpt = base_domain()
+h_inflight = InFlightLifecycleState(handle_id="h_inf", request_id="r_inf", state="InFlight", reserved_amount=10)
+d_no_rcpt.handles["h_inf"] = h_inflight
+try:
+    __import__("transitions").admit_completion(d_no_rcpt, "h_inf", "rcpt-1", receipt=None)
+    raise AssertionError("missing receipt was accepted on admit_completion")
 except __import__("transitions").TransitionError as e:
-    assert "SettlementAmountMismatch" in str(e), f"wrong refusal: {e}"
-print("  ✓ R57 settlement authority verified: caller cannot override durable ExecutionReceipt amount")
+    assert "MissingExecutionReceipt" in str(e), f"wrong refusal: {e}"
+
+# Negative R62: wrong request_id MUST FAIL
+try:
+    bad_rcpt = ExecutionReceipt("r_wrong", "rcpt-1", "usd", 10)
+    __import__("transitions").admit_completion(d_no_rcpt, "h_inf", "rcpt-1", receipt=bad_rcpt)
+    raise AssertionError("receipt with mismatched request_id was accepted")
+except __import__("transitions").TransitionError as e:
+    assert "ReceiptRequestIdMismatch" in str(e), f"wrong refusal: {e}"
+
+# Negative R62: wrong receipt_id MUST FAIL
+try:
+    bad_rcpt_id = ExecutionReceipt("r_inf", "rcpt_mismatch", "usd", 10)
+    __import__("transitions").admit_completion(d_no_rcpt, "h_inf", "rcpt-1", receipt=bad_rcpt_id)
+    raise AssertionError("receipt with mismatched receipt_id was accepted")
+except __import__("transitions").TransitionError as e:
+    assert "ReceiptIdMismatch" in str(e), f"wrong refusal: {e}"
+
+print("  ✓ R57/R62 settlement & receipt authority verified: receipt is mandatory and strictly bound to request_id/receipt_id")
 
 # I8 kill (R30): attempt actual machine frontier mutation while Closing
 d8 = base_domain()

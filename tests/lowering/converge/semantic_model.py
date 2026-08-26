@@ -4,9 +4,8 @@ Models the WHAT (ConvergeFrame v0 semantics), not the soma.vm.* HOW.
 Deliberately more direct than the lowered model in model.py/transitions.py:
 no outbox, no CompletionRecord, no StageLocal, no settlement records.
 
-R9 (audit): SemanticFrame executes ScenarioProgram autonomously using ONLY
-its own internal methods. Drivers NEVER poke internal status or counters.
-
+R9/R67: SemanticFrame executes ScenarioProgram autonomously using unified
+scheduling over RunnableAction (EligibleChecks & EligibleExpansions).
 Deterministic stubs only: 0 LLM calls, 0 network, 0 randomness.
 """
 from __future__ import annotations
@@ -43,8 +42,9 @@ class SemanticFrame:
     max_steps: int = 6
     budget_limit: int = 100
 
-    nodes: dict[str, str] = field(default_factory=dict)   # node_id -> status ("Frontier"|"Expanding")
+    nodes: dict[str, str] = field(default_factory=dict)   # node_id -> status ("Frontier"|"Expanding"|"Pruned")
     node_satisfaction_states: dict[str, str] = field(default_factory=dict) # R61: node_id -> SatisfactionState
+    node_satisfaction_retries: dict[str, int] = field(default_factory=dict)
     frontier: list[str] = field(default_factory=list)
     visited: list[Visit] = field(default_factory=list)
     step_count: int = 0
@@ -74,20 +74,28 @@ class SemanticFrame:
                 if s not in self.nodes:
                     self.nodes[s] = "Frontier"
                     self.node_satisfaction_states.setdefault(s, "Untested")
+                    self.node_satisfaction_retries.setdefault(s, 0)
                     self.frontier.append(s)
         return succs if not delivery_unknown else []
 
     def check_satisfaction(self, node_id: str,
-                           satisfier_map: dict[str, tuple[str, bool, Any]],
+                           satisfier_map: dict[str, Any],
                            on_error: str = "abort") -> bool:
-        """Check satisfaction on a candidate node (R61)."""
+        """Check satisfaction on a candidate node (R61/R67)."""
         if self.status not in (Status.SEARCHING, Status.EXHAUSTED):
             return False
         self.satisfaction_attempts += 1
         map_entry = satisfier_map.get(node_id, ("ok", False, None))
-        kind, ok, val = map_entry[0] if isinstance(map_entry, list) else map_entry
+        retries = self.node_satisfaction_retries.get(node_id, 0)
+        if isinstance(map_entry, list):
+            idx = min(retries, len(map_entry) - 1)
+            kind, ok, val = map_entry[idx]
+        else:
+            kind, ok, val = map_entry
+
         if kind == "err":
             self.node_satisfaction_states[node_id] = "RetryableFailure"
+            self.node_satisfaction_retries[node_id] = retries + 1
             if on_error == "abort":
                 self.status = Status.FAILED
                 self.outcome = SemanticOutcome(Status.FAILED, error=val)
@@ -109,16 +117,16 @@ class SemanticFrame:
             self.outcome = SemanticOutcome(Status.CANCELLED)
 
     def exhaust(self, reason: str = "FrontierEmpty") -> None:
-        """Natural exhaustion (R34)."""
-        if self.status in (Status.SEARCHING, "Waiting"):
-            self.exhaustion_reason = reason
+        """Exhaustion: search complete without satisfying predicate."""
+        if self.status == Status.SEARCHING:
             self.status = Status.EXHAUSTED
+            self.exhaustion_reason = reason
             self.outcome = SemanticOutcome(Status.EXHAUSTED)
 
-    # ---- autonomous runner ----------------------------------------------
+    # ---- autonomous program execution (R9/R67) -------------------------
 
     def run_program(self, prog: ScenarioProgram) -> SemanticOutcome:
-        """Execute a ScenarioProgram purely via semantic search semantics."""
+        """Execute a ScenarioProgram purely via unified RunnableAction semantics (R67)."""
         self.max_steps = prog.max_steps
         self.budget_limit = prog.budget_limit
         self.exhaustion_reason = None
@@ -126,177 +134,162 @@ class SemanticFrame:
         for n in prog.initial_frontier:
             self.frontier.append(n)
             self.nodes[n] = "Frontier"
+            self.node_satisfaction_states[n] = "Untested"
+            self.node_satisfaction_retries[n] = 0
 
-        runnable_idx = 0
         while self.status == Status.SEARCHING:
-            if self.step_count >= self.max_steps or not self.frontier:
-                break
+            # 1. Compute and execute eligible satisfaction checks (R67/R68)
+            action_taken = False
+            if self.satisfaction_attempts < prog.max_satisfaction_attempts:
+                for cand, sat_state in list(self.node_satisfaction_states.items()):
+                    if cand in prog.partial_map and sat_state in ("Untested", "RetryableFailure"):
+                        if prog.effectful_satisfier:
+                            es = prog.effectful_satisfier
+                            if self.budget_spent + es.cost > self.budget_limit:
+                                continue
+                            self.satisfaction_attempts += 1
+                            retries = self.node_satisfaction_retries.get(cand, 0)
+                            self.effects.append(f"external({es.op_id})")
 
-            # R25: Semantic search scheduler selects first runnable node
-            runnable_idx = None
-            for i, n in enumerate(self.frontier):
-                op = prog.node_ops.get(n, OpDef(op_id=f"op:{n}"))
-                op_ceiling = op.cost if op.kind == "external" else 0
-                if self.budget_spent + op_ceiling <= self.budget_limit:
-                    runnable_idx = i
-                    break
-
-            if runnable_idx is None:
-                # No runnable node within budget -> Stop(BudgetDepleted)
-                break
-
-            node = self.frontier.pop(runnable_idx)
-            op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
-            succs = list(prog.successors.get(node, []))
-
-            if op.op_id == "opGate":
-                # R64: Space StepFailure (DynamicGateRejection) terminates search as Failed
-                self.step_count += 1
-                self.budget_spent += op.charge()
-                self.visited.append(Visit(node))
-                self.effects.append(f"external({op.op_id})")
-                self.status = Status.FAILED
-                self.outcome = SemanticOutcome(Status.FAILED, error="DynamicGateRejection: out-of-domain")
-                return self.outcome
-
-            op_is_delivery_unknown = prog.fault_spec.delivery_unknown or (op.op_id in prog.fault_spec.delivery_unknown_ops)
-            self.expand(node, op, succs, delivery_unknown=op_is_delivery_unknown)
-
-            # R31/R41/R51/R60: External dispatch with DeliveryUnknown transitions to Waiting state unless safe_retry succeeds
-            if op_is_delivery_unknown and op.kind == "external":
-                if prog.fault_spec.safe_retry and (op.dedup_capable or op.idempotent):
-                    if prog.fault_spec.double_delivery_unknown:
-                        # R60: second retry attempt also suffers DeliveryUnknown -> remains Waiting
-                        self.status = "Waiting"
-                        self.outcome = SemanticOutcome("Waiting")
-                        self.outstanding_scope_commitment = op.cost
-                        self.unsettled_request_count = 1
-                        self.attributable_owner_reserved = op.cost
-                        self.intent_available_consumed = self.budget_spent + op.cost
-                        return self.outcome
-                    else:
-                        # R51: Safe transport retry succeeds on second attempt
-                        self.budget_spent += op.charge()
-                        for s in succs:
-                            if s not in self.nodes:
-                                self.nodes[s] = "Frontier"
-                                self.node_satisfaction_states.setdefault(s, "Untested")
-                                self.frontier.append(s)
-                else:
-                    self.status = "Waiting"
-                    self.outcome = SemanticOutcome("Waiting")
-                    self.outstanding_scope_commitment = op.cost
-                    self.unsettled_request_count = 1
-                    self.attributable_owner_reserved = op.cost
-                    self.intent_available_consumed = self.budget_spent + op.cost
-                    return self.outcome
-
-            # Check for environmental cancellation
-            if prog.fault_spec.cancel_in_flight:
-                self.cancel()
-                return self.outcome
-
-            # Candidates to check: the expanded node itself, then its successors
-            candidates = [node] + succs
-            for cand in candidates:
-                # R48: Strict PartialOf check — only nodes explicitly declared in partial_map are checkable
-                if cand not in prog.partial_map:
-                    continue
-
-                # R61: nodes in CheckedNotSatisfied or Satisfied are NOT eligible for re-checking!
-                if self.node_satisfaction_states.get(cand) in ("CheckedNotSatisfied", "Satisfied"):
-                    continue
-
-                cand_attempts = 0
-                while True:
-                    # R42/R49/R59: Check satisfaction attempt limit
-                    if self.satisfaction_attempts >= prog.max_satisfaction_attempts:
-                        break
-
-                    # R24/R26/R52/R55/R59/R60: effectful satisfier
-                    if prog.effectful_satisfier:
-                        es = prog.effectful_satisfier
-                        es_cost = es.cost
-                        if self.budget_spent + es_cost > self.budget_limit:
-                            break
-                        # R26: satisfaction attempt committed upon emission
-                        self.satisfaction_attempts += 1
-                        cand_attempts += 1
-                        self.effects.append(f"external({es.op_id})")
-
-                        es_is_delivery_unknown = prog.fault_spec.delivery_unknown or (es.op_id in prog.fault_spec.delivery_unknown_ops)
-                        if es_is_delivery_unknown:
-                            if prog.fault_spec.safe_retry and (es.dedup_capable or es.idempotent):
-                                if prog.fault_spec.double_delivery_unknown:
+                            es_is_delivery_unknown = prog.fault_spec.delivery_unknown or (es.op_id in prog.fault_spec.delivery_unknown_ops)
+                            if es_is_delivery_unknown:
+                                if prog.fault_spec.safe_retry and (es.dedup_capable or es.idempotent):
+                                    if prog.fault_spec.double_delivery_unknown:
+                                        self.status = "Waiting"
+                                        self.outcome = SemanticOutcome("Waiting")
+                                        self.outstanding_scope_commitment = es.cost
+                                        self.unsettled_request_count = 1
+                                        self.attributable_owner_reserved = es.cost
+                                        self.intent_available_consumed = self.budget_spent + es.cost
+                                        return self.outcome
+                                    else:
+                                        self.budget_spent += es.charge()
+                                else:
                                     self.status = "Waiting"
                                     self.outcome = SemanticOutcome("Waiting")
-                                    self.outstanding_scope_commitment = es_cost
+                                    self.outstanding_scope_commitment = es.cost
                                     self.unsettled_request_count = 1
-                                    self.attributable_owner_reserved = es_cost
-                                    self.intent_available_consumed = self.budget_spent + es_cost
+                                    self.attributable_owner_reserved = es.cost
+                                    self.intent_available_consumed = self.budget_spent + es.cost
                                     return self.outcome
-                                else:
-                                    self.budget_spent += es.charge()
                             else:
-                                # R31: DeliveryUnknown leaves frame in Waiting state
-                                self.status = "Waiting"
-                                self.outcome = SemanticOutcome("Waiting")
-                                self.outstanding_scope_commitment = es_cost
-                                self.unsettled_request_count = 1
-                                self.attributable_owner_reserved = es_cost
-                                self.intent_available_consumed = self.budget_spent + es_cost
+                                self.budget_spent += es.charge()
+
+                            if prog.fault_spec.cancel_in_flight:
+                                self.cancel()
                                 return self.outcome
-                        else:
-                            self.budget_spent += es.charge()
 
-                        map_entry = prog.satisfier_map.get(cand, ("ok", False, None))
-                        if isinstance(map_entry, list):
-                            idx = min(cand_attempts - 1, len(map_entry) - 1)
-                            kind, ok, val = map_entry[idx]
-                        else:
-                            kind, ok, val = map_entry
+                            map_entry = prog.satisfier_map.get(cand, ("ok", False, None))
+                            if isinstance(map_entry, list):
+                                idx = min(retries, len(map_entry) - 1)
+                                kind, ok, val = map_entry[idx]
+                            else:
+                                kind, ok, val = map_entry
 
-                        if kind == "err":
-                            # R52/R59/R61: mark RetryableFailure
-                            self.node_satisfaction_states[cand] = "RetryableFailure"
-                            self.satisfier_error = val
-                            if prog.on_satisfier_error == "abort":
-                                self.status = "Failed"
-                                self.outcome = SemanticOutcome("Failed", error=val)
+                            if kind == "err":
+                                self.node_satisfaction_states[cand] = "RetryableFailure"
+                                self.node_satisfaction_retries[cand] = retries + 1
+                                self.satisfier_error = val
+                                if prog.on_satisfier_error == "abort":
+                                    self.status = Status.FAILED
+                                    self.outcome = SemanticOutcome(Status.FAILED, error=val)
+                                    return self.outcome
+                                action_taken = True
+                                break
+                            elif ok:
+                                self.node_satisfaction_states[cand] = "Satisfied"
+                                self.status = Status.SATISFIED
+                                self.outcome = SemanticOutcome(Status.SATISFIED, val)
                                 return self.outcome
                             else:
-                                # R59 retry policy: loop again to retry candidate if attempts < max
-                                continue
-                        elif ok:
-                            self.node_satisfaction_states[cand] = "Satisfied"
-                            self.status = Status.SATISFIED
-                            self.outcome = SemanticOutcome(Status.SATISFIED, val)
-                            return self.outcome
+                                self.node_satisfaction_states[cand] = "CheckedNotSatisfied"
+                                action_taken = True
+                                break
                         else:
-                            # Not satisfied (Ok None)
-                            self.node_satisfaction_states[cand] = "CheckedNotSatisfied"
+                            # Local satisfier
+                            if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
+                                return self.outcome
+                            action_taken = True
                             break
-                    else:
-                        if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
-                            return self.outcome
+
+            if action_taken:
+                continue
+
+            # 2. Compute and execute eligible expansions (R67)
+            if self.step_count < self.max_steps and self.frontier:
+                runnable_idx = None
+                for i, n in enumerate(self.frontier):
+                    op = prog.node_ops.get(n, OpDef(op_id=f"op:{n}"))
+                    op_ceiling = op.cost if op.kind == "external" else 0
+                    if self.budget_spent + op_ceiling <= self.budget_limit:
+                        runnable_idx = i
                         break
 
-        # Post-fuel / partial check (D03 / R49 / R63)
-        if self.status in (Status.SEARCHING, Status.EXHAUSTED) and prog.check_partial_after_fuel:
-            cand = prog.check_partial_after_fuel
-            if (self.satisfaction_attempts < prog.max_satisfaction_attempts and
-                cand in prog.partial_map):
-                if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
-                    return self.outcome
+                if runnable_idx is not None:
+                    node = self.frontier.pop(runnable_idx)
+                    op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
+                    succs = list(prog.successors.get(node, []))
 
-        if self.status == Status.SEARCHING:
+                    # R64/R69: declarative space fault handling
+                    if op.op_id in prog.space_faults:
+                        fault_msg = prog.space_faults[op.op_id]
+                        self.step_count += 1
+                        self.budget_spent += op.charge()
+                        self.visited.append(Visit(node))
+                        self.effects.append(f"external({op.op_id})")
+                        if prog.on_step_failure == "abort":
+                            self.status = Status.FAILED
+                            self.outcome = SemanticOutcome(Status.FAILED, error=fault_msg)
+                            return self.outcome
+                        elif prog.on_step_failure == "prune":
+                            self.nodes[node] = "Pruned"
+                            continue
+
+                    op_is_delivery_unknown = prog.fault_spec.delivery_unknown or (op.op_id in prog.fault_spec.delivery_unknown_ops)
+                    self.expand(node, op, succs, delivery_unknown=op_is_delivery_unknown)
+
+                    if op_is_delivery_unknown and op.kind == "external":
+                        if prog.fault_spec.safe_retry and (op.dedup_capable or op.idempotent):
+                            if prog.fault_spec.double_delivery_unknown:
+                                self.status = "Waiting"
+                                self.outcome = SemanticOutcome("Waiting")
+                                self.outstanding_scope_commitment = op.cost
+                                self.unsettled_request_count = 1
+                                self.attributable_owner_reserved = op.cost
+                                self.intent_available_consumed = self.budget_spent + op.cost
+                                return self.outcome
+                            else:
+                                self.budget_spent += op.charge()
+                                for s in succs:
+                                    if s not in self.nodes:
+                                        self.nodes[s] = "Frontier"
+                                        self.node_satisfaction_states[s] = "Untested"
+                                        self.node_satisfaction_retries[s] = 0
+                                        self.frontier.append(s)
+                        else:
+                            self.status = "Waiting"
+                            self.outcome = SemanticOutcome("Waiting")
+                            self.outstanding_scope_commitment = op.cost
+                            self.unsettled_request_count = 1
+                            self.attributable_owner_reserved = op.cost
+                            self.intent_available_consumed = self.budget_spent + op.cost
+                            return self.outcome
+
+                    if prog.fault_spec.cancel_in_flight:
+                        self.cancel()
+                        return self.outcome
+
+                    continue
+
+            # 3. Stop reasons when no eligible actions exist
             if self.step_count >= self.max_steps:
                 reason = "FuelExhausted"
-            elif runnable_idx is None:
-                reason = "BudgetDepleted"
-            else:
+            elif not self.frontier:
                 reason = "FrontierEmpty"
+            else:
+                reason = "BudgetDepleted"
             self.exhaust(reason)
+            break
 
         return self.outcome
 
