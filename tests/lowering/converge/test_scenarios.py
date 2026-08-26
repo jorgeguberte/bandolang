@@ -232,10 +232,10 @@ def t08():
     except CrashInjected:
         pass
     # forward recovery: settlement survives, application happens exactly once
-    st = d.handles[handle]
-    assert_true(st.settlement is not None, "settlement record lost in recovery")
+    assert_true(d.handles[handle].settlement is not None, "settlement record lost before recovery")
     from transitions import recover
     recover(d, snapshot, "after_settlement_before_apply")
+    st = d.handles[handle]
     assert_true(st.applied and st.state == "Applied", "recovery did not forward-apply")
     # applying again is still a no-op (exactly-once)
     h.step("apply-idempotent", tx.apply_semantic, handle)
@@ -474,6 +474,39 @@ def t18():
         raise AssertionError("generic apply was accepted on typed completion")
     except tx.TransitionError as e:
         assert_true("generic apply_semantic refused" in str(e), f"wrong refusal: {e}")
+
+
+@scenario("T19_RECOVERY_SNAPSHOT_AUTHORITATIVE")
+def t19():
+    """R53: Recovery must redrive exclusively on the durable snapshot state; volatile RAM cannot corrupt recovery."""
+    from model import SpaceOutcome, CompletionRecord, SearchNode
+    d, h = new_domain()
+    h.step("stage", tx.stage_local, "n19", "op19", "r19", "usd", 10)
+    handle = h.step("emit", tx.emit_external, "r19")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-19",
+           semantic_payload=SpaceOutcome(successors=["GOOD_SUCC"]))
+    h.step("settle", tx.settle, handle, "usd", 10)
+
+    # Durable pre-apply snapshot taken
+    snapshot = h.snapshot()
+
+    # Simulate post-crash volatile corruption in live RAM before recover() is called
+    bad_payload = SpaceOutcome(successors=["BAD_SUCC"])
+    d.handles[handle].completion = CompletionRecord(
+        handle_id=handle, receipt_id="rcpt-19-bad", digest="digest-bad", outcome="Success",
+        semantic_payload=bad_payload,
+    )
+    d.nodes["BAD_SUCC"] = SearchNode("BAD_SUCC", "Expanding")
+
+    # Recover from the durable snapshot
+    from transitions import recover
+    recover(d, snapshot, "after_settlement_before_apply")
+
+    # Verify that ONLY the durable snapshot outcome (GOOD_SUCC) was incorporated!
+    assert_true("GOOD_SUCC" in d.frontier, "GOOD_SUCC not incorporated into frontier")
+    assert_true("GOOD_SUCC" in d.nodes, "GOOD_SUCC not incorporated into nodes")
+    assert_true("BAD_SUCC" not in d.frontier, "volatile BAD_SUCC leaked into frontier")
+    assert_true("BAD_SUCC" not in d.nodes, "volatile BAD_SUCC leaked into nodes")
 
 
 # =====================================================================

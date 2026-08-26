@@ -19,7 +19,9 @@ sys.path.insert(0, str(Path(__file__).parent))
 from scenarios import (
     D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17,
     D18_WAITING, D19_CRASH_RECOVERY, D20_TARGETED_DELIVERY_UNKNOWN,
-    D21_SATISFACTION_LIMIT, D22_DELIVERY_UNKNOWN_NO_SUCCESSORS, OpDef, ScenarioProgram,
+    D21_SATISFACTION_LIMIT, D22_DELIVERY_UNKNOWN_NO_SUCCESSORS,
+    D23_EFFECTFUL_SATISFIER_ERR_ABORT, D24_EFFECTFUL_SATISFIER_ERR_RETRY,
+    D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN, OpDef, ScenarioProgram,
 )
 import transitions as tx
 from differential import compare, classify, lowered_observation
@@ -35,6 +37,7 @@ PASS, FAIL = 0, 0
 
 def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h: Harness) -> None:
     """Execute a ScenarioProgram on the lowered machine according to search semantics."""
+    d.on_satisfier_error = prog.on_satisfier_error
     tx.discover_successors(d, prog.initial_frontier)
 
     while d.frame_status == SearchStatus.SEARCHING:
@@ -67,13 +70,14 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                    deliver_unknown=op_is_delivery_unknown)
 
             if op_is_delivery_unknown:
-                # R31: delivery unknown remains in Waiting state
-                break
-
-            if prog.fault_spec.safe_retry:
-                steps_before = d.step_count
-                h.step(f"retry-{op.op_id}", tx.emit_external, handle)
-                assert d.step_count == steps_before, "retry consumed fuel"
+                if prog.fault_spec.safe_retry and op.dedup_capable:
+                    # R51: Safe transport retry on the same request_id succeeds!
+                    steps_before = d.step_count
+                    h.step(f"retry-{op.op_id}", tx.emit_external, handle, deliver_unknown=False)
+                    assert d.step_count == steps_before, "retry consumed fuel"
+                else:
+                    # R31: delivery unknown remains in Waiting state
+                    break
 
             if prog.fault_spec.cancel_in_flight:
                 h.step(f"deliver-{op.op_id}", tx.admit_completion, handle,
@@ -102,7 +106,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                 except CrashInjected:
                     pass
                 from transitions import recover
-                # R32/R45: recovery autonomously reads SpaceOutcome and discovers successors
+                # R32/R45/R53: recovery autonomously reads SpaceOutcome and discovers successors
                 recover(d, d.copy(), "after_settlement_before_apply")
                 assert d.handles[handle].applied and d.handles[handle].state == "Applied", "recovery lost settled result"
             else:
@@ -120,7 +124,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
             if d.satisfaction_attempts >= prog.max_satisfaction_attempts:
                 continue
 
-            # R24/R26: effectful satisfier
+            # R24/R26/R52/R55: effectful satisfier
             if prog.effectful_satisfier:
                 es = prog.effectful_satisfier
                 if not tx.classify_runnable(d, es.cost, "usd"):
@@ -128,12 +132,17 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                 h_req = f"req:{es.op_id}:{cand}"
                 h_handle = h.step(f"stage-sat-{es.op_id}", tx.stage_local, cand, es.op_id, h_req,
                                   "usd", es.cost, is_expansion=False)
-                h.step(f"emit-sat-{es.op_id}", tx.emit_external, h_handle,
-                       deliver_unknown=prog.fault_spec.delivery_unknown)
 
-                if prog.fault_spec.delivery_unknown:
-                    # R31: delivery unknown remains in Waiting state
-                    break
+                es_is_delivery_unknown = prog.fault_spec.delivery_unknown or (es.op_id in prog.fault_spec.delivery_unknown_ops)
+                h.step(f"emit-sat-{es.op_id}", tx.emit_external, h_handle,
+                       deliver_unknown=es_is_delivery_unknown)
+
+                if es_is_delivery_unknown:
+                    if prog.fault_spec.safe_retry and es.dedup_capable:
+                        h.step(f"retry-sat-{es.op_id}", tx.emit_external, h_handle, deliver_unknown=False)
+                    else:
+                        # R31: delivery unknown remains in Waiting state
+                        break
 
                 if prog.fault_spec.cancel_in_flight:
                     h.step("cancel", tx.cancel)
@@ -141,12 +150,22 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                     break
 
                 kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
+                if kind == "err":
+                    sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=False, value=None, error=val)
+                elif ok:
+                    sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=True, value=val, error=None)
+                else:
+                    sat_payload = SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=False, value=None, error=None)
+
                 h.step(f"deliver-sat-{es.op_id}", tx.admit_completion, h_handle, f"rcpt-sat-{cand}",
-                       semantic_payload=SatisfierOutcome(node_id=cand, op_id=es.op_id, satisfied=ok, value=val))
+                       semantic_payload=sat_payload)
                 h.step(f"settle-sat-{es.op_id}", tx.settle, h_handle, "usd", es.charge())
-                # R45: apply_satisfier_completion reads durable SatisfierOutcome
+                # R45/R52: apply_satisfier_completion reads durable SatisfierOutcome and frame error policy
                 h.step(f"apply-sat-{es.op_id}", tx.apply_satisfier_completion, h_handle)
-                if ok:
+                if kind == "err" and prog.on_satisfier_error == "abort":
+                    h.step("drain", tx.finish_if_drained)
+                    break
+                elif ok:
                     break
             else:
                 kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
@@ -285,6 +304,26 @@ def run(prog: ScenarioProgram) -> None:
             assert sem_obs["step_count"] == 1, f"R47: step_count must be 1, got {sem_obs['step_count']}"
             print("    \u2713 R47 verified: DeliveryUnknown did not incorporate successor B into frontier")
 
+        # R52 assertion for D23
+        if prog.name == "D23_effectful_satisfier_err_abort":
+            assert sem_obs["status"] == "Failed", f"R52: status must be Failed, got {sem_obs['status']}"
+            assert sem_obs["error"] == "sensor failure", f"R52: error must be 'sensor failure', got {sem_obs['error']}"
+            print("    \u2713 R52 verified: effectful satisfier Err(e) with abort policy transitions to Failed(e)")
+
+        # R52 assertion for D24
+        if prog.name == "D24_effectful_satisfier_err_retry":
+            assert sem_obs["status"] == "Satisfied", f"R52: status must be Satisfied, got {sem_obs['status']}"
+            assert sem_obs["value"] == "T-recovered-after-retry", f"R52: value must be 'T-recovered-after-retry', got {sem_obs['value']}"
+            assert sem_obs["satisfaction_attempts"] == 2, f"R52: attempts must be 2, got {sem_obs['satisfaction_attempts']}"
+            print("    \u2713 R52 verified: effectful satisfier Err(e) with retry policy continued to cand2 -> Satisfied")
+
+        # R55 assertion for D25
+        if prog.name == "D25_targeted_effectful_satisfier_delivery_unknown":
+            assert sem_obs["status"] == "Waiting", f"R55: status must be Waiting, got {sem_obs['status']}"
+            assert sem_obs["satisfaction_attempts"] == 1, f"R55: attempts must be 1, got {sem_obs['satisfaction_attempts']}"
+            assert sem_obs["outstanding_scope_commitment"] == 5, f"R55: commitment must be 5, got {sem_obs['outstanding_scope_commitment']}"
+            print("    \u2713 R55 verified: targeted delivery_unknown_ops on effectful satisfier opVerify leaves frame in Waiting")
+
         print(f"  \u2713 PASS {prog.name}  (status={sem_obs['status']} value={sem_obs['value']!r})")
         PASS += 1
 
@@ -294,7 +333,9 @@ if __name__ == "__main__":
     print("CAMPAIGN 2 BASIC — declarative ScenarioProgram, autonomous execution")
     for prog in (D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17,
                  D18_WAITING, D19_CRASH_RECOVERY, D20_TARGETED_DELIVERY_UNKNOWN,
-                 D21_SATISFACTION_LIMIT, D22_DELIVERY_UNKNOWN_NO_SUCCESSORS):
+                 D21_SATISFACTION_LIMIT, D22_DELIVERY_UNKNOWN_NO_SUCCESSORS,
+                 D23_EFFECTFUL_SATISFIER_ERR_ABORT, D24_EFFECTFUL_SATISFIER_ERR_RETRY,
+                 D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN):
         run(prog)
 
     print("=" * 70)

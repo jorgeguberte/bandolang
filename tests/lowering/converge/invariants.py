@@ -106,7 +106,7 @@ def i6_apply_at_most_once(d: ConvergeTransactionDomain) -> bool:
     return True
 
 
-# I7. SettlementRecord(h) ==> ledger reconciliation count == 1 per handle (R40)
+# I7. SettlementRecord(h) ==> ledger reconciliation count == 1 per handle (R40/R54)
 def i7_settlement_exactly_once(d: ConvergeTransactionDomain) -> bool:
     # 1. Every settled handle must have exactly 1 independent reconciliation event
     for hid, st in d.handles.items():
@@ -119,14 +119,15 @@ def i7_settlement_exactly_once(d: ConvergeTransactionDomain) -> bool:
             return False
         if hid not in d.handles or d.handles[hid].settlement is None:
             return False
-    # 3. Ledger consistency: scope_spent must equal exact sum of settlement records
+    # 3. Ledger consistency: scope_spent must equal exact sum of settlement records across union of resources (R54)
     total_by_resource: dict[str, int] = {}
     for st in d.handles.values():
         if st.settlement:
             r = st.settlement.resource
             total_by_resource[r] = total_by_resource.get(r, 0) + st.settlement.amount
-    for r, total in total_by_resource.items():
-        if d.scope_spent.get(r, 0) != total:
+    all_resources = set(d.scope_spent.keys()) | set(total_by_resource.keys())
+    for r in all_resources:
+        if d.scope_spent.get(r, 0) != total_by_resource.get(r, 0):
             return False
     return True
 

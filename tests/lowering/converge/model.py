@@ -213,6 +213,7 @@ class ConvergeTransactionDomain:
     # Satisfaction result carried by check_satisfaction (differential parity)
     satisfied_value: object = None
     satisfier_error: str = None
+    on_satisfier_error: str = "abort"         # R52: durable machine/frame error policy ("abort" | "retry")
     exhaustion_reason: Optional[str] = None   # R34: "BudgetDepleted" | "FrontierEmpty" | "FuelExhausted"
 
     def copy(self) -> "ConvergeTransactionDomain":
@@ -248,6 +249,7 @@ class ConvergeTransactionDomain:
             protocol_violations=[dict(v) for v in self.protocol_violations],
             satisfied_value=self.satisfied_value,
             satisfier_error=self.satisfier_error,
+            on_satisfier_error=self.on_satisfier_error,
             exhaustion_reason=self.exhaustion_reason,
         )
 

@@ -144,15 +144,23 @@ class SemanticFrame:
             op_is_delivery_unknown = prog.fault_spec.delivery_unknown or (op.op_id in prog.fault_spec.delivery_unknown_ops)
             self.expand(node, op, succs, delivery_unknown=op_is_delivery_unknown)
 
-            # R31/R41: External dispatch with DeliveryUnknown transitions to Waiting state, preserving prior budget_spent
+            # R31/R41/R51: External dispatch with DeliveryUnknown transitions to Waiting state unless safe_retry succeeds
             if op_is_delivery_unknown and op.kind == "external":
-                self.status = "Waiting"
-                self.outcome = SemanticOutcome("Waiting")
-                self.outstanding_scope_commitment = op.cost
-                self.unsettled_request_count = 1
-                self.attributable_owner_reserved = op.cost
-                self.intent_available_consumed = self.budget_spent + op.cost
-                return self.outcome
+                if prog.fault_spec.safe_retry and op.dedup_capable:
+                    # R51: Safe transport retry succeeds on second attempt
+                    self.budget_spent += op.charge()
+                    for s in succs:
+                        if s not in self.nodes:
+                            self.nodes[s] = "Frontier"
+                            self.frontier.append(s)
+                else:
+                    self.status = "Waiting"
+                    self.outcome = SemanticOutcome("Waiting")
+                    self.outstanding_scope_commitment = op.cost
+                    self.unsettled_request_count = 1
+                    self.attributable_owner_reserved = op.cost
+                    self.intent_available_consumed = self.budget_spent + op.cost
+                    return self.outcome
 
             # Check for environmental cancellation
             if prog.fault_spec.cancel_in_flight:
@@ -170,28 +178,44 @@ class SemanticFrame:
                 if self.satisfaction_attempts >= prog.max_satisfaction_attempts:
                     continue
 
-                # R24/R26: effectful satisfier
+                # R24/R26/R52/R55: effectful satisfier
                 if prog.effectful_satisfier:
-                    es_cost = prog.effectful_satisfier.cost
+                    es = prog.effectful_satisfier
+                    es_cost = es.cost
                     if self.budget_spent + es_cost > self.budget_limit:
                         continue
                     # R26: satisfaction attempt committed upon emission
                     self.satisfaction_attempts += 1
-                    self.effects.append(f"external({prog.effectful_satisfier.op_id})")
+                    self.effects.append(f"external({es.op_id})")
 
-                    if prog.fault_spec.delivery_unknown:
-                        # R31: DeliveryUnknown leaves frame in Waiting state
-                        self.status = "Waiting"
-                        self.outcome = SemanticOutcome("Waiting")
-                        self.outstanding_scope_commitment = es_cost
-                        self.unsettled_request_count = 1
-                        self.attributable_owner_reserved = es_cost
-                        self.intent_available_consumed = self.budget_spent + es_cost
-                        return self.outcome
+                    es_is_delivery_unknown = prog.fault_spec.delivery_unknown or (es.op_id in prog.fault_spec.delivery_unknown_ops)
+                    if es_is_delivery_unknown:
+                        if prog.fault_spec.safe_retry and es.dedup_capable:
+                            self.budget_spent += es.charge()
+                        else:
+                            # R31: DeliveryUnknown leaves frame in Waiting state
+                            self.status = "Waiting"
+                            self.outcome = SemanticOutcome("Waiting")
+                            self.outstanding_scope_commitment = es_cost
+                            self.unsettled_request_count = 1
+                            self.attributable_owner_reserved = es_cost
+                            self.intent_available_consumed = self.budget_spent + es_cost
+                            return self.outcome
+                    else:
+                        self.budget_spent += es.charge()
 
-                    self.budget_spent += prog.effectful_satisfier.charge()
                     kind, ok, val = prog.satisfier_map.get(cand, ("ok", False, None))
-                    if ok:
+                    if kind == "err":
+                        # R52: effectful satisfier Err(e) honors on_satisfier_error policy
+                        self.satisfier_error = val
+                        if prog.on_satisfier_error == "abort":
+                            self.status = "Failed"
+                            self.outcome = SemanticOutcome("Failed", error=val)
+                            return self.outcome
+                        else:
+                            # retry policy: candidate failed, continue to next candidate
+                            continue
+                    elif ok:
                         self.status = Status.SATISFIED
                         self.outcome = SemanticOutcome(Status.SATISFIED, val)
                         return self.outcome

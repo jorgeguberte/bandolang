@@ -56,6 +56,16 @@ def run(prog: ScenarioProgram) -> None:
                 f"R2: cancellation must observe Cancelled, got sem={sem_obs['status']} low={low_obs['status']}")
             print("    \u2713 R2 verified: status==Cancelled (distinct from Exhausted)")
 
+        # R51 assertion for D08: safe transport retry succeeds and reaches Satisfied(T-retry)
+        if prog.name == "D08_safe_transport_retry":
+            assert sem_obs["status"] == "Satisfied", f"R51: status must be Satisfied, got {sem_obs['status']}"
+            assert sem_obs["value"] == "T-retry", f"R51: value must be 'T-retry', got {sem_obs['value']}"
+            assert sem_obs["step_count"] == 1, f"R51: step_count must be 1, got {sem_obs['step_count']}"
+            assert sem_obs["visited"] == ["root"], f"R51: visited must be ['root'], got {sem_obs['visited']}"
+            h_obj = list(d.handles.values())[0]
+            assert h_obj.transport_attempts == 2, f"R51: transport_attempts must be 2, got {h_obj.transport_attempts}"
+            print("    \u2713 R51 verified: safe transport retry succeeded on attempt 2 -> Satisfied(T-retry)")
+
         print(f"  \u2713 PASS {prog.name}  (status={sem_obs['status']} value={sem_obs['value']!r})")
         PASS += 1
 

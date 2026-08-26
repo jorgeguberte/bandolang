@@ -384,3 +384,69 @@ D22_DELIVERY_UNKNOWN_NO_SUCCESSORS = ScenarioProgram(
     max_steps=6,
     budget_limit=100,
 )
+
+# R52: effectful satisfier Err(e) with abort policy transitions frame to Failed(e)
+D23_EFFECTFUL_SATISFIER_ERR_ABORT = ScenarioProgram(
+    name="D23_effectful_satisfier_err_abort",
+    initial_frontier=["root"],
+    successors={"root": ["cand1"]},
+    node_ops={
+        "root": OpDef("opRoot", kind="local"),
+        "cand1": OpDef("opCand1", kind="local"),
+    },
+    partial_map={
+        "cand1": "PartialCandidate1",
+    },
+    satisfier_map={
+        "cand1": ("err", False, "sensor failure"),
+    },
+    on_satisfier_error="abort",
+    max_steps=6,
+    budget_limit=100,
+    effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
+)
+
+# R52: effectful satisfier Err(e) with retry policy continues search to next candidate
+D24_EFFECTFUL_SATISFIER_ERR_RETRY = ScenarioProgram(
+    name="D24_effectful_satisfier_err_retry",
+    initial_frontier=["root"],
+    successors={"root": ["cand1", "cand2"]},
+    node_ops={
+        "root": OpDef("opRoot", kind="local"),
+        "cand1": OpDef("opCand1", kind="local"),
+        "cand2": OpDef("opCand2", kind="local"),
+    },
+    partial_map={
+        "cand1": "P1",
+        "cand2": "P2",
+    },
+    satisfier_map={
+        "cand1": ("err", False, "transient verification failure"),
+        "cand2": ("ok", True, "T-recovered-after-retry"),
+    },
+    on_satisfier_error="retry",
+    max_steps=6,
+    budget_limit=100,
+    effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
+)
+
+# R55: targeted delivery_unknown_ops applying directly to effectful satisfier
+D25_TARGETED_EFFECTFUL_SATISFIER_DELIVERY_UNKNOWN = ScenarioProgram(
+    name="D25_targeted_effectful_satisfier_delivery_unknown",
+    initial_frontier=["root"],
+    successors={"root": ["cand1"]},
+    node_ops={
+        "root": OpDef("opRoot", kind="local"),
+        "cand1": OpDef("opCand1", kind="local"),
+    },
+    partial_map={
+        "cand1": "P1",
+    },
+    satisfier_map={
+        "cand1": ("ok", True, "T-unreached"),
+    },
+    max_steps=6,
+    budget_limit=100,
+    effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
+    fault_spec=FaultSpec(delivery_unknown_ops=("opVerify",)),
+)

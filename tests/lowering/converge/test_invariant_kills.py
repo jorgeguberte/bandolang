@@ -145,6 +145,13 @@ d5c.settlement_reconciliations = {"ghost_h": 1}
 d5c.handles = {}
 kill("I7 kill C (ghost reconciliation record without settled handle)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5c)
 
+# I7 kill D (R54): ghost scope_spent with zero settlements
+d5d = base_domain()
+d5d.scope_spent["usd"] = 10
+d5d.handles = {}
+d5d.settlement_reconciliations = {}
+kill("I7 kill D (ghost scope_spent with zero settlements)", lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5d)
+
 # I7 control probe (R36/R40): two distinct handles with the same receipt_id
 d5b = base_domain()
 hs1 = InFlightLifecycleState(handle_id="hs1", request_id="rs1")
@@ -156,6 +163,18 @@ d5b.settlement_reconciliations = {"hs1": 1, "hs2": 1}
 d5b.scope_spent["usd"] = 20
 survives("I7 control probe (different handles with same receipt_id accepted)",
          lambda x: __import__("invariants").i7_settlement_exactly_once(x), d5b)
+
+# R50: Exact canonical digest property tests (order sensitivity & op_id sensitivity)
+from transitions import canonical_digest
+from model import SpaceOutcome, SatisfierOutcome
+digest_order1 = canonical_digest("rcpt", "Success", SpaceOutcome(successors=["B", "C"]))
+digest_order2 = canonical_digest("rcpt", "Success", SpaceOutcome(successors=["C", "B"]))
+assert digest_order1 != digest_order2, "R50: successor order must change canonical digest"
+
+digest_op1 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="n", op_id="opVerifyA", satisfied=True, value="val"))
+digest_op2 = canonical_digest("rcpt", "Success", SatisfierOutcome(node_id="n", op_id="opVerifyB", satisfied=True, value="val"))
+assert digest_op1 != digest_op2, "R50: op_id must change canonical digest"
+print("  ✓ R50 exact canonical digest verified: successor order and op_id are strictly bound")
 
 # I8 kill (R30): attempt actual machine frontier mutation while Closing
 d8 = base_domain()

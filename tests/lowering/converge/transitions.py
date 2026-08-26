@@ -257,11 +257,13 @@ def _node_for_op(d: ConvergeTransactionDomain, op_id: str) -> str:
 
 def canonical_digest(receipt_id: str, outcome: str = "Success",
                      semantic_payload: Optional[SpaceOutcome | SatisfierOutcome] = None) -> str:
-    """R46: Deterministic canonical digest binding receipt_id, outcome, and semantic_payload."""
+    """R46/R50: Deterministic canonical digest binding receipt_id, outcome, and all payload fields."""
     if isinstance(semantic_payload, SpaceOutcome):
-        p_str = f"Space({sorted(semantic_payload.successors)})"
+        # R50: preserve exact successor order
+        p_str = f"Space({list(semantic_payload.successors)})"
     elif isinstance(semantic_payload, SatisfierOutcome):
-        p_str = f"Satisfier({semantic_payload.node_id}:{semantic_payload.satisfied}:{semantic_payload.value}:{semantic_payload.error})"
+        # R50: include node_id, op_id, satisfied, value, error
+        p_str = f"Satisfier({semantic_payload.node_id}:{semantic_payload.op_id}:{semantic_payload.satisfied}:{semantic_payload.value}:{semantic_payload.error})"
     else:
         p_str = "None"
     return f"digest({receipt_id}:{outcome}:{p_str})"
@@ -408,11 +410,11 @@ def apply_space_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool
     return True
 
 
-def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str,
-                               abort_on_error: bool = False) -> bool:
-    """R27/R45: Atomic satisfier completion incorporation.
+def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str) -> bool:
+    """R27/R45/R52: Atomic satisfier completion incorporation.
 
     Autonomously reads and applies durable SatisfierOutcome from st.completion.semantic_payload.
+    Reads on_satisfier_error policy directly from durable frame state (R52).
     """
     st = d.handles.get(handle_id)
     if st is None:
@@ -431,8 +433,10 @@ def apply_satisfier_completion(d: ConvergeTransactionDomain, handle_id: str,
         d.current_in_flight = None
     elif so.error is not None:
         d.satisfier_error = so.error
-        if abort_on_error:
+        if d.on_satisfier_error == "abort":
             fatal_close(d, so.error)
+        elif d.frame_status == SearchStatus.WAITING:
+            d.frame_status = SearchStatus.SEARCHING
     elif d.frame_status == SearchStatus.WAITING:
         d.frame_status = SearchStatus.SEARCHING
 
@@ -519,43 +523,30 @@ def finish_if_drained(d: ConvergeTransactionDomain) -> bool:
 
 
 # ---------------------------------------------------------------------
-# Recovery — forward only; observes pre-state OR committed post-state (T08/T09/R32)
+# Recovery — forward only; observes pre-state OR committed post-state (T08/T09/R32/R53)
 # ---------------------------------------------------------------------
 
 def recover(d: ConvergeTransactionDomain, snapshot: ConvergeTransactionDomain,
             crash_point: str) -> None:
-    """Forward recovery from a durable snapshot taken before the crash.
-
-    T08/R32: settlement record persisted but semantic application lost →
-    autonomously re-apply from durable completion semantic_payload!
-    T09: crash during semantic apply loop → domain resumes from pre-state snapshot
-    or committed post-state, never partial (transactional atomicity).
+    """Forward recovery from a durable snapshot taken before the crash (R32/R45/R53).
+    R53: Redrives exclusively on the restored snapshot domain, then authoritatively updates d.
     """
     if crash_point == "after_settlement_before_apply":
-        # Restore durable state, then forward-apply from durable semantic payload (R32/R45).
+        # Restore durable state, then redrive on restored domain exclusively (R53)
         restored = snapshot.copy()
-        for hid, st in restored.handles.items():
+        for hid, st in list(restored.handles.items()):
             if st.settlement is not None and not st.applied and st.completion is not None:
                 payload = st.completion.semantic_payload
                 if isinstance(payload, SpaceOutcome):
-                    apply_space_completion(d, hid)
+                    apply_space_completion(restored, hid)
                 elif isinstance(payload, SatisfierOutcome):
-                    apply_satisfier_completion(d, hid)
+                    apply_satisfier_completion(restored, hid)
                 else:
-                    st_live = d.handles.get(hid) or st
-                    st_live.applied = True
-                    st_live.state = "Applied"
-                    c_id = f"{hid}:{st.completion.receipt_id}" if st.completion else hid
-                    if c_id not in d.applied_completions:
-                        d.applied_completions.append(c_id)
+                    apply_semantic(restored, hid)
+        # Authoritatively update d to match restored committed state
+        d.__dict__.clear()
+        d.__dict__.update(restored.__dict__)
     elif crash_point == "mid_apply_loop":
-        # R22: Transactional atomicity — if crash happened mid-apply,
-        # reset uncommitted partial RAM state back to pre-state durable snapshot
-        d.nodes.clear()
-        d.nodes.update({k: replace(v) for k, v in snapshot.nodes.items()})
-        d.frontier.clear()
-        d.frontier.extend(snapshot.frontier)
-        for hid, st in snapshot.handles.items():
-            if hid in d.handles:
-                d.handles[hid].applied = st.applied
-                d.handles[hid].state = st.state
+        # R22: Transactional atomicity — reset uncommitted partial RAM state back to pre-state snapshot
+        d.__dict__.clear()
+        d.__dict__.update(snapshot.copy().__dict__)
