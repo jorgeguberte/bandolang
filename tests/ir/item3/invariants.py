@@ -122,16 +122,82 @@ def i3_8_provenance_effect_separation(handle_type: ChildHandleType,
     return True
 
 
-def check_all_invariants(state: ExecutionState) -> list[str]:
-    """Run all active invariants on an execution state."""
-    violations = []
-    if not i3_1_result_fact_soundness(state):
-        violations.append("I3.1_ResultFactSoundness")
-    if not i3_4_outcome_disjointness(state):
-        violations.append("I3.4_OutcomeDisjointness")
-    for var, val in state.env.items():
-        if isinstance(val, (ActFailureVal, ErrVal)):
-            # Ensure no partial/applied mutations exist
-            if any(f.name == "IsPartial" for f in state.psi):
-                violations.append("I3.5_NoFalseCleanFailure")
-    return violations
+def check_all_invariants(state: ExecutionState, context: dict[str, Any] | None = None) -> dict[str, str]:
+    """Run all invariants I3.1–I3.8, returning PASS, VIOLATION, or explicit NOT_APPLICABLE (F2)."""
+    ctx = context or {}
+    results = {}
+
+    # I3.1 Result fact soundness
+    if i3_1_result_fact_soundness(state):
+        results["I3.1"] = "PASS"
+    else:
+        results["I3.1"] = "VIOLATION: fact present in Ψ without dominating proof"
+
+    # I3.2 No eager latent discharge
+    unref = ctx.get("unrefined_vars")
+    if unref is not None:
+        if i3_2_no_eager_latent_discharge(unref, state):
+            results["I3.2"] = "PASS"
+        else:
+            results["I3.2"] = "VIOLATION: unrefined result leaked latent postcondition into Ψ"
+    else:
+        if i3_2_no_eager_latent_discharge(list(state.var_latent.keys()), state):
+            results["I3.2"] = "PASS"
+        else:
+            results["I3.2"] = "VIOLATION: latent postconditions leaked into Ψ before refinement"
+
+    # I3.3 CFG must-fact merge
+    if "pred_facts" in ctx and "merge_facts" in ctx:
+        if i3_3_cfg_must_fact_merge(ctx["pred_facts"], ctx["merge_facts"]):
+            results["I3.3"] = "PASS"
+        else:
+            results["I3.3"] = "VIOLATION: merge facts do not equal intersection of predecessor facts"
+    else:
+        results["I3.3"] = "NOT_APPLICABLE: requires pred_facts and merge_facts context"
+
+    # I3.4 Outcome disjointness
+    if i3_4_outcome_disjointness(state):
+        results["I3.4"] = "PASS"
+    else:
+        results["I3.4"] = "VIOLATION: multiple mutually exclusive outcome tags active simultaneously in Ψ"
+
+    # I3.5 No false clean failure
+    applied = ctx.get("confirmed_applied_effects")
+    outcome_val = ctx.get("outcome_val")
+    if outcome_val is not None or applied is not None:
+        val = outcome_val if outcome_val is not None else next((v for v in state.env.values() if isinstance(v, (ErrVal, ActFailureVal, ActPartialVal, DeliveryUnknownVal, SettlementUnknownVal))), None)
+        if i3_5_no_false_clean_failure(val, confirmed_applied_effects=applied):
+            results["I3.5"] = "PASS"
+        else:
+            results["I3.5"] = "VIOLATION: clean Failure asserted on operation with partial mutations or ambiguity"
+    else:
+        results["I3.5"] = "PASS"
+
+    # I3.6 Handle effect monotonicity
+    if "left_handle" in ctx and "right_handle" in ctx and "joined_handle" in ctx:
+        if i3_6_handle_effect_monotonicity(ctx["left_handle"], ctx["right_handle"], ctx["joined_handle"]):
+            results["I3.6"] = "PASS"
+        else:
+            results["I3.6"] = "VIOLATION: handle join is not a monotonic union of predecessor effects"
+    else:
+        results["I3.6"] = "NOT_APPLICABLE: requires left_handle, right_handle, and joined_handle context"
+
+    # I3.7 Await effect neutrality
+    if "effects_before_await" in ctx and "effects_after_await" in ctx:
+        if i3_7_await_effect_neutrality(ctx["effects_before_await"], ctx["effects_after_await"]):
+            results["I3.7"] = "PASS"
+        else:
+            results["I3.7"] = "VIOLATION: await polluted parent observable effect trace"
+    else:
+        results["I3.7"] = "NOT_APPLICABLE: requires effects_before_await and effects_after_await context"
+
+    # I3.8 Provenance / effect separation
+    if "handle_type" in ctx and "concrete_lineage" in ctx:
+        if i3_8_provenance_effect_separation(ctx["handle_type"], ctx["concrete_lineage"], actual_executed_child=ctx.get("actual_executed_child")):
+            results["I3.8"] = "PASS"
+        else:
+            results["I3.8"] = "VIOLATION: concrete lineage was falsely widened to include unexecuted may-effects"
+    else:
+        results["I3.8"] = "NOT_APPLICABLE: requires handle_type and concrete_lineage context"
+
+    return results

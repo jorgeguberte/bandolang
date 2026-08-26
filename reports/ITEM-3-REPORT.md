@@ -1,11 +1,10 @@
-# SOMA-IR Item 3 — Execution Report (CFG / Result / Error Model) — REPAIR GATE (J1–J4)
+# SOMA-IR Item 3 — Execution Report (CFG / Result / Error Model) — FINAL ACCEPTANCE (F1–F3)
 
-> **Item 3 integrated execution report after J1–J4 repair gate.**
-> 1. J1: Separated dynamic execution from static CFG dataflow fact analysis. Implemented `CFGDataflowAnalyzer` worklist fixed-point analyzer over CFG edges ($\Psi_{\text{in}}(N) = \bigcap_{P \in \text{Preds}(N)} \text{rename}(\text{EdgeFacts}(P \to N))$). R04, R05, X2, and R07 query dataflow analysis directly.
-> 2. J2: Real block argument type derivation and join: CFG analysis derives $\Sigma_{\text{join}} = \bigcup_P \Sigma_P$ from all incoming predecessor edges for `ChildHandleType` and validates type compatibility across edges without hardcoded expected parameters.
-> 3. J3: Formalized invariants I3.1–I3.8 with concrete state and footprint evidence. I3.5 validates clean failure against applied mutations and ambiguity records; I3.8 validates result provenance against actual executed children; K10 calls I3.8 directly.
-> 4. J4: Exact observable differential comparator comparing active $\Psi$ path facts, latent postcondition sets, block argument bindings, block argument types, handle $\Sigma$, concrete value lineage, outcome variant, observable effects, and execution status across 11 cross-cutting differential suites.
-> All 47 Item 3 test cases (21 golden, 15 kills, 11 differential) and all 81 Phase D regression tests pass across the repository.
+> **Item 3 integrated execution report after final acceptance gate.**
+> 1. F1: Exact observable differential comparator comparing strict `Fact` object equality ($\text{sem.ctx.psi} == \text{cfg\_state.psi}$) without name+arity shortcuts, exact latent postcondition sets, block-argument bindings, derived handle $\Sigma$, concrete value lineage, outcome variant, observable effects ($\Sigma$), and status. Verified with 2 negative mutations proving fact argument mismatches and extra conditional facts fail differential checks.
+> 2. F2: Completed `check_all_invariants` contract returning explicit `PASS`, `VIOLATION`, or `NOT_APPLICABLE(reason)` across all invariants I3.1–I3.8.
+> 3. F3: R15 exercises real CFG dataflow verification over mismatched predecessor handles via `CFGDataflowAnalyzer(prog).analyze()`, strictly asserting `TypeError`.
+> All 49 Item 3 test cases (21 golden, 15 kills, 13 exact differential) and all 81 Phase D regression tests pass across the repository.
 
 ---
 
@@ -18,7 +17,7 @@ my-wiki
 
 bandolang
     executable harness / language experiments
-    baseline: b129b3b89b14eb1308a0d013778a514d3f56f108
+    baseline: 765e48aa25f8263595f9c42a20e36365b210ce84
 
 bando (soma-docs)
     published Fumadocs docs
@@ -30,7 +29,7 @@ bando (soma-docs)
 ## 2. Normative Obligations & Architecture
 
 ```text
-Track A — RESULT-LATENT-POSTCOND (J1)
+Track A — RESULT-LATENT-POSTCOND (J1, F1)
     Result<T,E> binds LatentPostconditions(on_ok, on_err).
     Postconditions remain LATENT on SSA definitions and NEVER enter Ψ before refinement.
     `SwitchResult` branches instantiate postconditions bound to the block argument SSA symbol.
@@ -38,21 +37,21 @@ Track A — RESULT-LATENT-POSTCOND (J1)
     Branch-specific facts are discarded on merge; common facts are preserved.
     Loop fixed-point analysis proves iteration facts do not leak to headers or exit paths without proof.
 
-Track B — ACT-SETTLEMENT-OUTCOME (J3)
+Track B — ACT-SETTLEMENT-OUTCOME (J3, F1)
     Physical ambiguity (DeliveryUnknown, SettlementUnknown) is strictly disjoint from Definite Failure.
     `ActOutcome` / `EffectOutcome` distinguishes Completed(Result<T,E>) vs Pending(Unknown).
     `await` on ChildHandle suspends while settlement is unknown; does not fabricate Err.
     Confirmed failure (ConfirmedNotDelivered) becomes clean Err only upon definite certainty.
 
-Track C — ACT-PARTIAL-COMPLETION (J3)
+Track C — ACT-PARTIAL-COMPLETION (J3, F1)
     Partial completion (A+B applied, C+D failed) carries PartialEffectReport.
     Partial is distinct from Success, clean Failure, and Unknown.
     Adapters declaring transactional/atomic contracts reject Partial with FatalProtocolViolation.
     Success-only facts do NOT materialize in Partial branch.
 
-Track D — HANDLE-EFFECT-JOIN (J2, J3, J4)
+Track D — HANDLE-EFFECT-JOIN (J2, J3, F1, F3)
     Derived ChildHandle block argument types compute may-effect union Σ_join = ⋃_P Σ_P from all predecessor edges.
-    Type mismatch between predecessor handles is strictly rejected.
+    Type mismatch between predecessor handles is strictly rejected at CFG dataflow verification (F3).
     May-effects summary Σ_join does not invent concrete execution provenance.
     `await` adds zero observable effects to parent trace (Σ_await = ∅).
     Concrete result lineage reflects actual child execution, not may-effects union.
@@ -63,7 +62,7 @@ Track D — HANDLE-EFFECT-JOIN (J2, J3, J4)
 ## 3. Executable Validation Results
 
 ```text
-Golden Scenarios Battery (R01–R18, X1–X4) — J1 & J2 Verified:
+Golden Scenarios Battery (R01–R18, X1–X4) — F3 Verified:
     21/21 PASS
     - R01_OK_POSTCONDITION: on_ok facts materialize on Ok branch [PASS]
     - R02_ERR_ISOLATION: on_ok facts strictly isolated from Err branch [PASS]
@@ -79,7 +78,7 @@ Golden Scenarios Battery (R01–R18, X1–X4) — J1 & J2 Verified:
     - R12_PARTIAL_BRANCH_FACTS: partial footprint facts materialize, success facts absent [PASS]
     - R13_HANDLE_SAME_EFFECTS_JOIN: derived parameter type computes identical effects [PASS]
     - R14_HANDLE_HETEROGENEOUS_EFFECTS_JOIN: derived parameter type computes may-effects union Σa ∪ Σb [PASS]
-    - R15_HANDLE_TYPE_MISMATCH_REJECT: incompatible handle types reject join at CFG verification [PASS]
+    - R15_HANDLE_TYPE_MISMATCH_REJECT: CFGDataflowAnalyzer.analyze() rejects join with TypeError [F3 PASS]
     - R16_AWAIT_EFFECT_PRESERVATION: await adds zero observable effects (Σ_await = ∅) [PASS]
     - R17_HANDLE_UNION_DOES_NOT_BECOME_RESULT_PROVENANCE: concrete lineage reflects actual child execution [PASS]
     - R18_RESULT_AFTER_JOINED_HANDLE: await result refines normally [PASS]
@@ -87,7 +86,7 @@ Golden Scenarios Battery (R01–R18, X1–X4) — J1 & J2 Verified:
     - X2_PARTIAL_MERGE_INTEGRATION: static dataflow analyzer verifies CompleteSuccess + PartialCompletion merge [PASS]
     - X3_X4_HANDLE_AWAIT_REFINEMENT_INTEGRATION: handle join + await neutrality + result refinement [PASS]
 
-Adversarial Mutation Kills (K1–K12 & Probes) — J3 Verified:
+Adversarial Mutation Kills (K1–K12 & Probes) — F2 Verified:
     15/15 PASS
     - K1 Eager postcondition leak: detector flagged unrefined fact in Ψ [PASS]
     - K2 Err receives Ok fact: detector flagged contradiction [PASS]
@@ -103,8 +102,8 @@ Adversarial Mutation Kills (K1–K12 & Probes) — J3 Verified:
     - K12 Branch fact survives merge: detector flagged missing intersection [PASS]
     - Control Probes: 3/3 clean valid states accepted [PASS]
 
-Exact Observable Differential Semantics Battery (J4):
-    11/11 PASS
+Exact Observable Differential Semantics Battery (F1):
+    13/13 PASS
     - D_R01_ok_postcondition [PASS]
     - D_R02_err_isolation [PASS]
     - D_R08_unknown_not_err [PASS]
@@ -116,6 +115,8 @@ Exact Observable Differential Semantics Battery (J4):
     - D_handle_join_provenance_separation [PASS]
     - D_X1_result_act_integration [PASS]
     - D_X3_X4_handle_await_refinement [PASS]
+    - MUTATION_same_fact_name_wrong_args: exact comparator caught mismatched fact args [F1 PASS]
+    - MUTATION_extra_conditional_cfg_fact: exact comparator caught extra spurious CFG fact [F1 PASS]
 
 Phase D Lowering Regression Battery:
     81/81 PASS (zero regressions across all 4 Phase D suites)

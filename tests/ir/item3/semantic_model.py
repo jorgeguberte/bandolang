@@ -72,14 +72,15 @@ class HighLevelSemanticEngine:
 
     def spawn_child_op(self, child_id: str, may_effects: frozenset[str],
                        ok_type: Type, err_type: Type,
-                       actual_effects_executed: tuple[str, ...] = ()) -> ChildHandleVal:
+                       actual_effects_executed: tuple[str, ...] = (),
+                       latent: LatentPostconditions = LatentPostconditions()) -> ChildHandleVal:
         return ChildHandleVal(
             handle_id=f"handle:{child_id}",
             ok_type=ok_type,
             err_type=err_type,
             may_effects=may_effects,
             actual_provenance=actual_effects_executed or (f"exec({child_id})",),
-            result_val=OkVal("child_success", ok_type),
+            result_val=OkVal("child_success", ok_type, latent),
         )
 
     def join_handles(self, h1: ChildHandleVal, h2: ChildHandleVal) -> ChildHandleType:

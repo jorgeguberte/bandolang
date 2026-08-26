@@ -259,14 +259,13 @@ def r14():
 
 @scenario("R15_HANDLE_TYPE_MISMATCH_REJECT")
 def r15():
-    h_a = ChildHandleType(STRING, STRING, frozenset(["read[x]"]))
-    h_b = ChildHandleType(I64, STRING, frozenset(["act[y]"]))
-    assert_true(not h_a.is_compatible_for_join(h_b), "incompatible handle types were reported as compatible")
+    prog = build_r13_r18_handle_join_program(type_mismatch=True)
+    # F3: Exercise real CFG verification over mismatched predecessor edges
     try:
-        h_a.join(h_b)
-        raise AssertionError("handle join on type mismatch was permitted")
-    except TypeError:
-        pass
+        CFGDataflowAnalyzer(prog).analyze()
+        raise AssertionError("CFG dataflow analysis permitted handle join with type mismatch across predecessors")
+    except TypeError as e:
+        assert_true("Incompatible handle types" in str(e) or "Type mismatch" in str(e), f"wrong rejection: {e}")
 
 
 @scenario("R16_AWAIT_EFFECT_PRESERVATION")
