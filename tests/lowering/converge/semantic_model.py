@@ -64,7 +64,7 @@ class SemanticFrame:
         self.nodes[node_id] = "Expanding"
         self.visited.append(Visit(node_id))
         if op.kind == "external":
-            self.budget_spent += op.cost
+            self.budget_spent += op.charge()
             self.effects.append(f"external({op.op_id})")
         for s in succs:
             if s not in self.nodes:
@@ -157,5 +157,9 @@ class SemanticFrame:
             "visited": [v.node_id for v in self.visited],
             "frontier": list(self.frontier),
             "budget_spent": self.budget_spent,
+            "outstanding_scope_commitment": 0,
+            "unsettled_request_count": 0,
+            "attributable_owner_reserved": 0,
+            "intent_available_delta": self.budget_spent,
             "effects": sorted(self.effects),
         }

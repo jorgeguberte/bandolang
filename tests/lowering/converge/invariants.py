@@ -63,15 +63,9 @@ def i3_terminal_zero_obligations(d: ConvergeTransactionDomain,
         return True
     if any(v > 0 for v in d.scope_committed.values()):
         return False
-    if bk is None:
-        return True
-    # Reservations created by this CF must have been released on terminal.
-    return not bk.reservations_created_by_cf or _all_released(d)
-
-
-def _all_released(d: ConvergeTransactionDomain) -> bool:
-    # In campaign 1 a terminal frame implies its own reservations released;
-    # other operations' reservations are outside this model's view entirely.
+    if bk is not None:
+        if any(amt > 0 for amt in bk.reservations_created_by_cf.values()):
+            return False
     return True
 
 

@@ -34,6 +34,18 @@ class Harness:
 
     def step(self, name: str, fn, *args, **kwargs):
         """Run one transition, then verify all invariants."""
+        # Harness-only bookkeeping for I3 attribution (R12):
+        if getattr(fn, "__name__", "") == "stage_local" and len(args) >= 5:
+            req_id = args[2]  # (node_id, op_id, request_id, resource, amount)
+            amt = args[4]
+            if amt > 0:
+                self.bk.reservations_created_by_cf[req_id] = amt
+        elif getattr(fn, "__name__", "") == "settle" and len(args) >= 1:
+            handle_id = args[0]
+            st = self.d.handles.get(handle_id)
+            if st:
+                self.bk.reservations_created_by_cf.pop(st.request_id, None)
+
         out = fn(self.d, *args, **kwargs)
         self.result.steps.append(name)
         self.result.invariant_checks += 1

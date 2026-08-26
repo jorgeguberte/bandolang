@@ -19,10 +19,14 @@ from typing import Any, Optional
 class OpDef:
     op_id: str
     kind: str = "local"              # "local" | "external"
-    cost: int = 0                    # budget consumed by external action
+    cost: int = 0                    # budget ceiling reserved at stage_local
+    actual_cost: Optional[int] = None # actual charge at settlement (defaults to cost)
     request_id: Optional[str] = None # defaults to f"req:{op_id}"
     dedup_capable: bool = True
     idempotent: bool = True
+
+    def charge(self) -> int:
+        return self.cost if self.actual_cost is None else self.actual_cost
 
 
 @dataclass(frozen=True)
@@ -182,5 +186,15 @@ D12 = ScenarioProgram(
     node_ops={"root": OpDef("op12", kind="external", cost=50)},
     satisfier_map={"root": ("err", False, "fatal protocol breach")},
     on_satisfier_error="abort",
+    max_steps=6,
+)
+
+# R12/R14: budget ceiling vs actual charge (reserve 10, charge 6)
+D13 = ScenarioProgram(
+    name="D13_budget_ceiling_vs_actual_charge",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={"root": OpDef("op13", kind="external", cost=10, actual_cost=6)},
+    satisfier_map={"root": ("ok", True, "T-reconciled")},
     max_steps=6,
 )

@@ -57,17 +57,20 @@ def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("StageLocal outside Searching frame")
     # I4 guard: rejection must leave committed/reserved deltas at zero.
-    available = d.intent_available.get(resource, 0) - d.intent_reserved.get(resource, 0)
+    # R12: intent_available is the unreserved balance in IntentFrame.
+    available = d.intent_available.get(resource, 0)
     scope_head = d.scope_limit.get(resource, 0) - d.scope_committed.get(resource, 0)
     if amount > available or amount > scope_head or amount < 0:
         raise TransitionError("StageLocal.Rejected")   # caller sees rejection; no deltas move
 
+    d.intent_available[resource] = available - amount
     d.intent_reserved[resource] = d.intent_reserved.get(resource, 0) + amount
     d.scope_committed[resource] = d.scope_committed.get(resource, 0) + amount
     d.outbox[request_id] = OutboxRecord(
         request_id=request_id, op_id=op_id, payload_digest=f"digest({node_id})",
         dedup_capable=dedup_capable, idempotent=idempotent,
         node_id=node_id, local_only=local_only,
+        reserved_resource=resource, reserved_amount=amount,
     )
 
 
@@ -84,7 +87,10 @@ def emit_external(d: ConvergeTransactionDomain, request_id: str,
         raise TransitionError("no staged record for request")
 
     handle_id = next_id("h")
-    st = InFlightLifecycleState(handle_id=handle_id, request_id=request_id)
+    st = InFlightLifecycleState(
+        handle_id=handle_id, request_id=request_id,
+        reserved_resource=rec.reserved_resource, reserved_amount=rec.reserved_amount,
+    )
 
     # R7 (audit): sequential in-flight — a NEW request may not be emitted
     # while ANY other semantic request remains unsettled. Retries of the SAME
@@ -190,13 +196,21 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
         handle_id=handle_id, receipt_id=st.completion.receipt_id if st.completion else "?",
         resource=resource, amount=amount,
     )
-    d.scope_spent[resource] = d.scope_spent.get(resource, 0) + amount
-    d.intent_spent[resource] = d.intent_spent.get(resource, 0) + amount
+    # R12: ceiling R vs actual charge C <= R
+    ceiling = st.reserved_amount if st.reserved_amount > 0 else amount
+    ceiling_res = st.reserved_resource or resource
 
-    # Release this convergence's commitment on the scope; IntentFrame keeps ownership
-    # of the reservation until the obligation chain closes.
-    committed = d.scope_committed.get(resource, 0)
-    d.scope_committed[resource] = max(0, committed - amount)
+    # IntentFrame reconciliation:
+    # reserved -= R; spent += C; available += (R - C) [unspent refund]
+    d.intent_reserved[ceiling_res] = max(0, d.intent_reserved.get(ceiling_res, 0) - ceiling)
+    d.intent_spent[resource] = d.intent_spent.get(resource, 0) + amount
+    d.intent_available[ceiling_res] = d.intent_available.get(ceiling_res, 0) + max(0, ceiling - amount)
+
+    # BudgetScope reconciliation:
+    # committed -= R; spent += C
+    committed = d.scope_committed.get(ceiling_res, 0)
+    d.scope_committed[ceiling_res] = max(0, committed - ceiling)
+    d.scope_spent[resource] = d.scope_spent.get(resource, 0) + amount
 
 
 # ---------------------------------------------------------------------
@@ -242,21 +256,15 @@ def fatal_close(d: ConvergeTransactionDomain, err: str) -> None:
 
 
 def exhaust(d: ConvergeTransactionDomain) -> None:
-    """Natural exhaustion: frontier drained / fuel out without satisfaction.
-
-    Campaign 2 finding: this transition existed in the frozen semantics
-    (Exhausted outcome of ConvergeFrame v0) but had never been exercised —
-    Campaign 1 only tested cancel/fatal closing paths. Added for the
-    semantic differential; classified HARNESS_GAP, not spec change.
-    """
+    """Natural exhaustion: frontier drained / fuel out without satisfaction."""
     if d.frame_status != SearchStatus.SEARCHING:
         return
     unsettled = [s for s in d.handles.values() if s.settlement is None]
     pending_scope = any(v > 0 for v in d.scope_committed.values())
     if unsettled or pending_scope:
-        # must close first and drain obligations before terminalizing
+        # R13: must close as PendingExhausted and drain obligations before terminalizing
         d.frame_status = SearchStatus.CLOSING
-        d.closing_reason = ClosingReason("Draining")
+        d.closing_reason = ClosingReason("PendingExhausted")
         return
     d.frame_status = SearchStatus.EXHAUSTED
     d.current_in_flight = None
@@ -277,8 +285,12 @@ def finish_if_drained(d: ConvergeTransactionDomain) -> bool:
         d.frame_status = SearchStatus.FAILED
     elif kind == "PendingCancelled":
         d.frame_status = SearchStatus.CANCELLED   # R2: cancellation ≠ exhaustion
-    else:
+    elif kind == "PendingExhausted":
+        d.frame_status = SearchStatus.EXHAUSTED   # R13: PendingExhausted -> Exhausted, NEVER Satisfied
+    elif kind == "PendingSatisfied":
         d.frame_status = SearchStatus.SATISFIED
+    else:
+        d.frame_status = SearchStatus.EXHAUSTED
     return True
 
 

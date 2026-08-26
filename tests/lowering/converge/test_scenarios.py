@@ -83,6 +83,8 @@ def t02():
     # Release reservation, drain, terminalize
     d.scope_committed["usd"] -= 10
     d.intent_reserved["usd"] -= 10
+    d.intent_available["usd"] += 10
+    h.bk.reservations_created_by_cf.pop("r1", None)
     h.step("drain", tx.finish_if_drained)
     assert_true(d.frame_status == SearchStatus.CANCELLED,
                 f"R2: cancelled frame must terminalize Cancelled, got {d.frame_status}")
@@ -308,9 +310,27 @@ def t12():
     assert_true(d.current_in_flight.request_id == "r2", "r2 not admitted after settlement")
 
 
+@scenario("T13_EXHAUST_WHILE_COMMITMENT_PENDING")
+def t13():
+    """R13: search exhausts while commitment is pending -> Closing(PendingExhausted) -> drains to Exhausted (never Satisfied)."""
+    d, h = new_domain()
+    h.step("stage", tx.stage_local, "node:op13", "op13", "r13", "usd", 20)
+    handle = h.step("emit", tx.emit_external, "r13")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-13", "digest-13")
+    # Frontier runs dry or fuel exhausted while commitment is pending:
+    h.step("exhaust-pending", tx.exhaust)
+    assert_true(d.frame_status == SearchStatus.CLOSING, f"expected Closing, got {d.frame_status}")
+    assert_true(d.closing_reason.kind == "PendingExhausted", f"expected PendingExhausted, got {d.closing_reason.kind}")
+    # Late settlement arrives:
+    h.step("late-settle", tx.settle, handle, "usd", 20)
+    # Drain obligations:
+    h.step("drain", tx.finish_if_drained)
+    assert_true(d.frame_status == SearchStatus.EXHAUSTED, f"expected Exhausted, got {d.frame_status}")
+
+
 # =====================================================================
 print("\n" + "=" * 70)
-print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed (14 total)")
+print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed (15 total)")
 if FAIL:
     sys.exit(1)
 print("Phase D lowering survived every adversarial scenario under full invariant checking.")

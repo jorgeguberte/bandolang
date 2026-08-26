@@ -16,7 +16,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from scenarios import D01, D02, D03, D04, D05, D06, OpDef, ScenarioProgram
+from scenarios import D01, D02, D03, D04, D05, D06, D13, OpDef, ScenarioProgram
 import transitions as tx
 from differential import compare, classify, lowered_observation
 from harness import CrashInjected, Harness
@@ -41,6 +41,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
         op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
         req_id = op.request_id or f"req:{op.op_id}"
         cost = op.cost if op.kind == "external" else 0
+        charge = op.charge() if op.kind == "external" else 0
 
         h.step(f"stage-{op.op_id}", tx.stage_local, node, op.op_id, req_id,
                "usd", cost, dedup_capable=op.dedup_capable, idempotent=op.idempotent,
@@ -58,9 +59,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
             h.step(f"deliver-{op.op_id}", tx.admit_completion, handle,
                    f"rcpt-{req_id}", f"digest-{req_id}")
             h.step("cancel", tx.cancel)
-            h.step("late-settle", tx.settle, handle, "usd", cost)
-            d.scope_committed["usd"] = 0
-            d.intent_reserved["usd"] = 0
+            h.step("late-settle", tx.settle, handle, "usd", charge)
             h.step("drain", tx.finish_if_drained)
             break
 
@@ -71,7 +70,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
             h.step(f"dup-deliver-{op.op_id}", tx.admit_completion, handle,
                    f"rcpt-{req_id}-b", f"digest-{req_id}")
 
-        h.step(f"settle-{op.op_id}", tx.settle, handle, "usd", cost)
+        h.step(f"settle-{op.op_id}", tx.settle, handle, "usd", charge)
 
         if prog.fault_spec.crash_after_settlement:
             try:
@@ -170,7 +169,7 @@ def run(prog: ScenarioProgram) -> None:
 if __name__ == "__main__":
     print("=" * 70)
     print("CAMPAIGN 2 BASIC — declarative ScenarioProgram, autonomous execution")
-    for prog in (D01, D02, D03, D04, D05, D06):
+    for prog in (D01, D02, D03, D04, D05, D06, D13):
         run(prog)
 
     print("=" * 70)

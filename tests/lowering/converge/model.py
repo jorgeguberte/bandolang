@@ -75,6 +75,8 @@ class OutboxRecord:
     idempotent: bool          # adapter guarantee: operation idempotency
     node_id: Optional[str] = None   # explicit node identity (differential parity)
     local_only: bool = False        # DISPATCH_LOCAL semantics: no observable Σ
+    reserved_resource: str = "usd"
+    reserved_amount: int = 0
 
 
 @dataclass
@@ -87,6 +89,8 @@ class InFlightLifecycleState:
     completion: Optional["CompletionRecord"] = None
     settlement: Optional["SettlementRecord"] = None
     applied: bool = False
+    reserved_resource: str = "usd"
+    reserved_amount: int = 0
 
 
 @dataclass(frozen=True)
@@ -190,6 +194,7 @@ class InFlightCopy:
         c = InFlightLifecycleState(
             handle_id=s.handle_id, request_id=s.request_id, state=s.state,
             delivery_unknown=s.delivery_unknown, transport_attempts=s.transport_attempts,
+            reserved_resource=s.reserved_resource, reserved_amount=s.reserved_amount,
         )
         c.completion = s.completion
         c.settlement = s.settlement
@@ -203,4 +208,5 @@ class InFlightCopy:
 
 @dataclass
 class HarnessBookkeeping:
-    reservations_created_by_cf: set[str] = field(default_factory=set)
+    # R12: map request_id/handle_id -> active reserved amount attributable to THIS CF
+    reservations_created_by_cf: dict[str, int] = field(default_factory=dict)

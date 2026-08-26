@@ -24,37 +24,30 @@ class Divergence:
                 f"  semantic: {self.semantic!r}\n  lowered:  {self.lowered!r}")
 
 
-def lowered_observation(d: ConvergeTransactionDomain) -> dict:
+def lowered_observation(d: ConvergeTransactionDomain, initial_available: int = 100) -> dict:
     """Extract the SEMANTICALLY RELEVANT observation from the lowered domain,
-    normalizing administrative mechanics away."""
-    status_map = {
-        "Satisfied": "Satisfied",
-        "Exhausted": "Exhausted",
-        "Failed": "Failed",
-        "Cancelled": "Cancelled",   # R2: cancellation distinct
-        "Searching": "Searching",
-        "Closing": "Closing",       # closing frames normalize to their pending outcome
-    }
+    including ledger and obligation observables (R12/R14)."""
     status = d.frame_status
     error = None
     if d.closing_reason is not None:
         error = d.closing_reason.error or d.closing_reason.kind
 
-    if status == "Closing" and d.closing_reason:
-        if d.closing_reason.kind == "PendingCancelled":
-            status = "Cancelled"
-        elif d.closing_reason.kind == "PendingFailure":
-            status = "Failed"
+    curr_avail = d.intent_available.get("usd", initial_available)
+    avail_delta = initial_available - curr_avail
 
     return {
-        "status": status_map.get(status, status),
+        "status": status,
         "value": getattr(d, "satisfied_value", None),
-        "error": error if status == "Failed" else None,
+        "error": error if status in ("Failed", "Closing") else None,
         "step_count": d.step_count,
         "satisfaction_attempts": d.satisfaction_attempts,
         "visited": [v.node_id for v in d.visited],
         "frontier": [n for n in d.frontier],
         "budget_spent": sum(d.scope_spent.values()),
+        "outstanding_scope_commitment": sum(d.scope_committed.values()),
+        "unsettled_request_count": sum(1 for s in d.handles.values() if s.settlement is None),
+        "attributable_owner_reserved": sum(d.intent_reserved.values()),
+        "intent_available_delta": avail_delta,
         "effects": sorted(
             f"external({rec.op_id})" for rec in d.outbox.values()
             if d.first_emission_flags.get(rec.request_id) and not rec.local_only
@@ -64,11 +57,14 @@ def lowered_observation(d: ConvergeTransactionDomain) -> dict:
 
 def compare(scenario: str, semantic_obs: dict, lowered_obs: dict) -> list[Divergence]:
     """Field-by-field comparison of normalized observations.
-    R6 (audit): exact T-value comparison — None/non-None is insufficient."""
+    R6 (audit): exact T-value comparison.
+    R14 (audit): compares obligations, commitments, and available deltas."""
     divergences = []
     for key in ("status", "value", "error", "step_count",
                 "satisfaction_attempts", "visited", "frontier",
-                "budget_spent", "effects"):
+                "budget_spent", "outstanding_scope_commitment",
+                "unsettled_request_count", "attributable_owner_reserved",
+                "intent_available_delta", "effects"):
         s, l = semantic_obs.get(key), lowered_obs.get(key)
         if s != l:
             divergences.append(Divergence(scenario, key, s, l))

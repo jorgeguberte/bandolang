@@ -67,11 +67,29 @@ d2.handles = {"h1": h1b}
 d2.current_in_flight = h1b
 survives("I1 clean state accepted", lambda x: __import__("invariants").i1_unique_unsettled(x), d2)
 
-# I3 kill: terminal frame with outstanding scope commitments
-d3 = base_domain()
-d3.frame_status = SearchStatus.SATISFIED
-d3.scope_committed["usd"] = 5
-kill("I3 kill (terminal with committed scope)", lambda x: __import__("invariants").i3_terminal_zero_obligations(x), d3)
+# I3 kill A: terminal frame with outstanding scope commitments
+d3a = base_domain()
+d3a.frame_status = SearchStatus.SATISFIED
+d3a.scope_committed["usd"] = 5
+kill("I3 kill A (terminal with committed scope)", lambda x: __import__("invariants").i3_terminal_zero_obligations(x), d3a)
+
+# I3 kill B (R12): terminal frame with scope=0 but attributable owner reservation still active
+from model import HarnessBookkeeping
+d3b = base_domain()
+d3b.frame_status = SearchStatus.SATISFIED
+d3b.scope_committed["usd"] = 0
+bk_with_cf_res = HarnessBookkeeping(reservations_created_by_cf={"req-1": 5})
+kill("I3 kill B (terminal with active attributable reservation)",
+     lambda x: __import__("invariants").i3_terminal_zero_obligations(x, bk_with_cf_res), d3b)
+
+# I3 control probe (R12): terminal frame with reservation belonging to ANOTHER CF/operation
+d3c = base_domain()
+d3c.frame_status = SearchStatus.SATISFIED
+d3c.scope_committed["usd"] = 0
+d3c.intent_reserved["usd"] = 50   # belongs to another operation in the IntentFrame!
+bk_empty = HarnessBookkeeping(reservations_created_by_cf={})
+survives("I3 control probe (reservation of OTHER operation accepted)",
+         lambda x: __import__("invariants").i3_terminal_zero_obligations(x, bk_empty), d3c)
 
 # I6 kill: same completion digest applied twice via two handles
 d4 = base_domain()
