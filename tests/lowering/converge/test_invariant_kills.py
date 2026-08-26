@@ -53,13 +53,13 @@ def base_domain() -> ConvergeTransactionDomain:
 print("=" * 70)
 print("INVARIANT KILL TESTS — detector must flag every fabricated violation")
 
-# I1 kill: two unsettled handles for the current in-flight request
+# I1 kill: TWO unsettled handles on DIFFERENT requests (R7 strengthened kill)
 d = base_domain()
 h1 = InFlightLifecycleState(handle_id="h1", request_id="r1")
-h2 = InFlightLifecycleState(handle_id="h2", request_id="r1")
+h2 = InFlightLifecycleState(handle_id="h2", request_id="r2")   # different request!
 d.handles = {"h1": h1, "h2": h2}
 d.current_in_flight = h1
-kill("I1 kill (two unsettled current handles)", lambda x: __import__("invariants").i1_unique_unsettled(x), d)
+kill("I1 kill (two unsettled requests r1+r2)", lambda x: __import__("invariants").i1_unique_unsettled(x), d)
 
 d2 = base_domain()
 h1b = InFlightLifecycleState(handle_id="h1", request_id="r1")

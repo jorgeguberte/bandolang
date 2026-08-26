@@ -17,6 +17,7 @@ class Status:
     SATISFIED = "Satisfied"
     EXHAUSTED = "Exhausted"
     FAILED = "Failed"
+    CANCELLED = "Cancelled"   # R2 (audit): owner cancellation ≠ exhaustion
 
 
 @dataclass(frozen=True)

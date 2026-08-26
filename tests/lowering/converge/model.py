@@ -29,9 +29,11 @@ class SearchStatus:
     FAILED = "Failed"
     SATISFIED = "Satisfied"
     EXHAUSTED = "Exhausted"
+    CANCELLED = "Cancelled"   # R2 (audit): owner cancellation ≠ natural exhaustion
 
 
-TERMINAL = {SearchStatus.FAILED, SearchStatus.SATISFIED, SearchStatus.EXHAUSTED}
+TERMINAL = {SearchStatus.FAILED, SearchStatus.SATISFIED,
+            SearchStatus.EXHAUSTED, SearchStatus.CANCELLED}
 
 
 class NodeStatus:

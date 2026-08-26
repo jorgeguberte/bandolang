@@ -63,27 +63,15 @@ def lowered_observation(d: ConvergeTransactionDomain) -> dict:
 
 
 def compare(scenario: str, semantic_obs: dict, lowered_obs: dict) -> list[Divergence]:
-    """Field-by-field comparison of normalized observations."""
+    """Field-by-field comparison of normalized observations.
+    R6 (audit): exact T-value comparison — None/non-None is insufficient."""
     divergences = []
     for key in ("status", "value", "error", "step_count",
                 "satisfaction_attempts", "visited", "frontier",
                 "budget_spent", "effects"):
         s, l = semantic_obs.get(key), lowered_obs.get(key)
-        if key == "value":
-            # semantic value is the satisfier's T; lowered carries the digest.
-            # Equivalence here: both None or both non-None (identity of T is
-            # out of scope until lineage campaign).
-            s_norm = None if s is None else "T"
-            l_norm = None if l is None else "T"
-            if s_norm != l_norm:
-                divergences.append(Divergence(scenario, key, s, l))
-        elif key == "visited":
-            # semantic records every expansion node; lowered does too.
-            if list(s or []) != list(l or []):
-                divergences.append(Divergence(scenario, key, s, l))
-        else:
-            if s != l:
-                divergences.append(Divergence(scenario, key, s, l))
+        if s != l:
+            divergences.append(Divergence(scenario, key, s, l))
     return divergences
 
 

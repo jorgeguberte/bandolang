@@ -84,7 +84,8 @@ def t02():
     d.scope_committed["usd"] -= 10
     d.intent_reserved["usd"] -= 10
     h.step("drain", tx.finish_if_drained)
-    assert_true(d.frame_status == SearchStatus.EXHAUSTED, f"terminal={d.frame_status}")
+    assert_true(d.frame_status == SearchStatus.CANCELLED,
+                f"R2: cancelled frame must terminalize Cancelled, got {d.frame_status}")
 
 
 @scenario("T03_FIRST_EMIT")
@@ -260,7 +261,8 @@ def t10():
     except tx.TransitionError as e:
         assert_true("I8" in str(e), f"wrong refusal: {e}")
     h.step("drain", tx.finish_if_drained)
-    assert_true(d.frame_status == SearchStatus.EXHAUSTED, f"terminal={d.frame_status}")
+    assert_true(d.frame_status == SearchStatus.CANCELLED,
+                f"R2: cancelled frame must terminalize Cancelled, got {d.frame_status}")
 
 
 @scenario("T11_LATE_SETTLEMENT_AFTER_FATAL_CLOSING")

@@ -40,13 +40,10 @@ def assert_clean(d: ConvergeTransactionDomain, bk: HarnessBookkeeping | None = N
         raise InvariantViolation(f"invariants violated: {', '.join(bad)}")
 
 
-# I1. current_in_flight != None ==> at most one unsettled handle for that request
-#     (exactly one while delivery is pending; zero once settlement reconciles it)
+# I1. current_in_flight != None ==> at most one unsettled semantic request
+#     for the ENTIRE ConvergeFrame (R7: any request, not just the current one)
 def i1_unique_unsettled(d: ConvergeTransactionDomain) -> bool:
-    if d.current_in_flight is None:
-        return True
-    unsettled = [s for s in d.handles.values()
-                 if s.request_id == d.current_in_flight.request_id and s.settlement is None]
+    unsettled = [s for s in d.handles.values() if s.settlement is None]
     return len(unsettled) <= 1
 
 

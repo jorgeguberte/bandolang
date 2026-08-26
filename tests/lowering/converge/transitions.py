@@ -27,21 +27,24 @@ class FatalInvariantViolation(Exception):
 def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                        satisfied: bool, value: object = None,
                        error: str = None, abort_on_error: bool = False) -> None:
-    """Satisfaction check on a node WITHOUT dispatching/expanding it.
+    """CheckSatisfaction on a node WITHOUT dispatching/expanding it.
 
     Frozen ConvergeFrame v0 semantics: CheckSatisfaction is part of the
     parent expansion's processing — the successor node is consumed by the
     check without consuming fuel or entering visitation history.
 
-    Campaign 2 finding: Campaign 1 never exercised satisfaction of an
-    unexpanded successor; this transition was missing from the harness.
-    Classified HARNESS_GAP (spec unchanged).
+    R1 (audit): the ONLY place satisfaction_attempts increments.
+    R3 (audit): Ok(Some(T)) performs the normative Satisfied transition itself.
     """
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("CheckSatisfaction outside Searching frame")
     d.satisfaction_attempts += 1
+    if node_id in d.frontier:
+        d.frontier.remove(node_id)     # checked successor is consumed
     if satisfied:
         d.satisfied_value = value
+        d.frame_status = SearchStatus.SATISFIED      # R3: normative transition
+        d.current_in_flight = None                   # search consumed its request
         return
     if error is not None:
         d.satisfier_error = error
@@ -85,18 +88,31 @@ def emit_external(d: ConvergeTransactionDomain, request_id: str,
     handle_id = next_id("h")
     st = InFlightLifecycleState(handle_id=handle_id, request_id=request_id)
 
+    # R7 (audit): sequential in-flight — a NEW request may not be emitted
+    # while ANY other semantic request remains unsettled. Retries of the SAME
+    # request are exempt (they re-use its handle). A settled-but-not-drained
+    # current_in_flight does not block: settlement discharged the obligation.
+    prior_id = _find_handle_by_request(d, request_id)
+    if prior_id is None:
+        unsettled = [s for s in d.handles.values() if s.settlement is None]
+        if unsettled:
+            raise TransitionError(
+                "sequential in-flight: previous request still unsettled (I1/R7)")
+
     if request_id not in d.first_emission_flags:
         # First logical emission: exactly one fuel increment, node advances,
         # visitation recorded (I9, T03).
         d.first_emission_flags[request_id] = True
         d.step_count += 1
-        if not rec.local_only:
-            d.satisfaction_attempts += 1   # external emission carries an attempt;
-        node_id = rec.node_id or _node_for_op(d, rec.op_id)   # local dispatch does not
+        node_id = rec.node_id or _node_for_op(d, rec.op_id)
+        # R1 (audit): emission does NOT carry an implicit satisfier attempt.
+        # Only CheckSatisfaction increments satisfaction_attempts.
         d.nodes[node_id] = __import__("model", fromlist=["SearchNode"]).SearchNode(node_id, NodeStatus.EXPANDING)
         visit_key = f"{rec.op_id}:{node_id}"
         visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
         d.visited.append(VisitedRecord(visit_key, node_id, rec.op_id, visit_no))
+        if node_id in d.frontier:
+            d.frontier.remove(node_id)      # expanded node leaves the frontier
     else:
         # Transport retry (T04): only legal with adapter guarantees (T04B).
         prior_id = _find_handle_by_request(d, request_id)
@@ -262,7 +278,7 @@ def finish_if_drained(d: ConvergeTransactionDomain) -> bool:
     if kind == "PendingFailure":
         d.frame_status = SearchStatus.FAILED
     elif kind == "PendingCancelled":
-        d.frame_status = SearchStatus.EXHAUSTED
+        d.frame_status = SearchStatus.CANCELLED   # R2: cancellation ≠ exhaustion
     else:
         d.frame_status = SearchStatus.SATISFIED
     return True

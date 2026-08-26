@@ -1,93 +1,89 @@
-# Campaign 2 — Execution Report (Differential Semantics)
+# Campaign 2 — Execution Report (Differential Semantics) — REISSUE
 
-> Evidência histórica. Não modifica a semântica nem o freeze da Phase D.
-> Spec normativa permanece em `my-wiki@4a66862` / `bando@943754b`.
-> Campaign 1 report: `reports/CAMPAIGN-1-REPORT.md`.
+> **REISSUE after audit NO-GO on `03d27d4`.** The original report claimed
+> "VERIFIED IN TESTED REGIME" and "Item 3 UNBLOCKED". The audit correctly
+> identified that the apparatus normalized away real semantic distinctions
+> (R1–R7). This reissue reflects the repaired state. Prior claims are
+> WITHDRAWN and superseded by this document.
 
-## Question
-
-Campaign 1 asked: does the lowered machine keep its own invariants under
-crash/retry/duplicate/cancel/settlement? (YES, 13/13)
-
-**Campaign 2 asked: does the lowered machine preserve the MEANING of
-ConvergeFrame v0?**
+## Audit repairs applied
 
 ```text
-Obs(SemanticExecution) == Obs(LoweredExecution)
+R1  satisfaction_attempts
+    FIXED — EmitExternal no longer increments attempts; only
+    CheckSatisfaction does. All scenario-side -=1 normalizations removed.
+
+R2  cancellation
+    FIXED — new terminal status Cancelled; PendingCancelled drains to
+    Cancelled, never Exhausted. Semantic model mirrors it. Differential
+    observation now distinguishes cancellation from exhaustion (D11 asserts
+    Cancelled explicitly).
+
+R3  satisfaction transition
+    FIXED — check_satisfaction Ok(Some(T)) performs the normative Satisfied
+    transition itself. No scenario sets frame_status="Satisfied" manually.
+
+R4  D03 genuinely differential
+    FIXED — D03 descriptor: two external expansions reaching max_steps,
+    partial produced, CheckSatisfaction(partial) succeeds AFTER expansion
+    fuel ends → Satisfied(T-partial). Both models execute the same
+    descriptor independently; result matches.
+
+R5  external semantic execution
+    FIXED — scenarios.py defines shared Scenario/Step descriptors;
+    drive_semantic and drive_lowered derive effects/budget/attempts from the
+    descriptor alone. No scenario pre-fills observations.
+
+R6  value preservation
+    FIXED — compare() does exact T-value equality on all fields including
+    value. None/non-None normalization deleted.
+
+R7  sequential in-flight invariant
+    FIXED — I1 strengthened: at most one unsettled handle for ANY request in
+    the frame. New kill test (h1@r1 + h2@r2 unsettled ⇒ I1 must fail).
+    New transition guard: first emission of r2 while r1 unsettled is REFUSED;
+    regression verified. Retry of same request remains exempt.
 ```
 
-## Result
+## Result (post-repair)
 
 ```text
 Campaign 2 — Differential Semantics
 
 Basic scenarios:
-    6/6 PASS   (D01 local-exhaust, D02 successor-satisfied,
-                D03 fuel-cap parity, D04 Ok(None), D05 Err+abort,
-                D06 external expand)
+    6/6 PASS   (D01 exhaust, D02 successor satisfied, D03 max_steps +
+                partial checked, D04 Ok(None), D05 Err+abort, D06 external)
 
 Fault/recovery scenarios:
     6/6 PASS   (D07 DeliveryUnknown, D08 safe retry, D09 duplicate completion,
-                D10 crash-after-settlement forward recovery, D11 cancel-in-flight,
+                D10 crash-after-settlement forward recovery,
+                D11 cancel-in-flight [Cancelled ≠ Exhausted],
                 D12 late settlement after fatal closing)
 
+Campaign 1 regressions:
+    13/13 PASS (T02/T10 assertions updated from Exhausted to Cancelled —
+                they had baked in the R2 defect as expected behavior)
+
+Invariant kill tests:
+    8/8 PASS   (including R7-strengthened I1 kill on distinct requests)
+    Transition regression: second request while first unsettled REFUSED
+
 Semantic model:
-    REAL / EXERCISED     (semantic_model.py: WHAT only — no outbox, no
-                          CompletionRecord, no StageLocal, no vm mechanics)
+    REAL / EXERCISED (descriptor-driven, independent derivation)
 
 Lowered model:
-    REAL / EXERCISED     (reused from Campaign 1; not duplicated)
+    REAL / EXERCISED (same descriptors, independent derivation)
 
 Differential counterexamples:
-    NONE IN TESTED REGIME
+    NONE IN TESTED REGIME (post-repair regime is strictly stronger:
+    exact values, attempt accounting by CheckSatisfaction only,
+    cancellation distinguished, I1 frame-wide)
 
 LLM calls / network / randomness:
     0 / 0 / 0
 ```
 
-## Harness/test defects found during construction
-
-```text
-YES — again evidence FOR the methodology:
-
-4. natural-exhaustion transition missing entirely from the Campaign 1 harness.
-      Campaign 1 tested cancel/fatal closing but never plain exhaustion
-      (frontier drained without satisfaction). The semantic differential
-      exposed the gap on the first run. Classified HARNESS_GAP; spec unchanged.
-
-5. satisfaction of an UNEXPANDED successor had no lowered-model primitive.
-      Frozen ConvergeFrame v0 semantics: CheckSatisfaction is part of the
-      parent expansion's processing — the successor is consumed by the check
-      without consuming fuel or entering visitation history. Added as
-      check_satisfaction(); classified HARNESS_GAP.
-
-6. attempt-accounting normalization: external emissions carry an implicit
-   satisfier attempt; local dispatches do not. Encoded in emit_external and
-   normalized in scenarios where the explicit check IS the emission's attempt.
-
-7. scenario stub mismatches (D07–D12): semantic models initially declared
-   zero-cost/no-effect runs while the lowered side performed real paid actions.
-   Fixed the stubs to mirror observable reality — the semantic model must
-   describe what actually happened observably, not an idealized version.
-```
-
-## Normalizations applied (administrative differences ≠ divergence)
-
-```text
-StageLocal/Outbox/CompletionRecord/SettlementRecord (lowered-only mechanics)
-    → collapse to the single observable effect they realize
-
-local dispatch (DISPATCH_LOCAL)
-    → no observable Σ, no satisfier attempt
-
-transport retry
-    → invisible: same request_id, zero fuel delta, zero visitation delta
-
-value identity
-    → compared as None/non-None until the lineage campaign (2B) opens
-```
-
-## Evidence level statement
+## Evidence level statement (reissued)
 
 ```text
 Phase D
@@ -101,10 +97,10 @@ Executable lowered state-machine model
     REAL / EXERCISED (13/13 adversarial)
 
 Executable semantic model
-    REAL / EXERCISED (12/12 differential)
+    REAL / EXERCISED (12/12 differential, exact-value comparison)
 
 Differential semantic preservation
-    VERIFIED IN TESTED REGIME (no counterexample found)
+    VERIFIED IN TESTED REGIME (post-audit repairs R1–R7 incorporated)
 
 Actual compiler/lowering implementation
     NOT YET VERIFIED
@@ -118,7 +114,7 @@ best_partial / lineage / Ψ
 
 ## Item 3 gate
 
-```text
-Item 3 (CFG / Result / Error Model)
-    UNBLOCKED per campaign plan — Campaign 2 initial pass achieved with report.
-```
+Reconsidered per audit instructions: with R1–R7 incorporated and all batteries
+green under the strengthened regime, **Item 3 unblocked** is reasserted —
+with the explicit caveat that this claim has now survived one adversarial
+audit cycle, and any further NO-GO supersedes it again.
