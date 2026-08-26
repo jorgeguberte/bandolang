@@ -55,7 +55,8 @@ class SemanticFrame:
 
     # ---- core methods ---------------------------------------------------
 
-    def expand(self, node_id: str, op: OpDef, succs: list[str]) -> list[str]:
+    def expand(self, node_id: str, op: OpDef, succs: list[str],
+               delivery_unknown: bool = False) -> list[str]:
         """Expand node: costs 1 step fuel, marks Expanding, records visited,
         adds external effects/budget if external, adds successors to frontier."""
         if self.status != Status.SEARCHING or self.step_count >= self.max_steps:
@@ -64,8 +65,9 @@ class SemanticFrame:
         self.nodes[node_id] = "Expanding"
         self.visited.append(Visit(node_id))
         if op.kind == "external":
-            self.budget_spent += op.charge()
             self.effects.append(f"external({op.op_id})")
+            if not delivery_unknown:
+                self.budget_spent += op.charge()
         for s in succs:
             if s not in self.nodes:
                 self.nodes[s] = "Frontier"
@@ -138,17 +140,17 @@ class SemanticFrame:
             node = self.frontier.pop(runnable_idx)
             op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
             succs = list(prog.successors.get(node, []))
-            self.expand(node, op, succs)
+            op_is_delivery_unknown = prog.fault_spec.delivery_unknown or (op.op_id in prog.fault_spec.delivery_unknown_ops)
+            self.expand(node, op, succs, delivery_unknown=op_is_delivery_unknown)
 
-            # R31: External dispatch with DeliveryUnknown transitions to Waiting state
-            if prog.fault_spec.delivery_unknown and op.kind == "external":
+            # R31/R41: External dispatch with DeliveryUnknown transitions to Waiting state, preserving prior budget_spent
+            if op_is_delivery_unknown and op.kind == "external":
                 self.status = "Waiting"
                 self.outcome = SemanticOutcome("Waiting")
-                self.budget_spent = 0
                 self.outstanding_scope_commitment = op.cost
                 self.unsettled_request_count = 1
                 self.attributable_owner_reserved = op.cost
-                self.intent_available_consumed = op.cost
+                self.intent_available_consumed = self.budget_spent + op.cost
                 return self.outcome
 
             # Check for environmental cancellation
@@ -159,7 +161,9 @@ class SemanticFrame:
             # Candidates to check: the expanded node itself, then its successors
             candidates = [node] + succs
             for cand in candidates:
-                # R33: Check satisfaction only on nodes with explicit PartialOf(cand) == Some(P)
+                # R33/R42: Check satisfaction eligibility
+                if self.satisfaction_attempts >= prog.max_satisfaction_attempts:
+                    continue
                 if prog.partial_map and cand not in prog.partial_map:
                     continue
 
@@ -179,7 +183,7 @@ class SemanticFrame:
                         self.outstanding_scope_commitment = es_cost
                         self.unsettled_request_count = 1
                         self.attributable_owner_reserved = es_cost
-                        self.intent_available_consumed = es_cost
+                        self.intent_available_consumed = self.budget_spent + es_cost
                         return self.outcome
 
                     self.budget_spent += prog.effectful_satisfier.charge()

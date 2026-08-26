@@ -33,6 +33,7 @@ class OpDef:
 class FaultSpec:
     """Environmental/transport fault injection flags (inputs, not outcome oracles)."""
     delivery_unknown: bool = False
+    delivery_unknown_ops: tuple[str, ...] = ()  # R41: targeted op_ids that suffer DeliveryUnknown
     safe_retry: bool = False
     duplicate_completion: bool = False
     crash_after_settlement: bool = False
@@ -57,6 +58,8 @@ class ScenarioProgram:
     effectful_satisfier: Optional[OpDef] = None
     # R33: explicit PartialOf mapping: node_id -> Partial (only partial nodes are checkable)
     partial_map: dict[str, Any] = field(default_factory=dict)
+    # R42: maximum satisfaction attempts before satisfier eligibility is exhausted
+    max_satisfaction_attempts: int = 10
 
 
 # =====================================================================
@@ -308,4 +311,37 @@ D19_CRASH_RECOVERY = ScenarioProgram(
     fault_spec=FaultSpec(crash_after_settlement=True),
     max_steps=6,
     budget_limit=100,
+)
+
+# R41: targeted DeliveryUnknown on second external op preserves prior settled budget spend
+D20_TARGETED_DELIVERY_UNKNOWN = ScenarioProgram(
+    name="D20_waiting_preserves_prior_spend",
+    initial_frontier=["A"],
+    successors={"A": ["B"], "B": []},
+    node_ops={
+        "A": OpDef("opA", kind="external", cost=20),
+        "B": OpDef("opB", kind="external", cost=10),
+    },
+    fault_spec=FaultSpec(delivery_unknown_ops=("opB",)),
+    max_steps=6,
+    budget_limit=100,
+)
+
+# R42: max_satisfaction_attempts limit exhaustion
+D21_SATISFACTION_LIMIT = ScenarioProgram(
+    name="D21_satisfaction_attempt_limit_exhausts",
+    initial_frontier=["root"],
+    successors={"root": []},
+    node_ops={
+        "root": OpDef("opRoot", kind="local"),
+    },
+    partial_map={
+        "root": "PartialRoot",
+    },
+    satisfier_map={
+        "root": ("ok", False, None),
+    },
+    max_steps=6,
+    budget_limit=100,
+    max_satisfaction_attempts=1,
 )

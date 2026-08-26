@@ -1,60 +1,64 @@
-# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 7
+# Campaign 2 — Execution Report (Differential Semantics) — REISSUE 8
 
-> **REISSUE 7 after seventh audit round (R31–R36).**
-> The seventh audit caught the final core execution discrepancies:
-> 1. Missing `Waiting(InFlightHandle)` state in lifecycle and scheduler decisions.
-> 2. `recover()` fabricating `Applied` without durable semantic outcome payloads.
-> 3. Missing `PartialOf` eligibility modeling in `ScenarioProgram`.
-> 4. Discarded `exhaustion_reason` in differential observations.
-> 5. Completeness gap in I6 (applied handle missing application record).
-> 6. Over-constrained receipt_id uniqueness in I7 across distinct handles.
-> All six issues have been resolved across both the lowered machine and the semantic model.
+> **REISSUE 8 after eighth audit round (R37–R43).**
+> The eighth audit verified deep integrity and binding properties:
+> 1. Completion / Payload binding (digest and outcome strictly bind semantic payloads; failure cannot carry success payload).
+> 2. Generic `apply_semantic` bypass removed for typed outcomes.
+> 3. I6 true bijection (Applied handles <=> unique application records).
+> 4. I7 real independent reconciliation count per handle (`settlement_reconciliations`).
+> 5. Targeted fault injection (`delivery_unknown_ops`) and preservation of prior settled spend during Waiting.
+> 6. Unambiguous `PartialOf` eligibility and `max_satisfaction_attempts` limit.
+> 7. `request_id` identity reuse rejection before any mutation or reservation.
+> All seven issues have been resolved across both the lowered machine and the semantic model.
 
-## Audit repairs applied (Round 7: R31–R36)
+## Audit repairs applied (Round 8: R37–R43)
 
 ```text
-R31 Real Waiting Lifecycle (SearchStatus.WAITING & scheduler_step Wait)
-    FIXED — external dispatch transitions frame to SearchStatus.WAITING.
-    DeliveryUnknown retains commitments and preserves Waiting(handle).
-    `scheduler_step` returns `Wait(InFlight(h))` whenever an unsettled handle exists.
-    Driver receiving `Wait` MUST NOT call exhaust.
-    D17 rewritten to observe Waiting state, attempts=1, unsettled=1, value=None.
-    Added D18: unsettled external A blocks subsequent local runnable node B from dispatching.
+R37 Completion / Payload Binding
+    FIXED — `admit_completion()` strictly validates that `digest`, `outcome`, and `semantic_payload`
+    form a coherent bound outcome. Rejects Failure outcome carrying success payload.
+    Equivocation detection checks full payload divergence on the same handle.
 
-R32 Durable Semantic Completion & Autonomous Recovery
-    FIXED — `CompletionRecord` durably carries `SpaceOutcome(successors)` or `SatisfierOutcome`.
-    `recover()` reads durable outcome and autonomously re-drives atomic application.
-    T15/T16 recover without test oracle re-supplying successors or satisfaction values.
-    Added D19: crash after settlement before apply autonomously recovers successors into frontier.
+R38 Remove Generic Apply Bypass
+    FIXED — `apply_semantic()` refuses to apply handles carrying typed SpaceOutcome
+    or SatisfierOutcome, preventing bypass of successor discovery or satisfaction incorporation.
+    Added T18 regression scenario.
 
-R33 Explicit Partial Eligibility (PartialOf)
-    FIXED — `ScenarioProgram` represents `partial_map: dict[node, Partial]`.
-    CheckSatisfaction (local or effectful) only executes when `PartialOf(cand) == Some(P)`.
-    D16 explicitly declares `partial_map={"cand1": "P1"}`, resulting in exactly 1 satisfier
-    tool call, spent=5, satisfied T-verified.
+R39 I6 True Bijection
+    FIXED — I6 enforces exact two-way bijection:
+        (a) unique application records
+        (b) every Applied handle has matching application record
+        (c) every application record corresponds to an actual Applied handle
+    Added I6 kill B (ghost application record with no Applied handle => FAIL).
 
-R34 Preserve Exhaustion Reason
-    FIXED — `tx.exhaust(d, reason)` records `exhaustion_reason` ("BudgetDepleted",
-    "FrontierEmpty", "FuelExhausted").
-    D14 and D15 observe and assert `exhaustion_reason == "BudgetDepleted"`.
+R40 I7 Real Reconciliation Count
+    FIXED — domain tracks independent `settlement_reconciliations[handle_id]` count.
+    I7 verifies `reconciliation_count[h] == 1` per handle and exact scope spent match.
 
-R35 Fix I6 Completeness (Applied <=> Application Record)
-    FIXED — I6 enforces exact bijection: every applied handle must have a matching
-    CompletionId in `applied_completions`, and records must be unique.
-    Added I6 kill B: applied handle with missing application record => FAIL.
+R41 Targeted Faults & DeliveryUnknown History Preservation (D20)
+    FIXED — FaultSpec supports targeted `delivery_unknown_ops`.
+    SemanticFrame preserves prior settled `budget_spent` when an in-flight operation
+    suffers DeliveryUnknown.
+    Added D20 (A settles 20, B suffers DeliveryUnknown ceiling 10 => spent=20, committed=10).
 
-R36 Fix I7 Per-Handle Settlement Identity
-    FIXED — I7 tracks reconciliation count per handle identity, not global receipt string uniqueness.
-    Added I7 control probe: two distinct handles with identical receipt string => PASS.
+R42 PartialOf & Satisfaction Attempt Limit (D21)
+    FIXED — explicit `partial_map` mapping and `max_satisfaction_attempts` limit.
+    Added D21 testing exhaustion when satisfaction attempts reach the configured limit.
+
+R43 Request ID Identity & Reuse Protection (T17)
+    FIXED — `StageLocal` rejects historical `request_id` reuse for new requests before
+    any mutation of available, reserved, or committed funds.
+    Added T17 regression scenario.
 ```
 
 ## Complete verification results
 
 ```text
 Campaign 1 (Lowered Safety & Crash Recovery):
-    18/18 PASS (T01–T11, T04A/B, T07B real recovery, T12 sequential stage guard,
+    20/20 PASS (T01–T11, T04A/B, T07B real recovery, T12 sequential stage guard,
                 T13 pending exhaust drain, T14 settlement ceiling bounds,
-                T15 autonomous space apply recovery, T16 autonomous satisfier apply recovery)
+                T15 autonomous space apply recovery, T16 autonomous satisfier apply recovery,
+                T17 request_id reuse rejection, T18 generic apply bypass refused)
 
 Invariant Kill Tests (Mutation Testing):
     17/17 PASS (I1 frame-wide, I3 scope kill, I3 attributable kill, I3 control probe,
@@ -66,7 +70,7 @@ Invariant Kill Tests (Mutation Testing):
                 I10 spent>avail control probe)
 
 Campaign 2 Basic (Declarative Search Programs):
-    13/13 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
+    15/15 PASS (D01 exhaust [R19 verified], D02 successor [R19/R10 verified],
                 D03 max_steps + partial [R4 verified], D04 Ok(None), D05 Err+abort,
                 D06 external, D13 ceiling vs actual charge [R12/R14 verified],
                 D14 budget headroom depletion [R15/R34 verified],
@@ -74,7 +78,9 @@ Campaign 2 Basic (Declarative Search Programs):
                 D16 effectful satisfier with explicit PartialOf [R24/R33 verified],
                 D17 effectful satisfier commit point under DeliveryUnknown [R26/R31 verified],
                 D18 sequential Waiting blocks local dispatch [R31 verified],
-                D19 autonomous crash recovery preserves space successors [R32 verified])
+                D19 autonomous crash recovery preserves space successors [R32/R37 verified],
+                D20 targeted DeliveryUnknown preserves prior spend [R41 verified],
+                D21 satisfaction attempt limit exhaustion [R42 verified])
 
 Campaign 2 Fault (Environmental Fault Injections):
     6/6 PASS   (D07 DeliveryUnknown [Waiting verified], D08 safe retry,
@@ -86,8 +92,8 @@ Semantic model:
     REAL / AUTONOMOUS (purely declarative search space execution)
 
 Lowered model:
-    REAL / ADVERSARIALLY HARDENED (Waiting lifecycle, durable semantic payloads,
-    autonomous recovery, explicit PartialOf, exact accounting, invariant bijection)
+    REAL / ADVERSARIALLY HARDENED (bound completion payloads, bijection invariants,
+    independent reconciliation tracking, request_id reuse protection, autonomous recovery)
 
 Differential counterexamples:
     NONE IN TESTED REGIME
@@ -107,16 +113,16 @@ Design
     ADVERSARIALLY REVIEWED
 
 Executable lowered state-machine model
-    REAL / ADVERSARIALLY HARDENED (18/18 adversarial scenarios)
+    REAL / ADVERSARIALLY HARDENED (20/20 adversarial scenarios)
 
 Executable semantic model
-    REAL / AUTONOMOUS (19/19 differential programs)
+    REAL / AUTONOMOUS (21/21 differential programs)
 
 Invariant checker
     SELF-TESTED (17/17 mutation kill tests & control probes)
 
 Differential semantic preservation
-    VERIFIED IN TESTED REGIME (audited across 7 review rounds, R1–R36 fixed)
+    VERIFIED IN TESTED REGIME (audited across 8 adversarial review rounds, R1–R43 fixed)
 
 Actual compiler/lowering implementation
     NOT YET VERIFIED
@@ -133,6 +139,6 @@ best_partial / lineage / Ψ
 ```text
 Item 3 (CFG / Result / Error Model)
     UNBLOCKED per campaign plan — Phase D lowering safety, Waiting lifecycle,
-    budget conservation, durable autonomous recovery, and differential
-    preservation have survived 7 exhaustive adversarial audit rounds.
+    budget conservation, durable autonomous recovery, invariant bijection,
+    and differential preservation have survived 8 adversarial audit rounds.
 ```

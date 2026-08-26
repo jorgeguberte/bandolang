@@ -18,7 +18,8 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from scenarios import (
     D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17,
-    D18_WAITING, D19_CRASH_RECOVERY, OpDef, ScenarioProgram,
+    D18_WAITING, D19_CRASH_RECOVERY, D20_TARGETED_DELIVERY_UNKNOWN,
+    D21_SATISFACTION_LIMIT, OpDef, ScenarioProgram,
 )
 import transitions as tx
 from differential import compare, classify, lowered_observation
@@ -51,6 +52,7 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
         cost = op.cost if op.kind == "external" else 0
         charge = op.charge() if op.kind == "external" else 0
         succs = list(prog.successors.get(node, []))
+        op_is_delivery_unknown = prog.fault_spec.delivery_unknown or (op.op_id in prog.fault_spec.delivery_unknown_ops)
 
         if op.kind == "local":
             # R19: Real local dispatch — zero handles, zero outbox, zero settlement
@@ -62,9 +64,9 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
                             local_only=False)
 
             h.step(f"emit-{op.op_id}", tx.emit_external, handle,
-                   deliver_unknown=prog.fault_spec.delivery_unknown)
+                   deliver_unknown=op_is_delivery_unknown)
 
-            if prog.fault_spec.delivery_unknown:
+            if op_is_delivery_unknown:
                 # R31: delivery unknown remains in Waiting state
                 break
 
@@ -110,6 +112,10 @@ def drive_lowered_program(prog: ScenarioProgram, d: ConvergeTransactionDomain, h
         # Check satisfaction on candidates: the expanded node itself, then its successors
         candidates = [node] + succs
         for cand in candidates:
+            # R42: Check satisfaction attempt limit
+            if d.satisfaction_attempts >= prog.max_satisfaction_attempts:
+                continue
+
             # R33: Check satisfaction only on candidates with explicit PartialOf(cand) == Some(P)
             if prog.partial_map and cand not in prog.partial_map:
                 continue
@@ -253,6 +259,21 @@ def run(prog: ScenarioProgram) -> None:
             assert "childB" in sem_obs["visited"] or "childB" in sem_obs["frontier"] or sem_obs["value"] == "T-recovered", "childB was not incorporated"
             print("    \u2713 R32 verified: autonomous crash recovery preserved and incorporated SpaceOutcome successors")
 
+        # R41 assertion for D20
+        if prog.name == "D20_waiting_preserves_prior_spend":
+            assert sem_obs["status"] == "Waiting", f"R41: status must be Waiting, got {sem_obs['status']}"
+            assert sem_obs["budget_spent"] == 20, f"R41: budget_spent must be 20, got {sem_obs['budget_spent']}"
+            assert sem_obs["outstanding_scope_commitment"] == 10, f"R41: commitment must be 10, got {sem_obs['outstanding_scope_commitment']}"
+            assert sem_obs["attributable_owner_reserved"] == 10, f"R41: reserved must be 10, got {sem_obs['attributable_owner_reserved']}"
+            assert sem_obs["intent_available_consumed"] == 30, f"R41: consumed must be 30, got {sem_obs['intent_available_consumed']}"
+            print("    \u2713 R41 verified: DeliveryUnknown on opB preserved prior settled budget_spent==20 and committed==10")
+
+        # R42 assertion for D21
+        if prog.name == "D21_satisfaction_attempt_limit_exhausts":
+            assert sem_obs["satisfaction_attempts"] == 1, f"R42: attempts must be 1, got {sem_obs['satisfaction_attempts']}"
+            assert sem_obs["status"] == "Exhausted", f"R42: status must be Exhausted, got {sem_obs['status']}"
+            print("    \u2713 R42 verified: max_satisfaction_attempts==1 enforced; search exhausts naturally")
+
         print(f"  \u2713 PASS {prog.name}  (status={sem_obs['status']} value={sem_obs['value']!r})")
         PASS += 1
 
@@ -260,7 +281,8 @@ def run(prog: ScenarioProgram) -> None:
 if __name__ == "__main__":
     print("=" * 70)
     print("CAMPAIGN 2 BASIC — declarative ScenarioProgram, autonomous execution")
-    for prog in (D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17, D18_WAITING, D19_CRASH_RECOVERY):
+    for prog in (D01, D02, D03, D04, D05, D06, D13, D14, D15, D16, D17,
+                 D18_WAITING, D19_CRASH_RECOVERY, D20_TARGETED_DELIVERY_UNKNOWN, D21_SATISFACTION_LIMIT):
         run(prog)
 
     print("=" * 70)

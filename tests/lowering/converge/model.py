@@ -195,6 +195,7 @@ class ConvergeTransactionDomain:
     handles: dict[str, InFlightLifecycleState] = field(default_factory=dict)
     completions: dict[str, CompletionRecord] = field(default_factory=dict)
     applied_completions: list[str] = field(default_factory=list) # R28: CompletionId tracking for I6
+    settlement_reconciliations: dict[str, int] = field(default_factory=dict) # R40: per-handle reconciliation count for I7
 
     # 4. Coordinated accounting
     scope_limit: dict[str, int] = field(default_factory=dict)
@@ -236,6 +237,7 @@ class ConvergeTransactionDomain:
             handles=h,
             completions=dict(self.completions),
             applied_completions=list(self.applied_completions),
+            settlement_reconciliations=dict(self.settlement_reconciliations),
             scope_limit=dict(self.scope_limit),
             scope_committed=dict(self.scope_committed),
             scope_spent=dict(self.scope_spent),

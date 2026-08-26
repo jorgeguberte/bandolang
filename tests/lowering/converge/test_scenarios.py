@@ -421,6 +421,51 @@ def t16():
     assert_true(d_rec.satisfied_value == "T-sat-val", "satisfied value missing")
 
 
+@scenario("T17_REQUEST_ID_REUSE_REJECTED")
+def t17():
+    """R43: StageLocal for a new request must reject a historical request_id before any reservation."""
+    d, h = new_domain()
+    h.step("stage-1", tx.stage_local, "n1", "op1", "r_unique", "usd", 10)
+    handle1 = h.step("emit-1", tx.emit_external, "r_unique")
+    h.step("deliver-1", tx.admit_completion, handle1, "rcpt-1", "d1")
+    h.step("settle-1", tx.settle, handle1, "usd", 10)
+    h.step("apply-1", tx.apply_space_completion, handle1, [])
+
+    # Now attempt to reuse "r_unique" for a different node / attempt:
+    avail_before = d.intent_available["usd"]
+    res_before = d.intent_reserved.get("usd", 0)
+    comm_before = d.scope_committed.get("usd", 0)
+    try:
+        h.step("stage-reuse", tx.stage_local, "n2", "op2", "r_unique", "usd", 10)
+        raise AssertionError("request_id reuse was permitted")
+    except tx.TransitionError as e:
+        assert_true("RequestIdAlreadyUsed" in str(e), f"wrong refusal: {e}")
+
+    # Assert zero deltas before rejection
+    assert_true(d.intent_available["usd"] == avail_before, "available mutated on rejected reuse")
+    assert_true(d.intent_reserved.get("usd", 0) == res_before, "reserved mutated on rejected reuse")
+    assert_true(d.scope_committed.get("usd", 0) == comm_before, "committed mutated on rejected reuse")
+
+
+@scenario("T18_GENERIC_APPLY_REFUSED_ON_TYPED_COMPLETION")
+def t18():
+    """R38: generic apply_semantic must refuse when handle carries typed SpaceOutcome."""
+    from model import SpaceOutcome
+    d, h = new_domain()
+    h.step("stage", tx.stage_local, "n18", "op18", "r18", "usd", 10)
+    handle = h.step("emit", tx.emit_external, "r18")
+    h.step("deliver", tx.admit_completion, handle, "rcpt-18", "d18",
+           semantic_payload=SpaceOutcome(successors=["childX"]))
+    h.step("settle", tx.settle, handle, "usd", 10)
+
+    # Calling generic apply_semantic on typed completion must raise TransitionError:
+    try:
+        h.step("generic-apply", tx.apply_semantic, handle)
+        raise AssertionError("generic apply was accepted on typed completion")
+    except tx.TransitionError as e:
+        assert_true("generic apply_semantic refused" in str(e), f"wrong refusal: {e}")
+
+
 # =====================================================================
 print("\n" + "=" * 70)
 print(f"CAMPAIGN 1 RESULT: {PASS} scenarios passed, {FAIL} failed (16 total)")

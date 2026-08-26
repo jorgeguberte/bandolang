@@ -130,6 +130,10 @@ def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                 request_id: str, resource: str, amount: int,
                 dedup_capable: bool = False, idempotent: bool = False,
                 local_only: bool = False, is_expansion: bool = True) -> str:
+    # R43: reject request_id reuse for a new request before any mutation or reservation
+    if request_id in d.outbox:
+        raise TransitionError(f"RequestIdAlreadyUsed: cannot stage new request with historical request_id '{request_id}'")
+
     # Sequential in-flight: cannot stage a new request if an unsettled handle exists
     unsettled = [s for s in d.handles.values() if s.settlement is None and s.state != "Aborted"]
     if unsettled:
@@ -258,14 +262,18 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
     if st is None:
         raise TransitionError("completion for unknown handle")
 
+    if outcome == "Failure" and semantic_payload is not None:
+        raise TransitionError("Failure outcome cannot carry success semantic payload (R37)")
+
     existing = next((c for c in d.completions.values() if c.handle_id == handle_id), None)
     if existing is not None:
-        if existing.digest != digest:
-            # T07B: contradictory digest on same handle -> fatal equivocation
+        # R37: Equivocation check binds receipt_id, digest, outcome, AND semantic_payload
+        if (existing.digest != digest or
+            existing.semantic_payload != semantic_payload or
+            existing.outcome != outcome):
             fatal_close(d, f"receipt equivocation on {handle_id}")
             raise FatalInvariantViolation(f"receipt equivocation on {handle_id}")
         else:
-            # Idempotent duplicate delivery of identical completion
             return
 
     if st.state not in ("InFlight", "DeliveryUnknown"):
@@ -313,6 +321,8 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
         resource=resource, amount=amount,
     )
     st.state = "Settled"
+    # R40: independent reconciliation count per handle
+    d.settlement_reconciliations[handle_id] = d.settlement_reconciliations.get(handle_id, 0) + 1
 
     # IntentFrame reconciliation:
     # reserved -= R; spent += C; available += (R - C) [unspent refund]
@@ -328,7 +338,7 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
 
 
 # ---------------------------------------------------------------------
-# apply — semantic incorporation, exactly once per completion (I6, R27)
+# apply — semantic incorporation, exactly once per completion (I6, R27, R38)
 # ---------------------------------------------------------------------
 
 def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
@@ -340,6 +350,9 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
         return False         # idempotent: duplicate apply is a no-op
     if st.state != "Settled":
         raise TransitionError(f"apply_semantic called in invalid state '{st.state}' — must be Settled")
+    if st.completion is not None and st.completion.semantic_payload is not None:
+        # R38: refuse generic apply on handles with typed SpaceOutcome/SatisfierOutcome
+        raise TransitionError("generic apply_semantic refused on handle with typed SpaceOutcome/SatisfierOutcome — use apply_space_completion or apply_satisfier_completion")
     if mutate_frontier and d.frame_status in (SearchStatus.CLOSING, SearchStatus.CANCELLED,
                                               SearchStatus.FAILED, SearchStatus.EXHAUSTED):
         raise TransitionError("I8: frontier mutation during Closing")
