@@ -5,7 +5,7 @@ a deliberately invalid state that the checker MUST flag.
 """
 from __future__ import annotations
 
-from model import TERMINAL, ConvergeTransactionDomain, HarnessBookkeeping
+from model import NodeStatus, TERMINAL, ConvergeTransactionDomain, HarnessBookkeeping
 
 
 class InvariantViolation(Exception):
@@ -119,7 +119,8 @@ def i8_closing_frontier_frozen(d: ConvergeTransactionDomain) -> bool:
 def i9_visited_requires_dispatch(d: ConvergeTransactionDomain) -> bool:
     emitted_ops = {rec.op_id for rec in d.outbox.values()
                    if d.first_emission_flags.get(rec.request_id)}
-    return all(v.op_id in emitted_ops for v in d.visited)
+    expanding_nodes = {nid for nid, node in d.nodes.items() if node.status == NodeStatus.EXPANDING}
+    return all(v.op_id in emitted_ops or v.node_id in expanding_nodes for v in d.visited)
 
 
 # I10. BudgetScope cannot grant or mint ownership; IntentFrame conserves resources

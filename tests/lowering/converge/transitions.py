@@ -3,12 +3,12 @@
 Each transition enforces the frozen normative principles. Faults are injected
 by the harness, never by these functions.
 """
-from __future__ import annotations
+from dataclasses import replace
 
 from model import (
     ClosingReason, CompletionRecord, ConvergeTransactionDomain,
     InFlightLifecycleState, NodeStatus, OutboxRecord, Reservation,
-    SearchStatus, SettlementRecord, VisitedRecord, next_id,
+    SearchNode, SearchStatus, SettlementRecord, VisitedRecord, next_id,
 )
 
 
@@ -23,6 +23,52 @@ class FatalInvariantViolation(Exception):
 # ---------------------------------------------------------------------
 # StageLocal — reserve resources and write outbox. NOT a semantic dispatch.
 # ---------------------------------------------------------------------
+
+# ---------------------------------------------------------------------
+# DISPATCH_LOCAL — real local/pure expansion (R19).
+# Consumes step fuel, records visited, expands frontier.
+# NEVER creates InFlightHandle, outbox, completion, settlement, or spend.
+# ---------------------------------------------------------------------
+
+def dispatch_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
+                   succs: list[str]) -> None:
+    if d.frame_status != SearchStatus.SEARCHING:
+        raise TransitionError("dispatch_local outside Searching frame")
+
+    unsettled = [s for s in d.handles.values() if s.settlement is None and s.state != "Aborted"]
+    if unsettled:
+        raise TransitionError("sequential in-flight: previous request still unsettled (I1/R7)")
+
+    d.step_count += 1
+    d.nodes[node_id] = SearchNode(node_id, NodeStatus.EXPANDING)
+    visit_key = f"{op_id}:{node_id}"
+    visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
+    d.visited.append(VisitedRecord(visit_key, node_id, op_id, visit_no))
+
+    if node_id in d.frontier:
+        d.frontier.remove(node_id)
+
+    discover_successors(d, succs)
+
+
+def discover_successors(d: ConvergeTransactionDomain, succs: list[str]) -> None:
+    """R23: all frontier additions go through this modeled operation."""
+    if d.frame_status in (SearchStatus.CLOSING, SearchStatus.CANCELLED,
+                          SearchStatus.FAILED, SearchStatus.EXHAUSTED):
+        d.frontier_mutations_during_closing += 1
+        raise TransitionError("I8: frontier mutation during Closing")
+    for s in succs:
+        if s not in d.nodes:
+            d.nodes[s] = SearchNode(s, NodeStatus.FRONTIER)
+            d.frontier.append(s)
+
+
+def classify_runnable(d: ConvergeTransactionDomain, op_cost: int, resource: str = "usd") -> bool:
+    """R20: Check whether an operation ceiling can be afforded under current headroom."""
+    available = d.intent_available.get(resource, 0)
+    scope_head = d.scope_limit.get(resource, 0) - d.scope_spent.get(resource, 0) - d.scope_committed.get(resource, 0)
+    return (op_cost <= available and op_cost <= scope_head)
+
 
 def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                        satisfied: bool, value: object = None,
@@ -53,7 +99,7 @@ def check_satisfaction(d: ConvergeTransactionDomain, node_id: str, op_id: str,
 def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
                 request_id: str, resource: str, amount: int,
                 dedup_capable: bool = False, idempotent: bool = False,
-                local_only: bool = False) -> str:
+                local_only: bool = False, is_expansion: bool = True) -> str:
     if d.frame_status != SearchStatus.SEARCHING:
         raise TransitionError("StageLocal outside Searching frame")
 
@@ -77,6 +123,7 @@ def stage_local(d: ConvergeTransactionDomain, node_id: str, op_id: str,
         dedup_capable=dedup_capable, idempotent=idempotent,
         node_id=node_id, local_only=local_only,
         reserved_resource=resource, reserved_amount=amount,
+        is_expansion=is_expansion,
     )
 
     # R15: StageLocal creates stable InFlightHandle atomically with reservation and outbox
@@ -122,20 +169,19 @@ def emit_external(d: ConvergeTransactionDomain, request_or_handle_id: str,
         handle_id = st.handle_id
 
     if request_id not in d.first_emission_flags:
-        # First logical emission: exactly one fuel increment, node advances,
-        # visitation recorded (I9, T03).
         d.first_emission_flags[request_id] = True
-        d.step_count += 1
         st.state = "InFlight"
-        node_id = rec.node_id or _node_for_op(d, rec.op_id)
-        # R1 (audit): emission does NOT carry an implicit satisfier attempt.
-        # Only CheckSatisfaction increments satisfaction_attempts.
-        d.nodes[node_id] = __import__("model", fromlist=["SearchNode"]).SearchNode(node_id, NodeStatus.EXPANDING)
-        visit_key = f"{rec.op_id}:{node_id}"
-        visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
-        d.visited.append(VisitedRecord(visit_key, node_id, rec.op_id, visit_no))
-        if node_id in d.frontier:
-            d.frontier.remove(node_id)      # expanded node leaves the frontier
+        if rec.is_expansion:
+            # First logical emission of a space expansion: consumes step fuel,
+            # advances node to EXPANDING, records visitation (I9, T03).
+            d.step_count += 1
+            node_id = rec.node_id or _node_for_op(d, rec.op_id)
+            d.nodes[node_id] = SearchNode(node_id, NodeStatus.EXPANDING)
+            visit_key = f"{rec.op_id}:{node_id}"
+            visit_no = sum(1 for v in d.visited if v.visit_key == visit_key) + 1
+            d.visited.append(VisitedRecord(visit_key, node_id, rec.op_id, visit_no))
+            if node_id in d.frontier:
+                d.frontier.remove(node_id)
     else:
         # Transport retry (T04): only legal with adapter guarantees (T04B).
         if st is not None and st.delivery_unknown:
@@ -175,16 +221,17 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
         raise TransitionError("completion for unknown handle")
 
     existing = next((c for c in d.completions.values() if c.handle_id == handle_id), None)
-    if existing is not None and existing.digest != digest:
-        # T07B: the contradiction becomes real ONLY when durably observed.
-        # Persist violation evidence atomically WITH this admission,
-        # BEFORE any fatal control flow completes.
-        d.protocol_violations.append({
-            "handle_id": handle_id,
-            "receipt_a": existing.receipt_id, "digest_a": existing.digest,
-            "receipt_b": receipt_id, "digest_b": digest,
-        })
-        raise FatalInvariantViolation(f"receipt equivocation on {handle_id}")
+    if existing is not None:
+        if existing.digest != digest:
+            # T07B: contradictory digest on same handle -> fatal equivocation
+            fatal_close(d, f"receipt equivocation on {handle_id}")
+            raise FatalInvariantViolation(f"receipt equivocation on {handle_id}")
+        else:
+            # Idempotent duplicate delivery of identical completion
+            return
+
+    if st.state not in ("InFlight", "DeliveryUnknown"):
+        raise TransitionError(f"completion admitted in invalid state '{st.state}' — must be InFlight or DeliveryUnknown")
 
     comp = CompletionRecord(handle_id=handle_id, receipt_id=receipt_id,
                             digest=digest, outcome=outcome)
@@ -195,7 +242,6 @@ def admit_completion(d: ConvergeTransactionDomain, handle_id: str,
 
 # ---------------------------------------------------------------------
 # settle — ledger reconciliation exactly once (I7); works from Delivered
-# or Settled-pending states, including late settlement after Closing (T10/T11)
 # ---------------------------------------------------------------------
 
 def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: int) -> None:
@@ -204,6 +250,9 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
         raise TransitionError("settlement for unknown handle")
     if st.settlement is not None:
         return          # idempotent: duplicate settlement reconciles nothing extra
+
+    if st.state != "Delivered":
+        raise TransitionError(f"settle called in invalid state '{st.state}' — must be Delivered")
 
     ceiling = st.reserved_amount
     ceiling_res = st.reserved_resource or resource
@@ -214,10 +263,10 @@ def settle(d: ConvergeTransactionDomain, handle_id: str, resource: str, amount: 
     if st.reserved_amount == 0 and amount > 0:
         raise TransitionError("ChargeOnZeroReservation: cannot settle positive charge on zero reservation")
     if amount > ceiling:
-        d.protocol_violations.append({"fatal": f"SettlementExceedsCeiling: charge {amount} > ceiling {ceiling}"})
+        fatal_close(d, f"SettlementExceedsCeiling: charge {amount} > ceiling {ceiling}")
         raise FatalInvariantViolation(f"SettlementExceedsCeiling: charge {amount} exceeds reserved ceiling {ceiling}")
     if resource != ceiling_res:
-        d.protocol_violations.append({"fatal": f"SettlementResourceMismatch: {resource} != {ceiling_res}"})
+        fatal_close(d, f"SettlementResourceMismatch: resource {resource} != reserved {ceiling_res}")
         raise FatalInvariantViolation(f"SettlementResourceMismatch: resource {resource} != reserved {ceiling_res}")
 
     st.settlement = SettlementRecord(
@@ -250,12 +299,13 @@ def apply_semantic(d: ConvergeTransactionDomain, handle_id: str,
         raise TransitionError("apply for unknown handle")
     if st.applied:
         return False         # idempotent: duplicate apply is a no-op
-    if st.state not in ("Delivered", "Settled"):
-        raise TransitionError("apply before delivery")
+    if st.state != "Settled":
+        raise TransitionError(f"apply_semantic called in invalid state '{st.state}' — must be Settled")
     if mutate_frontier and d.frame_status in (SearchStatus.CLOSING, SearchStatus.CANCELLED,
                                               SearchStatus.FAILED, SearchStatus.EXHAUSTED):
         raise TransitionError("I8: frontier mutation during Closing")
     st.applied = True
+    st.state = "Applied"
     return True
 
 
@@ -342,8 +392,8 @@ def recover(d: ConvergeTransactionDomain, snapshot: ConvergeTransactionDomain,
     """Forward recovery from a durable snapshot taken before the crash.
 
     T08: settlement record persisted but semantic application lost → re-apply once.
-    T09: crash during semantic apply loop → domain resumes from pre-state or
-    committed post-state, never partial.
+    T09: crash during semantic apply loop → domain resumes from pre-state snapshot
+    or committed post-state, never partial (transactional atomicity).
     """
     if crash_point == "after_settlement_before_apply":
         # Restore durable state, then forward-apply exactly once.
@@ -353,3 +403,14 @@ def recover(d: ConvergeTransactionDomain, snapshot: ConvergeTransactionDomain,
                 live = d.handles.get(hid) or st
                 live.applied = True
                 live.state = "Applied"
+    elif crash_point == "mid_apply_loop":
+        # R22: Transactional atomicity — if crash happened mid-apply,
+        # reset uncommitted partial RAM state back to pre-state durable snapshot
+        d.nodes.clear()
+        d.nodes.update({k: replace(v) for k, v in snapshot.nodes.items()})
+        d.frontier.clear()
+        d.frontier.extend(snapshot.frontier)
+        for hid, st in snapshot.handles.items():
+            if hid in d.handles:
+                d.handles[hid].applied = st.applied
+                d.handles[hid].state = st.state

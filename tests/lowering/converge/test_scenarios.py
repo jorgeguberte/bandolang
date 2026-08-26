@@ -14,7 +14,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 
 from model import (
-    CompletionRecord, ConvergeTransactionDomain, SearchStatus,
+    CompletionRecord, ConvergeTransactionDomain, SearchNode, SearchStatus,
     SettlementRecord,
 )
 from harness import CrashInjected, Harness
@@ -176,29 +176,40 @@ def t07():
 
 @scenario("T07B_EQUIVOCATION_CRASH")
 def t07b():
-    """Crash after durable conflict commit, before fatal control flow completes.
-    Recovery MUST recover the conflict; MUST NOT silently treat A as uncontested."""
+    """R22: Crash after durable conflict commit, before fatal control flow completes.
+    Recovery MUST reconstruct from durable state: conflict and obligations survive."""
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op8", "op8", "r8", "usd", 5)
     handle = h.step("emit", tx.emit_external, "r8")
     h.step("deliver-A", tx.admit_completion, handle, "rcpt-A", "digest-X")
 
-    snapshot = h.snapshot()   # durable state BEFORE conflict
+    # Conflict arrives on receipt B: admitted + persisted violation + fatal_close raised
     try:
         h.step("deliver-B", tx.admit_completion, handle, "rcpt-B", "digest-Y")
-        # admission persisted evidence atomically before raising; simulate crash
-        # right here — control flow dies but the durable write already happened.
-        h.inject_crash("after_conflict_commit_before_fatal_flow")
-    except (tx.FatalInvariantViolation, CrashInjected):
+    except tx.FatalInvariantViolation:
         pass
 
-    # Recovery: rebuild from RAM state that includes the durable violation record.
-    assert_true(len(d.protocol_violations) > 0,
+    # Take durable post-conflict crash snapshot
+    durable_crash_snapshot = h.snapshot()
+
+    # Simulate fresh process recovery from durable storage:
+    d_recovered = durable_crash_snapshot.copy()
+    h_rec = Harness(d_recovered)
+
+    assert_true(len(d_recovered.protocol_violations) > 0,
                 "conflict evidence lost across crash -- contradiction did not survive")
-    h.step("fatal-close", tx.fatal_close, "ProtocolConflict")
-    assert_true(d.closing_reason.kind == "PendingFailure", "frame not Closing(PendingFailure)")
-    assert_true(d.handles[handle].settlement is None or True,
-                "obligations must remain preservable through recovery")
+    assert_true(d_recovered.closing_reason.kind == "PendingFailure",
+                "recovery not in PendingFailure")
+    assert_true(d_recovered.handles[handle].settlement is None,
+                "unsettled obligation lost across crash")
+    assert_true(d_recovered.intent_reserved["usd"] == 5,
+                "reserved commitment lost across crash")
+
+    # Late settlement on recovered domain reconciles ledger exactly once:
+    h_rec.step("late-settle", tx.settle, handle, "usd", 5)
+    h_rec.step("drain", tx.finish_if_drained)
+    assert_true(d_recovered.frame_status == SearchStatus.FAILED,
+                f"expected Failed after drain, got {d_recovered.frame_status}")
 
 
 @scenario("T08_CRASH_AFTER_SETTLEMENT")
@@ -217,31 +228,38 @@ def t08():
     # forward recovery: settlement survives, application happens exactly once
     st = d.handles[handle]
     assert_true(st.settlement is not None, "settlement record lost in recovery")
-    applied_count_before = 1 if st.applied else 0
     from transitions import recover
     recover(d, snapshot, "after_settlement_before_apply")
-    assert_true(st.applied, "recovery did not forward-apply")
+    assert_true(st.applied and st.state == "Applied", "recovery did not forward-apply")
     # applying again is still a no-op (exactly-once)
     h.step("apply-idempotent", tx.apply_semantic, handle)
 
 
 @scenario("T09_CRASH_DURING_SEMANTIC_APPLY")
 def t09():
+    """R22: Crash mid-apply loop resets uncommitted partial RAM state back to durable pre-state."""
     d, h = new_domain()
     h.step("stage", tx.stage_local, "node:op10", "op10", "r10", "usd", 30)
     handle = h.step("emit", tx.emit_external, "r10")
     h.step("deliver", tx.admit_completion, handle, "rcpt-9", "digest-9")
+    h.step("settle", tx.settle, handle, "usd", 30)
     pre_state = h.snapshot()
-    # crash mid-loop: recovery must observe pre-state OR committed post-state,
-    # never partial. We model by restoring pre-state and re-applying once.
+
+    # Simulate partial uncommitted apply mutation in RAM
+    d.nodes["partial_node"] = SearchNode("partial_node", "Partial")
+    d.frontier.append("partial_node")
+
+    # Recover resets uncommitted partial state
     from transitions import recover
     recover(d, pre_state, "mid_apply_loop")
-    post = h.snapshot()
-    frontier_pre = list(pre_state.frontier)
-    assert_true(list(d.frontier) == frontier_pre or d.handles[handle].applied,
-                "partial state observed after recovery")
-    assert_true(not any(nd.status == "Partial" for nd in d.nodes.values()),
-                "partial node status leaked")
+
+    assert_true("partial_node" not in d.nodes, "partial node leaked after recovery")
+    assert_true(list(d.frontier) == list(pre_state.frontier), "frontier corrupted after recovery")
+    assert_true(not d.handles[handle].applied, "applied flag incorrectly set before committed apply")
+
+    # Now apply cleanly to commit
+    h.step("apply-clean", tx.apply_semantic, handle)
+    assert_true(d.handles[handle].applied and d.handles[handle].state == "Applied", "clean apply failed")
 
 
 @scenario("T10_CANCEL_WHILE_IN_FLIGHT")

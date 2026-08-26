@@ -121,11 +121,11 @@ class SemanticFrame:
 
             node = self.frontier.pop(0)
             op = prog.node_ops.get(node, OpDef(op_id=f"op:{node}"))
-            op_cost = op.charge() if op.kind == "external" else 0
+            op_ceiling = op.cost if op.kind == "external" else 0
 
-            # R15: CanAfford check against budget_limit in search policy
-            if self.budget_spent + op_cost > self.budget_limit:
-                # Unaffordable operation: cannot expand within budget
+            # R20: CanAfford check against budget_limit uses cost ceiling, not actual charge
+            if self.budget_spent + op_ceiling > self.budget_limit:
+                # Unaffordable operation under cost ceiling: cannot expand within budget
                 continue
 
             succs = list(prog.successors.get(node, []))
@@ -139,6 +139,14 @@ class SemanticFrame:
             # Candidates to check: the expanded node itself, then its successors
             candidates = [node] + succs
             for cand in candidates:
+                # R24: effectful satisfier
+                if prog.effectful_satisfier:
+                    es_cost = prog.effectful_satisfier.cost
+                    if self.budget_spent + es_cost > self.budget_limit:
+                        continue
+                    self.budget_spent += prog.effectful_satisfier.charge()
+                    self.effects.append(f"external({prog.effectful_satisfier.op_id})")
+
                 if self.check_satisfaction(cand, prog.satisfier_map, prog.on_satisfier_error):
                     return self.outcome
 

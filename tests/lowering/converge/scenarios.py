@@ -53,6 +53,8 @@ class ScenarioProgram:
     fault_spec: FaultSpec = field(default_factory=FaultSpec)
     # For D03: check a specific partial candidate after expansion fuel is exhausted
     check_partial_after_fuel: Optional[str] = None
+    # R24: effectful satisfier definition (own budget/cost, effects trace)
+    effectful_satisfier: Optional[OpDef] = None
 
 
 # =====================================================================
@@ -214,4 +216,40 @@ D14 = ScenarioProgram(
     },
     max_steps=6,
     budget_limit=100,
+)
+
+# R20: unaffordable cost ceiling (remaining headroom 40 < ceiling 60), actual charge would be 10 -> MUST NOT DISPATCH
+D15 = ScenarioProgram(
+    name="D15_unaffordable_ceiling_refused",
+    initial_frontier=["A"],
+    successors={"A": ["B"], "B": ["C"], "C": []},
+    node_ops={
+        "A": OpDef("opA", kind="external", cost=60),
+        "B": OpDef("opB", kind="external", cost=60, actual_cost=10), # ceiling 60 > remaining 40!
+        "C": OpDef("opC", kind="local"),
+    },
+    satisfier_map={
+        "A": ("ok", False, None),
+        "B": ("ok", False, None),
+        "C": ("ok", True, "T-unreached-goal"),
+    },
+    max_steps=6,
+    budget_limit=100,
+)
+
+# R24: effectful satisfier coverage (own budget, effect trace, settlement)
+D16 = ScenarioProgram(
+    name="D16_effectful_satisfier",
+    initial_frontier=["root"],
+    successors={"root": ["cand1"]},
+    node_ops={
+        "root": OpDef("opRoot", kind="local"),
+        "cand1": OpDef("opCand1", kind="local"),
+    },
+    satisfier_map={
+        "cand1": ("ok", True, "T-verified"),
+    },
+    max_steps=6,
+    budget_limit=100,
+    effectful_satisfier=OpDef("opVerify", kind="external", cost=5),
 )

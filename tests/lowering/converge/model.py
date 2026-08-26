@@ -77,6 +77,7 @@ class OutboxRecord:
     local_only: bool = False        # DISPATCH_LOCAL semantics: no observable Σ
     reserved_resource: str = "usd"
     reserved_amount: int = 0
+    is_expansion: bool = True       # True for space expansion, False for effectful satisfier
 
 
 @dataclass
