@@ -80,8 +80,11 @@ def i3_4_outcome_disjointness(state: ExecutionState) -> bool:
     return len(tags) <= 1
 
 
-def i3_5_no_false_clean_failure(outcome_val: Any) -> bool:
-    """I3.5: If target mutation occurred or is ambiguous, outcome is not CleanFailure."""
+def i3_5_no_false_clean_failure(outcome_val: Any, confirmed_applied_effects: list[str] | tuple[str, ...] | None = None) -> bool:
+    """I3.5: If target mutation occurred or physical ambiguity exists, outcome cannot be clean Failure."""
+    if confirmed_applied_effects and len(confirmed_applied_effects) > 0:
+        if isinstance(outcome_val, (ErrVal, ActFailureVal)):
+            return False
     if isinstance(outcome_val, (ActPartialVal, SettlementUnknownVal, DeliveryUnknownVal)):
         if isinstance(outcome_val, (ErrVal, ActFailureVal)):
             return False
@@ -105,10 +108,17 @@ def i3_7_await_effect_neutrality(effects_before_await: list[str],
 
 
 def i3_8_provenance_effect_separation(handle_type: ChildHandleType,
-                                     concrete_lineage: tuple[str, ...]) -> bool:
-    """I3.8: Concrete result lineage reflects actual execution, NOT full may-effects set."""
-    # If may_effects has multiple operations from unexecuted branches,
-    # concrete_lineage must not falsely include unexecuted operations.
+                                     concrete_lineage: tuple[str, ...],
+                                     actual_executed_child: str | None = None) -> bool:
+    """I3.8: Concrete result lineage reflects actual execution, NOT full may-effects set (J3)."""
+    # If concrete_lineage claims execution of an unexecuted child or operation, it is a provenance violation
+    if actual_executed_child is not None:
+        expected = (f"exec({actual_executed_child})",)
+        return concrete_lineage == expected
+    # Lineage must not blindly equal may_effects summary if multiple alternative branches exist
+    if len(handle_type.may_effects) > 1 and len(concrete_lineage) == len(handle_type.may_effects):
+        # Provably fabricated if it claims all alternative branches executed
+        return False
     return True
 
 
@@ -119,4 +129,9 @@ def check_all_invariants(state: ExecutionState) -> list[str]:
         violations.append("I3.1_ResultFactSoundness")
     if not i3_4_outcome_disjointness(state):
         violations.append("I3.4_OutcomeDisjointness")
+    for var, val in state.env.items():
+        if isinstance(val, (ActFailureVal, ErrVal)):
+            # Ensure no partial/applied mutations exist
+            if any(f.name == "IsPartial" for f in state.psi):
+                violations.append("I3.5_NoFalseCleanFailure")
     return violations

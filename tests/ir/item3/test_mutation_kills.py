@@ -156,12 +156,16 @@ kill("K5_UNKNOWN_COERCED_TO_ERR", k5)
 # =====================================================================
 
 def k6():
-    # Fabricate state where PartialCompletion is labeled as IsFailure
+    # Fabricate state where PartialCompletion is labeled as clean IsFailure / ErrVal
+    report = PartialEffectReport("act_batch", ("step1",), ("step2",), "rcpt-1")
     st = ExecutionState(
         current_block="part_block",
-        psi=frozenset([Fact("IsPartial", ("act",)), Fact("IsFailure", ("act",))]),
+        env={"act": ErrVal("err", STRING)},
+        psi=frozenset([Fact("IsFailure", ("act",)), Fact("IsPartial", ("act",))]),
     )
-    return i3_4_outcome_disjointness(st)
+    valid_34 = i3_4_outcome_disjointness(st)
+    valid_35 = i3_5_no_false_clean_failure(ErrVal("err", STRING), confirmed_applied_effects=report.confirmed_applied)
+    return valid_34 and valid_35
 
 kill("K6_PARTIAL_COERCED_TO_ERR", k6)
 
@@ -218,9 +222,10 @@ kill("K9_HANDLE_JOIN_DROPS_EFFECTS", k9)
 
 def k10():
     # Execution ran workerA only, but lineage was falsely widened to include unexecuted workerB
-    actual_exec = ("exec(workerA)",)
+    h_type = ChildHandleType(STRING, STRING, frozenset(["read[x]", "act[y]", "infer[z]"]))
     fake_lineage = ("exec(workerA)", "exec(workerB)")
-    return actual_exec == fake_lineage
+    # J3: MUST call i3_8_provenance_effect_separation
+    return i3_8_provenance_effect_separation(h_type, fake_lineage, actual_executed_child="workerA")
 
 kill("K10_HANDLE_JOIN_INVENTS_LINEAGE", k10)
 

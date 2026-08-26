@@ -1,15 +1,18 @@
-"""cfg_model.py — Executable Lowered CFG Interpreter & Path Fact Analyzer for SOMA-IR Item 3.
+"""cfg_model.py — Executable Lowered CFG Interpreter & Dataflow Fact Analyzer for SOMA-IR Item 3.
 
 Implements:
 1. SSA Environment & Block Argument Passing (no phi nodes)
-2. Latent Postcondition Refinement on SwitchResult & SwitchActOutcome (Track A)
-3. Must-Fact Intersection Merge at CFG Join Points (with SSA symbol renaming)
-4. Settlement & Physical Ambiguity Handling (Track B)
-5. Partial Completion Distinguishability & Transactional Rejection (Track C)
-6. ChildHandle May-Effect Join, Await Effect Neutrality, and Concrete Lineage (Track D)
+2. Static CFG Worklist / Fixed-Point Fact Analyzer over CFG edges (J1):
+   Ψ_in(block) = ⋂_{pred} rename_edge(Ψ_out(pred -> block))
+3. Block-Argument Type Derivation & May-Effect Union Join (J2)
+4. Latent Postcondition Refinement on SwitchResult & SwitchActOutcome (Track A)
+5. Settlement & Physical Ambiguity Handling (Track B)
+6. Partial Completion Distinguishability & Transactional Rejection (Track C)
+7. ChildHandle May-Effect Join, Await Effect Neutrality, and Concrete Lineage (Track D)
 """
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -48,6 +51,273 @@ class ExecutionState:
     return_value: Any = None
 
 
+# ---------------------------------------------------------------------
+# Static CFG Dataflow & Type Join Analyzer (J1 & J2)
+# ---------------------------------------------------------------------
+
+@dataclass
+class AnalysisResult:
+    block_in_facts: dict[str, frozenset[Fact]]
+    block_out_facts: dict[str, frozenset[Fact]]
+    edge_facts: dict[tuple[str, str], frozenset[Fact]]
+    derived_block_param_types: dict[str, list[Type]]
+
+
+class CFGDataflowAnalyzer:
+    """Computes static greatest fixed-point for must-facts Ψ across all CFG edges and derives block argument types."""
+    def __init__(self, prog: CFGProgram):
+        self.prog = prog
+
+    def analyze(self) -> AnalysisResult:
+        # 1. First pass: Collect instruction definitions, types, and latent metadata
+        var_types: dict[str, Type] = {}
+        var_latent: dict[str, LatentPostconditions] = {}
+
+        for b in self.prog.blocks.values():
+            for p in b.params:
+                var_types[p.name] = p.val_type
+            for inst in b.instructions:
+                if isinstance(inst, (InstRead, InstInfer, InstVerify, InstAct)):
+                    var_types[inst.dest.name] = inst.dest.val_type
+                    var_latent[inst.dest.name] = inst.latent
+                elif isinstance(inst, InstSpawnChild):
+                    var_types[inst.dest.name] = ChildHandleType(inst.ok_type, inst.err_type, inst.may_effects)
+                    var_latent[inst.dest.name] = inst.latent
+                elif isinstance(inst, InstAssign):
+                    var_types[inst.dest.name] = inst.dest.val_type
+                    if isinstance(inst.source, Variable) and inst.source.name in var_latent:
+                        var_latent[inst.dest.name] = var_latent[inst.source.name]
+                elif isinstance(inst, InstAwaitHandle):
+                    h_type = var_types.get(inst.handle.name)
+                    if isinstance(h_type, ChildHandleType):
+                        var_types[inst.dest.name] = ResultType(h_type.ok_type, h_type.err_type)
+
+        # 2. Derive block argument types from ALL incoming predecessor edges (J2)
+        derived_param_types: dict[str, list[Type]] = {}
+        for b_name, b in self.prog.blocks.items():
+            if b_name == self.prog.entry:
+                derived_param_types[b_name] = [p.val_type for p in b.params]
+                continue
+
+            # Collect arguments from all predecessors
+            preds = self._find_predecessors(b_name)
+            if not preds:
+                derived_param_types[b_name] = [p.val_type for p in b.params]
+                continue
+
+            derived_types: list[Type] = []
+            for i, p in enumerate(b.params):
+                incoming_arg_types = []
+                for p_name, term in preds:
+                    args = self._get_terminator_args_for_target(term, b_name)
+                    if i < len(args):
+                        arg = args[i]
+                        if isinstance(arg, Variable):
+                            arg_t = var_types.get(arg.name, p.val_type)
+                        else:
+                            arg_t = arg.val_type
+                        incoming_arg_types.append(arg_t)
+
+                if incoming_arg_types and all(isinstance(t, ChildHandleType) for t in incoming_arg_types):
+                    # Check compatibility (R15)
+                    first_h = incoming_arg_types[0]
+                    for other_h in incoming_arg_types[1:]:
+                        if not first_h.is_compatible_for_join(other_h):
+                            raise TypeError(f"Incompatible handle types arriving at block '{b_name}' param '{p.name}': {first_h} vs {other_h}")
+                    # J2: derive union of may-effects from all incoming predecessors
+                    combined_effects = frozenset().union(*(t.may_effects for t in incoming_arg_types))
+                    derived_h_type = ChildHandleType(first_h.ok_type, first_h.err_type, combined_effects)
+                    derived_types.append(derived_h_type)
+                    var_types[p.name] = derived_h_type
+                elif incoming_arg_types:
+                    # Validate all incoming types match
+                    first_t = incoming_arg_types[0]
+                    for other_t in incoming_arg_types[1:]:
+                        if first_t != other_t:
+                            raise TypeError(f"Type mismatch arriving at block '{b_name}' param '{p.name}': {first_t} vs {other_t}")
+                    derived_types.append(first_t)
+                    var_types[p.name] = first_t
+                else:
+                    derived_types.append(p.val_type)
+
+            derived_param_types[b_name] = derived_types
+
+        # 3. Worklist fixed-point analysis for path facts Ψ (J1)
+        edge_facts: dict[tuple[str, str], frozenset[Fact]] = {}
+        block_in_facts: dict[str, frozenset[Fact]] = {b_name: frozenset() for b_name in self.prog.blocks}
+        block_out_facts: dict[str, frozenset[Fact]] = {b_name: frozenset() for b_name in self.prog.blocks}
+
+        # Initialize reachable set and worklist
+        worklist = deque([self.prog.entry])
+        visited_blocks = set()
+
+        while worklist:
+            curr = worklist.popleft()
+            block = self.prog.blocks[curr]
+            in_facts = block_in_facts[curr]
+
+            # Compute block out facts (instructions do not eagerly emit latent postconditions)
+            out_facts = in_facts
+            block_out_facts[curr] = out_facts
+
+            # Transfer across terminator edges
+            term = block.terminator
+            succ_edges = self._compute_successor_edges(curr, term, out_facts, var_latent)
+
+            for succ, facts_on_edge in succ_edges:
+                edge_key = (curr, succ)
+                edge_facts[edge_key] = facts_on_edge
+
+                # Recompute Ψ_in(succ) as intersection of all active incoming edges (J1)
+                incoming_to_succ = [edge_facts[(p_name, succ)]
+                                    for p_name, _ in self._find_predecessors(succ)
+                                    if (p_name, succ) in edge_facts]
+
+                if incoming_to_succ:
+                    new_succ_in = incoming_to_succ[0]
+                    for inc in incoming_to_succ[1:]:
+                        new_succ_in = new_succ_in & inc
+                else:
+                    new_succ_in = frozenset()
+
+                # If fixed point changed or first visit, add to worklist
+                if succ not in visited_blocks or new_succ_in != block_in_facts[succ]:
+                    visited_blocks.add(succ)
+                    block_in_facts[succ] = new_succ_in
+                    if succ not in worklist:
+                        worklist.append(succ)
+
+        return AnalysisResult(
+            block_in_facts=block_in_facts,
+            block_out_facts=block_out_facts,
+            edge_facts=edge_facts,
+            derived_block_param_types=derived_param_types,
+        )
+
+    def _find_predecessors(self, target_name: str) -> list[tuple[str, Terminator]]:
+        preds = []
+        for b_name, b in self.prog.blocks.items():
+            if target_name in self._get_terminator_targets(b.terminator):
+                preds.append((b_name, b.terminator))
+        return preds
+
+    def _get_terminator_targets(self, term: Terminator) -> list[str]:
+        if isinstance(term, TermBr):
+            return [term.target]
+        elif isinstance(term, TermCondBr):
+            return [term.true_target, term.false_target]
+        elif isinstance(term, TermSwitchResult):
+            return [term.ok_target, term.err_target]
+        elif isinstance(term, TermSwitchActOutcome):
+            targets = [term.success_target, term.failure_target]
+            if term.partial_target:
+                targets.append(term.partial_target)
+            if term.unknown_target:
+                targets.append(term.unknown_target)
+            return targets
+        return []
+
+    def _get_terminator_args_for_target(self, term: Terminator, target: str) -> tuple[Variable | Constant, ...]:
+        if isinstance(term, TermBr) and term.target == target:
+            return term.args
+        elif isinstance(term, TermCondBr):
+            if term.true_target == target:
+                return term.true_args
+            if term.false_target == target:
+                return term.false_args
+        elif isinstance(term, TermSwitchResult):
+            if term.ok_target == target:
+                return (term.ok_arg,)
+            if term.err_target == target:
+                return (term.err_arg,)
+        elif isinstance(term, TermSwitchActOutcome):
+            if term.success_target == target:
+                return (term.success_arg,)
+            if term.failure_target == target:
+                return (term.failure_arg,)
+            if term.partial_target == target and term.partial_arg:
+                return (term.partial_arg,)
+        return ()
+
+    def _compute_successor_edges(self, src: str, term: Terminator,
+                                 base_facts: frozenset[Fact],
+                                 var_latent: dict[str, LatentPostconditions]) -> list[tuple[str, frozenset[Fact]]]:
+        edges = []
+        if isinstance(term, TermBr):
+            target_block = self.prog.blocks[term.target]
+            renaming = self._build_renaming(term.args, target_block.params)
+            renamed = frozenset(f.rename(renaming) for f in base_facts)
+            edges.append((term.target, renamed))
+
+        elif isinstance(term, TermCondBr):
+            t_block = self.prog.blocks[term.true_target]
+            t_ren = self._build_renaming(term.true_args, t_block.params)
+            t_facts = frozenset(f.rename(t_ren) for f in (base_facts | frozenset([Fact("IsTrue", (term.cond.name,))])))
+            edges.append((term.true_target, t_facts))
+
+            f_block = self.prog.blocks[term.false_target]
+            f_ren = self._build_renaming(term.false_args, f_block.params)
+            f_facts = frozenset(f.rename(f_ren) for f in (base_facts | frozenset([Fact("IsFalse", (term.cond.name,))])))
+            edges.append((term.false_target, f_facts))
+
+        elif isinstance(term, TermSwitchResult):
+            latent = var_latent.get(term.result_var.name, LatentPostconditions())
+            ok_block = self.prog.blocks[term.ok_target]
+            ok_ren = self._build_renaming((term.ok_arg,), ok_block.params)
+            ok_facts = frozenset(f.rename(ok_ren) for f in (
+                base_facts | frozenset([Fact("IsOk", (term.result_var.name,))]) | latent.instantiate_ok(term.ok_arg.name)
+            ))
+            edges.append((term.ok_target, ok_facts))
+
+            err_block = self.prog.blocks[term.err_target]
+            err_ren = self._build_renaming((term.err_arg,), err_block.params)
+            err_facts = frozenset(f.rename(err_ren) for f in (
+                base_facts | frozenset([Fact("IsErr", (term.result_var.name,))]) | latent.instantiate_err(term.err_arg.name)
+            ))
+            edges.append((term.err_target, err_facts))
+
+        elif isinstance(term, TermSwitchActOutcome):
+            latent = var_latent.get(term.outcome_var.name, LatentPostconditions())
+            s_block = self.prog.blocks[term.success_target]
+            s_ren = self._build_renaming((term.success_arg,), s_block.params)
+            s_facts = frozenset(f.rename(s_ren) for f in (
+                base_facts | frozenset([Fact("IsSuccess", (term.outcome_var.name,))]) | latent.instantiate_ok(term.success_arg.name)
+            ))
+            edges.append((term.success_target, s_facts))
+
+            fl_block = self.prog.blocks[term.failure_target]
+            fl_ren = self._build_renaming((term.failure_arg,), fl_block.params)
+            fl_facts = frozenset(f.rename(fl_ren) for f in (
+                base_facts | frozenset([Fact("IsFailure", (term.outcome_var.name,))]) | latent.instantiate_err(term.failure_arg.name)
+            ))
+            edges.append((term.failure_target, fl_facts))
+
+            if term.partial_target and term.partial_arg:
+                p_block = self.prog.blocks[term.partial_target]
+                p_ren = self._build_renaming((term.partial_arg,), p_block.params)
+                p_facts = frozenset(f.rename(p_ren) for f in (
+                    base_facts | frozenset([Fact("IsPartial", (term.outcome_var.name,))]) | latent.instantiate_partial(term.partial_arg.name)
+                ))
+                edges.append((term.partial_target, p_facts))
+
+            if term.unknown_target:
+                u_facts = base_facts | frozenset([Fact("IsUnknown", (term.outcome_var.name,))])
+                edges.append((term.unknown_target, u_facts))
+
+        return edges
+
+    def _build_renaming(self, args: tuple[Variable | Constant, ...], params: list[Variable]) -> dict[str, str]:
+        renaming = {}
+        for i, p in enumerate(params):
+            if i < len(args) and isinstance(args[i], Variable):
+                renaming[args[i].name] = p.name
+        return renaming
+
+
+# ---------------------------------------------------------------------
+# Dynamic CFG Execution Interpreter
+# ---------------------------------------------------------------------
+
 class CFGInterpreter:
     def __init__(self, prog: CFGProgram):
         self.prog = prog
@@ -62,7 +332,6 @@ class CFGInterpreter:
         if not entry_block:
             raise CFGExecutionError(f"Entry block '{self.prog.entry}' not found")
 
-        # Map entry parameters
         for param in entry_block.params:
             if param.name in inputs:
                 state.var_types[param.name] = param.val_type
@@ -169,7 +438,6 @@ class CFGInterpreter:
             dest_name = inst.dest.name
             handle_type = ChildHandleType(inst.ok_type, inst.err_type, inst.may_effects)
             state.var_types[dest_name] = handle_type
-            # Runtime handle carrying concrete execution provenance
             val = state.env.get(dest_name)
             if val is None:
                 val = ChildHandleVal(
@@ -249,7 +517,6 @@ class CFGInterpreter:
             if isinstance(res_val, OkVal):
                 unwrapped_val = res_val.value
                 val_sym = term.ok_arg.name
-                # Materialize on_ok postconditions bound to unwrapped SSA symbol
                 ok_facts = frozenset([Fact("IsOk", (term.result_var.name,))]) | latent.instantiate_ok(val_sym)
                 self._transfer_control(
                     src_block=state.current_block,
@@ -324,7 +591,6 @@ class CFGInterpreter:
                         state=state,
                     )
                 else:
-                    # Track B: Unknown cannot collapse to clean Err; frame suspends
                     state.status = "SuspendedWaiting"
 
     def _transfer_control(self, src_block: str, target_block: str,
@@ -337,7 +603,6 @@ class CFGInterpreter:
         if not target:
             raise CFGExecutionError(f"Target block '{target_block}' does not exist")
 
-        # 1. Bind block arguments and build SSA symbol renaming map
         renaming_map: dict[str, str] = {}
         new_env = dict(state.env)
         if extra_env:
@@ -350,33 +615,25 @@ class CFGInterpreter:
                     val = state.env.get(arg.name)
                     new_env[param.name] = val
                     renaming_map[arg.name] = param.name
-                    # Type transfer / join (Track D)
                     src_type = state.var_types.get(arg.name, param.val_type)
                     if isinstance(src_type, ChildHandleType) and isinstance(param.val_type, ChildHandleType):
-                        # Join may-effects
                         state.var_types[param.name] = param.val_type.join(src_type)
                     else:
                         state.var_types[param.name] = param.val_type
-                    # Lineage transfer
                     if arg.name in state.value_lineage:
                         state.value_lineage[param.name] = state.value_lineage[arg.name]
-                    # Latent postcondition transfer (R06)
                     if arg.name in state.var_latent:
                         state.var_latent[param.name] = state.var_latent[arg.name]
                 elif isinstance(arg, Constant):
                     new_env[param.name] = arg.val
                     state.var_types[param.name] = arg.val_type
 
-        # 2. Path Facts (Ψ) propagation & renaming (Track A)
-        # Rename outgoing predecessor facts to match new block argument symbols
         renamed_pred_facts = frozenset(f.rename(renaming_map) for f in state.psi)
         outgoing_facts = renamed_pred_facts | refinement_facts
 
-        # Must-Fact Merge (R04/R05):
-        # If target block was already visited from another predecessor, compute intersection!
         if target_block in state.block_entry_psi:
             prior_psi = state.block_entry_psi[target_block]
-            merged_psi = prior_psi & outgoing_facts  # Strict intersection merge
+            merged_psi = prior_psi & outgoing_facts
         else:
             merged_psi = outgoing_facts
 

@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
-from cfg_model import CFGInterpreter, ExecutionState
+from cfg_model import CFGDataflowAnalyzer, CFGInterpreter, ExecutionState
 from invariants import (
     check_all_invariants, i3_1_result_fact_soundness, i3_2_no_eager_latent_discharge,
     i3_3_cfg_must_fact_merge, i3_4_outcome_disjointness, i3_5_no_false_clean_failure,
@@ -107,47 +107,23 @@ def r03():
 @scenario("R04_MERGE_LOSES_BRANCH_ONLY_FACT")
 def r04():
     prog = build_r04_r05_program(common_fact=False)
-    latent_ok = LatentPostconditions(on_ok=(FactTemplate("BranchOnlyFact", ("$value",)),))
-    latent_err = LatentPostconditions()
-
-    # Execute through Ok branch
-    interp_ok = CFGInterpreter(prog)
-    state_ok = interp_ok.execute({"r": OkVal("doc_val", STRING, latent_ok)})
-    psi_from_ok = state_ok.psi
-
-    # Execute through Err branch
-    interp_err = CFGInterpreter(prog)
-    state_err = interp_err.execute({"r": ErrVal("read_err", STRING, latent_err)})
-    psi_from_err = state_err.psi
-
-    # Intersection merge
-    merged_psi = psi_from_ok & psi_from_err
-    assert_true(not any(f.name == "BranchOnlyFact" for f in merged_psi),
-                f"branch-only fact survived merge intersection: {merged_psi}")
+    # J1: Static CFG dataflow fixed-point analyzer computes Ψ_in(merge) directly
+    analyzer = CFGDataflowAnalyzer(prog)
+    res = analyzer.analyze()
+    merge_facts = res.block_in_facts["merge"]
+    assert_true(not any(f.name == "BranchOnlyFact" for f in merge_facts),
+                f"branch-only fact survived merge intersection: {merge_facts}")
 
 
 @scenario("R05_MERGE_PRESERVES_COMMON_FACT")
 def r05():
     prog = build_r04_r05_program(common_fact=True)
-    latent_ok = LatentPostconditions(
-        on_ok=(FactTemplate("BranchOnlyFact", ("$value",)), FactTemplate("CommonFact", ("doc",)))
-    )
-    latent_err = LatentPostconditions(
-        on_err=(FactTemplate("CommonFact", ("doc",)),)
-    )
-
-    interp_ok = CFGInterpreter(prog)
-    state_ok = interp_ok.execute({"r": OkVal("doc_val", STRING, latent_ok)})
-    psi_from_ok = state_ok.psi
-
-    interp_err = CFGInterpreter(prog)
-    state_err = interp_err.execute({"r": ErrVal("read_err", STRING, latent_err)})
-    psi_from_err = state_err.psi
-
-    merged_psi = psi_from_ok & psi_from_err
-    assert_true(any(f.name == "CommonFact" and f.args == ("doc",) for f in merged_psi),
-                f"common fact lost on merge intersection: {merged_psi}")
-    assert_true(i3_3_cfg_must_fact_merge([psi_from_ok, psi_from_err], merged_psi), "I3.3 violated")
+    # J1: Static CFG dataflow fixed-point analyzer computes Ψ_in(merge) directly
+    analyzer = CFGDataflowAnalyzer(prog)
+    res = analyzer.analyze()
+    merge_facts = res.block_in_facts["merge"]
+    assert_true(any(f.name == "CommonFact" and f.args == ("doc",) for f in merge_facts),
+                f"common fact lost on merge intersection: {merge_facts}")
 
 
 @scenario("R06_FORWARDED_RESULT_REMAINS_LATENT")
@@ -166,11 +142,15 @@ def r06():
 @scenario("R07_LOOP_LEAKAGE_KILL")
 def r07():
     prog = build_r07_loop_program()
-    interp = CFGInterpreter(prog)
-    # Run loop iteration 0 (exit immediately)
-    state_exit0 = interp.execute({"cond": False})
-    assert_true(not any(f.name == "IterationFact" for f in state_exit0.psi),
-                f"loop iteration fact leaked to exit path without execution: {state_exit0.psi}")
+    # J1: Static CFG dataflow analyzer converges over backedge to fixed point
+    analyzer = CFGDataflowAnalyzer(prog)
+    res = analyzer.analyze()
+    header_facts = res.block_in_facts["loop_header"]
+    exit_facts = res.block_in_facts["exit"]
+    assert_true(not any(f.name == "IterationFact" for f in header_facts),
+                f"loop iteration fact leaked to loop header: {header_facts}")
+    assert_true(not any(f.name == "IterationFact" for f in exit_facts),
+                f"loop iteration fact leaked to exit block: {exit_facts}")
 
 
 # =====================================================================
@@ -253,25 +233,27 @@ def r12():
 @scenario("R13_HANDLE_SAME_EFFECTS_JOIN")
 def r13():
     prog = build_r13_r18_handle_join_program(same_effects=True)
-    interp = CFGInterpreter(prog)
-    state = interp.execute({"c": True})
-    t_join = state.var_types["h_joined"]
-    assert_true(isinstance(t_join, ChildHandleType), "h_joined is not ChildHandleType")
-    assert_true(t_join.may_effects == frozenset(["read[x]"]), f"wrong may_effects: {t_join.may_effects}")
+    # J2: Derive block argument types from incoming predecessor edges
+    analyzer = CFGDataflowAnalyzer(prog)
+    res = analyzer.analyze()
+    derived_t = res.derived_block_param_types["merge_handle"][0]
+    assert_true(isinstance(derived_t, ChildHandleType), "merged param is not ChildHandleType")
+    assert_true(derived_t.may_effects == frozenset(["read[x]"]), f"wrong may_effects: {derived_t.may_effects}")
 
 
 @scenario("R14_HANDLE_HETEROGENEOUS_EFFECTS_JOIN")
 def r14():
     prog = build_r13_r18_handle_join_program(same_effects=False)
-    interp = CFGInterpreter(prog)
-    state_l = interp.execute({"c": True})
-    t_join_l = state_l.var_types["h_joined"]
+    # J2: Derive union of may-effects from incoming predecessor edges
+    analyzer = CFGDataflowAnalyzer(prog)
+    res = analyzer.analyze()
+    derived_t = res.derived_block_param_types["merge_handle"][0]
     expected_union = frozenset(["read[x]", "act[y]", "infer[z]"])
-    assert_true(t_join_l.may_effects == expected_union, f"expected {expected_union}, got {t_join_l.may_effects}")
+    assert_true(derived_t.may_effects == expected_union, f"expected {expected_union}, got {derived_t.may_effects}")
     assert_true(i3_6_handle_effect_monotonicity(
         ChildHandleType(STRING, STRING, frozenset(["read[x]"])),
         ChildHandleType(STRING, STRING, frozenset(["act[y]", "infer[z]"])),
-        t_join_l,
+        derived_t,
     ), "I3.6 violated")
 
 
@@ -355,19 +337,13 @@ def x1():
 @scenario("X2_PARTIAL_MERGE_INTEGRATION")
 def x2():
     prog = build_x2_partial_merge_integration()
-    interp_a = CFGInterpreter(prog)
-    st_a = interp_a.execute({"c": True, "act_a": ActSuccessVal("cluster_ok", STRING)})
-
-    interp_b = CFGInterpreter(prog)
-    report = PartialEffectReport("update_cluster_b", ("node1",), ("node2",), "rcpt-x2")
-    st_b = interp_b.execute({"c": False, "act_b": ActPartialVal(report)})
-
-    merged_psi = st_a.psi & st_b.psi
-    # Common fact survives
-    assert_true(any(f.name == "ClusterKnown" for f in merged_psi), f"common ClusterKnown lost: {merged_psi}")
-    # Exclusive success facts are lost
-    assert_true(not any(f.name == "CompleteSuccessFact" for f in merged_psi), f"CompleteSuccessFact leaked: {merged_psi}")
-    assert_true(not any(f.name == "PartialFootprintFact" for f in merged_psi), f"PartialFootprintFact leaked: {merged_psi}")
+    # J1: Static CFG dataflow analyzer computes merge intersection directly
+    analyzer = CFGDataflowAnalyzer(prog)
+    res = analyzer.analyze()
+    merge_facts = res.block_in_facts["merge"]
+    assert_true(any(f.name == "ClusterKnown" for f in merge_facts), f"common ClusterKnown lost: {merge_facts}")
+    assert_true(not any(f.name == "CompleteSuccessFact" for f in merge_facts), f"CompleteSuccessFact leaked: {merge_facts}")
+    assert_true(not any(f.name == "PartialFootprintFact" for f in merge_facts), f"PartialFootprintFact leaked: {merge_facts}")
 
 
 @scenario("X3_X4_HANDLE_AWAIT_REFINEMENT_INTEGRATION")

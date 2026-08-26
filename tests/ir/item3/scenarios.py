@@ -126,21 +126,18 @@ def build_r03_program() -> CFGProgram:
 def build_r04_r05_program(common_fact: bool = False) -> CFGProgram:
     """R04/R05: Merge must-facts intersection: branch-only fact is lost; common fact survives."""
     if common_fact:
-        latent_ok = LatentPostconditions(
-            on_ok=(FactTemplate("BranchOnlyFact", ("$value",)), FactTemplate("CommonFact", ("doc",)))
-        )
-        latent_err = LatentPostconditions(
-            on_err=(FactTemplate("CommonFact", ("doc",)),)
+        latent = LatentPostconditions(
+            on_ok=(FactTemplate("BranchOnlyFact", ("$value",)), FactTemplate("CommonFact", ("doc",))),
+            on_err=(FactTemplate("CommonFact", ("doc",)),),
         )
     else:
-        latent_ok = LatentPostconditions(
+        latent = LatentPostconditions(
             on_ok=(FactTemplate("BranchOnlyFact", ("$value",)),)
         )
-        latent_err = LatentPostconditions()
     b_entry = BasicBlock(
         name="entry",
         instructions=[
-            InstRead(dest=Variable("r", ResultType(STRING, STRING)), target="doc", latent=latent_ok)
+            InstRead(dest=Variable("r", ResultType(STRING, STRING)), target="doc", latent=latent)
         ],
         terminator=TermSwitchResult(
             result_var=Variable("r", ResultType(STRING, STRING)),
@@ -391,8 +388,10 @@ def build_x1_result_act_integration() -> CFGProgram:
 
 def build_x2_partial_merge_integration() -> CFGProgram:
     """X2: Partial + Merge: CompleteSuccess on branch A, PartialCompletion on branch B merge cleanly."""
-    latent = LatentPostconditions(
+    latent_a = LatentPostconditions(
         on_ok=(FactTemplate("CompleteSuccessFact", ("cluster",)), FactTemplate("ClusterKnown", ("cluster",))),
+    )
+    latent_b = LatentPostconditions(
         on_partial=(FactTemplate("PartialFootprintFact", ("$report",)), FactTemplate("ClusterKnown", ("cluster",))),
     )
     b_entry = BasicBlock(
@@ -408,26 +407,26 @@ def build_x2_partial_merge_integration() -> CFGProgram:
     b_a = BasicBlock(
         name="branch_a",
         instructions=[
-            InstAct(dest=Variable("act_a", ActOutcomeType(STRING, STRING)), op_id="update_cluster_a", is_atomic=False, latent=latent)
+            InstAct(dest=Variable("act_a", ActOutcomeType(STRING, STRING)), op_id="update_cluster_a", is_atomic=False, latent=latent_a)
         ],
         terminator=TermSwitchActOutcome(
             outcome_var=Variable("act_a", ActOutcomeType(STRING, STRING)),
             success_target="merge",
             success_arg=Variable("res_a", STRING),
-            failure_target="merge",
+            failure_target="fail_exit",
             failure_arg=Variable("res_a", STRING),
         ),
     )
     b_b = BasicBlock(
         name="branch_b",
         instructions=[
-            InstAct(dest=Variable("act_b", ActOutcomeType(STRING, STRING)), op_id="update_cluster_b", is_atomic=False, latent=latent)
+            InstAct(dest=Variable("act_b", ActOutcomeType(STRING, STRING)), op_id="update_cluster_b", is_atomic=False, latent=latent_b)
         ],
         terminator=TermSwitchActOutcome(
             outcome_var=Variable("act_b", ActOutcomeType(STRING, STRING)),
-            success_target="merge",
+            success_target="succ_exit",
             success_arg=Variable("res_b", STRING),
-            failure_target="merge",
+            failure_target="fail_exit",
             failure_arg=Variable("res_b", STRING),
             partial_target="merge",
             partial_arg=Variable("res_b", STRING),
@@ -438,8 +437,12 @@ def build_x2_partial_merge_integration() -> CFGProgram:
         params=[Variable("res_m", STRING)],
         terminator=TermReturn(Variable("res_m", STRING)),
     )
+    b_succ_exit = BasicBlock(name="succ_exit", params=[Variable("v_s", STRING)], terminator=TermReturn(Variable("v_s", STRING)))
+    b_fail_exit = BasicBlock(name="fail_exit", params=[Variable("v_f", STRING)], terminator=TermReturn(Variable("v_f", STRING)))
+
     return CFGProgram(name="X2_partial_merge_integration", entry="entry", blocks={
         "entry": b_entry, "branch_a": b_a, "branch_b": b_b, "merge": b_merge,
+        "succ_exit": b_succ_exit, "fail_exit": b_fail_exit,
     })
 
 
