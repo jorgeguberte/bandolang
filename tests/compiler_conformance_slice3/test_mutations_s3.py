@@ -140,9 +140,9 @@ def s3m02_allow_requested_below_child():
     mutant["mutations"] = {"s3m02_allow_requested_below_child": True}
 
     def check(base, mut):
-        if base["status"] == "verifier_error":
-            return True, "baseline strictly rejected invocation ceiling below child"
-        return False, "verifier accepted"
+        if base["status"] == "verifier_error" and mut["status"] == "ok":
+            return True, "baseline strictly rejected invocation ceiling below child, mutant bypassed check"
+        return False, f"base={base['status']}, mut={mut['status']}"
 
     run_mutation_kill("S3M02_allow_requested_below_child", prog, mutant, check)
 
@@ -183,9 +183,9 @@ def s3m03_allow_requested_above_exported():
     mutant["mutations"] = {"s3m03_allow_requested_above_exported": True}
 
     def check(base, mut):
-        if base["status"] == "verifier_error":
-            return True, "baseline rejected requested ceiling exceeding exported envelope"
-        return False, "verifier accepted"
+        if base["status"] == "verifier_error" and mut["status"] == "ok":
+            return True, "baseline rejected requested ceiling exceeding exported envelope, mutant bypassed check"
+        return False, f"base={base['status']}, mut={mut['status']}"
 
     run_mutation_kill("S3M03_allow_requested_above_exported", prog, mutant, check)
 
@@ -317,9 +317,9 @@ def s3m06_child_runtime_confinement():
     mutant["mutations"] = {"s3m06_child_runtime_allows_out_of_ceiling": True}
 
     def check(base, mut):
-        if "ConfinementViolation" in base["status"]:
-            return True, "baseline blocked out-of-ceiling child effect execution"
-        return False, "confinement failed"
+        if "ConfinementViolation" in base["status"] and mut["status"] == "ok":
+            return True, "baseline blocked out-of-ceiling child effect execution, mutant bypassed confinement"
+        return False, f"base={base['status']}, mut={mut['status']}"
 
     run_mutation_kill("S3M06_child_runtime_confinement", prog, mutant, check)
 
@@ -455,12 +455,11 @@ def s3m09_duplicate_settlement_refunds_twice():
     mutant["mutations"] = {"s3m09_duplicate_settlement_refunds_twice": True}
 
     def check(base, mut):
-        b_evs = base.get("child_events", [])
-        m_evs = mut.get("child_events", [])
-        b_settled = sum(1 for e in b_evs if "Settled" in e)
-        if b_settled == 1:
-            return True, "baseline settled exactly once, preventing double refund"
-        return False, "duplicate settlement occurred"
+        b_avail = base.get("frame_ledgers", {}).get("root", {}).get("available", {}).get("compute", 0)
+        m_avail = mut.get("frame_ledgers", {}).get("root", {}).get("available", {}).get("compute", 0)
+        if b_avail == 100 and m_avail > 100:
+            return True, f"baseline settled once (root available {b_avail}), mutant refunded twice (root available {m_avail})"
+        return False, f"base={b_avail}, mut={m_avail}"
 
     run_mutation_kill("S3M09_duplicate_settlement_refunds_twice", prog, mutant, check)
 
@@ -549,9 +548,10 @@ def s3m11_child_spent_copied_to_parent():
 
     def check(base, mut):
         b_spent = base.get("frame_ledgers", {}).get("root", {}).get("spent", {}).get("compute", 0)
-        if b_spent == 0:
-            return True, "baseline kept parent.spent=0 (child spent attributed to child frame)"
-        return False, "spent misattributed"
+        m_spent = mut.get("frame_ledgers", {}).get("root", {}).get("spent", {}).get("compute", 0)
+        if b_spent == 0 and m_spent > 0:
+            return True, f"baseline kept parent.spent=0, mutant copied child spent into parent (spent={m_spent})"
+        return False, f"base={b_spent}, mut={m_spent}"
 
     run_mutation_kill("S3M11_child_spent_copied_to_parent", prog, mutant, check)
 
@@ -594,9 +594,10 @@ def s3m12_nested_delegation_conservation():
 
     def check(base, mut):
         b_avail = base.get("frame_ledgers", {}).get("root", {}).get("available", {}).get("compute", 0)
-        if b_avail == 100:
-            return True, "baseline conserved global budget across settlement"
-        return False, "budget lost"
+        m_avail = mut.get("frame_ledgers", {}).get("root", {}).get("available", {}).get("compute", 0)
+        if b_avail == 100 and m_avail < 100:
+            return True, f"baseline conserved global budget (root={b_avail}), mutant lost budget (root={m_avail})"
+        return False, f"base={b_avail}, mut={m_avail}"
 
     run_mutation_kill("S3M12_nested_delegation_conservation", prog, mutant, check)
 
@@ -726,9 +727,9 @@ def s3m15_parent_generation_validation_omitted():
     mutant["mutations"] = {"s3m15_parent_generation_validation_omitted": True}
 
     def check(base, mut):
-        if "ForeignParentHandle" in base["status"]:
+        if "ForeignParentHandle" in base["status"] and "ForeignParentHandle" not in mut["status"]:
             return True, "baseline rejected foreign handle, mutant omitted validation"
-        return False, f"base status: {base['status']}"
+        return False, f"base={base['status']}, mut={mut['status']}"
 
     run_mutation_kill("S3M15_parent_generation_validation_omitted", prog, mutant, check)
 

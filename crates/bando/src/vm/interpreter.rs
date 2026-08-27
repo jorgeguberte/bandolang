@@ -1105,7 +1105,11 @@ impl<'a> VmInterpreter<'a> {
                 // Check contract
                 let contract_pass = match &policy_desc.accepted_claim_contract {
                     ClaimContract::AcceptAll => true,
-                    ClaimContract::AcceptPredicate(_) => true,
+                    ClaimContract::AcceptPredicate(expected_pred) => match &claim_val {
+                        VmValue::Attestation { predicate, .. } => predicate == expected_pred,
+                        VmValue::String(s) => s == expected_pred || s.starts_with(expected_pred),
+                        _ => false,
+                    },
                     ClaimContract::AcceptSubjectLiteral(lit) => {
                         if let VmValue::String(s) = &claim_val {
                             s == lit
