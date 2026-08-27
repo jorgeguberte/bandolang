@@ -15,7 +15,14 @@ from protocol import invoke_rust_conformance
 PASS, FAIL = 0, 0
 
 
-def run_golden(name: str, program: dict, expected_status: str = "ok", expected_diag: str = None) -> None:
+def run_golden(
+    name: str,
+    program: dict,
+    expected_status: str = "ok",
+    expected_diag: str = None,
+    expected_gate_resolutions: list[dict] = None,
+    expected_gate_trace: list[dict] = None,
+) -> None:
     global PASS, FAIL
     print(f"\n--- GOLDEN PROGRAM (Slice 2): {name}")
     try:
@@ -39,6 +46,20 @@ def run_golden(name: str, program: dict, expected_status: str = "ok", expected_d
         else:
             if expected_status not in obs["status"]:
                 print(f"  \u2717 FAIL {name}: expected status containing '{expected_status}', got '{obs['status']}'")
+                FAIL += 1
+                return
+
+        if expected_gate_resolutions is not None:
+            actual_res = obs.get("gate_resolutions", [])
+            if actual_res != expected_gate_resolutions:
+                print(f"  \u2717 FAIL {name}: expected gate_resolutions {expected_gate_resolutions}, got {actual_res}")
+                FAIL += 1
+                return
+
+        if expected_gate_trace is not None:
+            actual_trace = obs.get("gate_trace", [])
+            if actual_trace != expected_gate_trace:
+                print(f"  \u2717 FAIL {name}: expected gate_trace {expected_gate_trace}, got {actual_trace}")
                 FAIL += 1
                 return
 
@@ -276,7 +297,16 @@ def s2c05_registered_but_untrusted_verifier_rejected_at_gate():
             }]
         }
     }
-    run_golden("S2C05_registered_but_untrusted_verifier_rejected_at_gate", prog)
+    run_golden(
+        "S2C05_registered_but_untrusted_verifier_rejected_at_gate",
+        prog,
+        expected_gate_trace=[{
+            "check_kind": "CheckTrustPolicy",
+            "authority_source": "TrustedRuntime",
+            "effects": ["read[trust_store]"],
+            "result": "Fail",
+        }],
+    )
 
 
 # =====================================================================
@@ -337,7 +367,11 @@ def s2c06_proved_requirement_target_executes():
             }]
         }
     }
-    run_golden("S2C06_proved_requirement_target_executes", prog)
+    run_golden(
+        "S2C06_proved_requirement_target_executes",
+        prog,
+        expected_gate_resolutions=[{"op_id": "simple_act", "resolution": "Proved"}],
+    )
 
 
 def s2c07_deferred_subject_binding_passes():
@@ -394,7 +428,17 @@ def s2c07_deferred_subject_binding_passes():
             }]
         }
     }
-    run_golden("S2C07_deferred_subject_binding_passes", prog)
+    run_golden(
+        "S2C07_deferred_subject_binding_passes",
+        prog,
+        expected_gate_resolutions=[{"op_id": "op_write", "resolution": "Deferred"}],
+        expected_gate_trace=[{
+            "check_kind": "CheckTrustPolicy",
+            "authority_source": "TrustedRuntime",
+            "effects": ["read[trust_store]"],
+            "result": "Pass",
+        }],
+    )
 
 
 def s2c08_deferred_subject_binding_fails_zero_mutation():
@@ -452,7 +496,17 @@ def s2c08_deferred_subject_binding_fails_zero_mutation():
             }]
         }
     }
-    run_golden("S2C08_deferred_subject_binding_fails_zero_mutation", prog)
+    run_golden(
+        "S2C08_deferred_subject_binding_fails_zero_mutation",
+        prog,
+        expected_gate_resolutions=[{"op_id": "op_write", "resolution": "Deferred"}],
+        expected_gate_trace=[{
+            "check_kind": "CheckSubjectBinding",
+            "authority_source": "Caller",
+            "effects": [],
+            "result": "Fail",
+        }],
+    )
 
 
 def s2c09_static_refuted():
@@ -503,7 +557,13 @@ def s2c09_static_refuted():
             }]
         }
     }
-    run_golden("S2C09_static_refuted", prog, expected_status="verifier_error", expected_diag="RefutedRequirement")
+    run_golden(
+        "S2C09_static_refuted",
+        prog,
+        expected_status="verifier_error",
+        expected_diag="RefutedRequirement",
+        expected_gate_resolutions=[{"op_id": "simple_act", "resolution": "Refuted"}],
+    )
 
 
 def s2c10_static_uncovered():
@@ -546,7 +606,13 @@ def s2c10_static_uncovered():
             }]
         }
     }
-    run_golden("S2C10_static_uncovered", prog, expected_status="verifier_error", expected_diag="UncoveredRequirement")
+    run_golden(
+        "S2C10_static_uncovered",
+        prog,
+        expected_status="verifier_error",
+        expected_diag="UncoveredRequirement",
+        expected_gate_resolutions=[{"op_id": "protected_act", "resolution": "Uncovered"}],
+    )
 
 
 def s2c11_caller_lacks_target_capability():

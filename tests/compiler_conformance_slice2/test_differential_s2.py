@@ -13,7 +13,7 @@ Compares every frozen shared observable available in ConformanceObservationV0:
 10. Mutation trace (exact list of writes)
 11. Final world state (exact storage key-value map)
 12. Gate resolutions (exact list of operation resolution outcomes)
-13. Gate check trace (exact list of dynamic gate checks executed with authority source)
+13. Gate check trace (exact list of dynamic gate checks executed with authority source and result)
 """
 from __future__ import annotations
 
@@ -337,6 +337,112 @@ def test_diff_gated_act_success():
     run_diff_check("Diff_Gated_Act_Success", _run)
 
 
+def test_diff_failing_deferred_check_trace():
+    def _run():
+        expected = {
+            "status": "ok",
+            "return_val": {"kind": "String", "payload": "GateRejected"},
+            "effects": ["read[workspace]", "read[trust_store]"],
+            "active_facts": {
+                ("IsFailure", ("sym(v3)",)),
+            },
+            "latent_facts": {},
+            "types": {
+                "v1": "string",
+                "v2": "Result<Attestation<PassesAudit, string>, string>",
+                "v3": "ActOutcome<string, string>",
+                "v5": "string",
+            },
+            "bindings": {
+                "v1": {"kind": "String", "payload": "sub_A"},
+                "v2": {"kind": "Ok", "payload": {
+                    "kind": "Attestation",
+                    "payload": {
+                        "predicate": "PassesAudit",
+                        "subject": {"kind": "String", "payload": "sub_A"},
+                        "issuer": "v_untrusted",
+                        "verifier_build": "1.0.0",
+                        "token": "tok_valid"
+                    }
+                }},
+                "v3": {"kind": "ActFailure", "payload": {"kind": "String", "payload": "GateRejected"}},
+                "v5": {"kind": "String", "payload": "GateRejected"}
+            },
+            "lineage": {},
+            "diagnostics": [],
+            "mutation_trace": [],
+            "final_world": {},
+            "gate_resolutions": [
+                {"op_id": "op_protected", "resolution": "Deferred"}
+            ],
+            "gate_trace": [
+                {
+                    "check_kind": "CheckTrustPolicy",
+                    "authority_source": "TrustedRuntime",
+                    "effects": ["read[trust_store]"],
+                    "result": "Fail"
+                }
+            ],
+        }
+        prog = {
+            "name": "Diff_Failing_Deferred_Check", "entry_func": "main", "inputs": {},
+            "registry": {
+                "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+                "runtime_authority": {"effects": [{"Read": "trust_store"}]},
+                "verifiers": {
+                    "v_untrusted": {
+                        "verifier_id": "v_untrusted", "version": "1.0.0",
+                        "effect_envelope": {"effects": [{"Read": "workspace"}]},
+                        "output_predicate": "PassesAudit", "subject_type": {"kind": "String"}
+                    }
+                },
+                "operations": {
+                    "op_protected": {
+                        "op_id": "op_protected", "target_domain": "workspace",
+                        "declared_envelope": {"effects": [{"Act": "workspace"}, {"Read": "workspace"}, {"Read": "trust_store"}]},
+                        "declared_footprint": {"Exact": ["workspace/doc1"]},
+                        "atomicity": "Atomic",
+                        "requirements": [{"RequiresAttestation": {"predicate": "PassesAudit", "subject_arg_idx": 0}}]
+                    }
+                },
+                "trust_policy": {"trusted_issuers": {"PassesAudit": ["v_official_only"]}}  # v_untrusted rejected at gate!
+            },
+            "module": {
+                "name": "m", "functions": [{
+                    "name": "main", "params": [], "return_type": {"kind": "String"},
+                    "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]},
+                    "entry": 0,
+                    "blocks": {
+                        "0": {
+                            "id": 0, "params": [],
+                            "instructions": [
+                                {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub_A"}, "ty": {"kind": "String"}}},
+                                {"Verify": {"dest": 2, "verifier_id": "v_untrusted", "subject": 1}},
+                                {"Act": {
+                                    "dest": 3, "op_id": "op_protected",
+                                    "success_type": {"kind": "String"}, "failure_type": {"kind": "String"},
+                                    "args": [1], "evidence": [2]
+                                }}
+                            ],
+                            "terminator": {
+                                "MatchActOutcome": {
+                                    "outcome_val": 3,
+                                    "success_arg": 4, "success_body": {"instructions": [], "terminator": {"Return": 4}},
+                                    "failure_arg": 5, "failure_body": {"instructions": [], "terminator": {"Return": 5}},
+                                    "partial_arg": 6, "partial_body": {"instructions": [], "terminator": {"Return": 1}},
+                                    "unknown_arg": 7, "unknown_body": {"instructions": [], "terminator": {"Return": 1}}
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+        rust_obs = invoke_rust_conformance(prog)
+        return compare_exact_observables("Diff_Failing_Deferred_Check", expected, rust_obs)
+    run_diff_check("Diff_Failing_Deferred_Check", _run)
+
+
 # =====================================================================
 # Negative Comparator Probes (Slice 2)
 # =====================================================================
@@ -497,11 +603,62 @@ def test_probe_wrong_authority_source_fails():
     run_diff_check("PROBE_wrong_authority_source_fails", _run)
 
 
+def test_probe_missing_gate_check_fails():
+    def _run():
+        expected = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "mutation_trace": [], "final_world": {}, "gate_resolutions": [],
+            "gate_trace": [{
+                "check_kind": "CheckTrustPolicy",
+                "authority_source": "TrustedRuntime",
+                "effects": ["read[trust_store]"],
+                "result": "Pass"
+            }]
+        }
+        rust_obs = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": [],
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "mutation_trace": [], "final_world": {}, "gate_resolutions": [],
+            "gate_trace": []  # MISSING CHECK TRACE!
+        }
+        errs = compare_exact_observables("PROBE_missing_gate_check", expected, rust_obs)
+        assert len(errs) > 0, "comparator falsely accepted missing gate check from trace"
+        return []
+    run_diff_check("PROBE_missing_gate_check_fails", _run)
+
+
+def test_probe_extra_gate_check_fails():
+    def _run():
+        expected = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "mutation_trace": [], "final_world": {}, "gate_resolutions": [],
+            "gate_trace": []
+        }
+        rust_obs = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": [],
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "mutation_trace": [], "final_world": {}, "gate_resolutions": [],
+            "gate_trace": [{
+                "check_kind": "CheckTrustPolicy",
+                "authority_source": "TrustedRuntime",
+                "effects": ["read[trust_store]"],
+                "result": "Pass"
+            }]  # UNEXPECTED EXTRA CHECK!
+        }
+        errs = compare_exact_observables("PROBE_extra_gate_check", expected, rust_obs)
+        assert len(errs) > 0, "comparator falsely accepted spurious extra gate check in trace"
+        return []
+    run_diff_check("PROBE_extra_gate_check_fails", _run)
+
+
 if __name__ == "__main__":
     print("=" * 70)
     print("SOMA COMPILER CONFORMANCE v0 (SLICE 2) — Python Oracle vs Rust Differential")
     test_diff_verify_success()
     test_diff_gated_act_success()
+    test_diff_failing_deferred_check_trace()
     test_probe_extra_lineage_fails()
     test_probe_extra_target_mutation_fails()
     test_probe_wrong_final_world_fails()
@@ -509,6 +666,8 @@ if __name__ == "__main__":
     test_probe_stale_current_fact_fails()
     test_probe_wrong_gate_resolution_fails()
     test_probe_wrong_authority_source_fails()
+    test_probe_missing_gate_check_fails()
+    test_probe_extra_gate_check_fails()
 
     print("=" * 70)
     print(f"SLICE 2 DIFFERENTIAL RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")
