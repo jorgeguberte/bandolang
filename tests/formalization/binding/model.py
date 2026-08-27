@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, List, Optional, Set, Union
+from typing import Any, Dict, List, Optional, Set, Tuple
 
 
 class TermKind(Enum):
@@ -25,15 +25,17 @@ class BindingTerm:
     val_type: str
     identity_key: str
     digest: Optional[str] = None
+    algorithm: Optional[str] = None
     lineage_ids: frozenset[str] = field(default_factory=frozenset)
     domain: Optional[str] = None
 
     @staticmethod
-    def value_ref(name: str, val_type: str, lineage_ids: Optional[Set[str]] = None) -> BindingTerm:
+    def value_ref(name: str, val_type: str, lineage_ids: Optional[Set[str]] = None, digest: Optional[str] = None) -> BindingTerm:
         return BindingTerm(
             kind=TermKind.VALUE_REF,
             val_type=val_type,
             identity_key=name,
+            digest=digest,
             lineage_ids=frozenset(lineage_ids or set()),
         )
 
@@ -44,6 +46,7 @@ class BindingTerm:
             val_type=val_type,
             identity_key=f"{algorithm}:{hex_hash}",
             digest=hex_hash,
+            algorithm=algorithm,
         )
 
     @staticmethod
@@ -81,6 +84,25 @@ class BindingTerm:
         )
 
 
+def has_concrete_contradiction(a: BindingTerm, b: BindingTerm) -> bool:
+    """R1 / R4: Check if two terms possess explicit contradictory concrete evidence."""
+    # 1. Stable digest algorithm mismatch
+    if a.kind == TermKind.STABLE_DIGEST and b.kind == TermKind.STABLE_DIGEST:
+        if a.algorithm != b.algorithm or a.digest != b.digest:
+            return True
+
+    # 2. Concrete digest contradiction across artifacts or value refs
+    if a.digest is not None and b.digest is not None and a.digest != b.digest:
+        return True
+
+    # 3. Literal value mismatch
+    if a.kind == TermKind.LITERAL and b.kind == TermKind.LITERAL:
+        if a.identity_key != b.identity_key:
+            return True
+
+    return False
+
+
 @dataclass(frozen=True)
 class BindingRequirement:
     predicate: str
@@ -97,8 +119,9 @@ class BindingEvidence:
     base_binding: Optional[BindingTerm] = None
     scope_binding: Optional[BindingTerm] = None
     validity_binding: Optional[BindingTerm] = None
-    provenance: str = "Concrete"  # "Concrete" | "Delegated" | "External"
+    provenance: str = "Concrete"  # "Concrete" | "Delegated" | "External" | "Merged"
     currentness_witness: Optional[bool] = None  # None = unknown, True = current, False = stale
+    validity_witness: Optional[bool] = None     # None = unknown, True = valid, False = expired/invalid
 
 
 @dataclass(frozen=True)
@@ -134,20 +157,41 @@ class PathFactContext:
     known_aliases: dict[str, str] = field(default_factory=dict)
     known_equal_digests: set[tuple[str, str]] = field(default_factory=set)
 
-    def are_equal(self, a: BindingTerm, b: BindingTerm) -> bool:
+    def are_equal(self, a: BindingTerm, b: BindingTerm, mutations: Optional[dict[str, bool]] = None) -> bool:
+        muts = mutations or {}
+
+        # R1 / R4: Concrete contradiction strictly dominates aliases and lexical shortcuts
+        if has_concrete_contradiction(a, b):
+            if not muts.get("m3_alias_overrides_contradiction", False):
+                return False
+
         if a == b:
             return True
+
+        # Lexical identity key match
         if a.identity_key == b.identity_key:
-            return True
+            if a.kind == b.kind:
+                # R1: Same URI with contradictory digests cannot be equal
+                if a.digest is not None and b.digest is not None and a.digest != b.digest:
+                    return False
+                return True
+
+        # Digest match
         if a.digest and b.digest and a.digest == b.digest:
+            if a.algorithm and b.algorithm and a.algorithm != b.algorithm:
+                return False
             return True
+
+        # Aliases in PathFactContext
         if self.known_aliases.get(a.identity_key) == b.identity_key:
             return True
         if self.known_aliases.get(b.identity_key) == a.identity_key:
             return True
+
         if a.digest and b.digest:
             if (a.digest, b.digest) in self.known_equal_digests or (b.digest, a.digest) in self.known_equal_digests:
                 return True
+
         return False
 
 
@@ -169,8 +213,17 @@ def match_term(
         if req.lineage_ids and ev.lineage_ids and (req.lineage_ids & ev.lineage_ids):
             return SymbolicMatch.proved()
 
+    # R1 / R4: Concrete contradiction check
+    if has_concrete_contradiction(req, ev):
+        if not muts.get("m3_alias_overrides_contradiction", False):
+            if muts.get("m3_concrete_mismatch_deferred", False):
+                return SymbolicMatch.deferred([
+                    DynamicCheck("CheckSubjectIdentity", req, ev, "Mutant deferred concrete mismatch")
+                ])
+            return SymbolicMatch.refuted(f"ContradictoryIdentity: {req.identity_key} != {ev.identity_key}")
+
     # Direct / proven equality
-    if ctx.are_equal(req, ev):
+    if ctx.are_equal(req, ev, muts):
         return SymbolicMatch.proved()
 
     # Concrete known digests or literals that mismatch -> Refuted (B3)
@@ -183,7 +236,6 @@ def match_term(
     )
 
     if both_concrete:
-        # Mutation M3: concrete mismatch => Deferred (FAIL B3)
         if muts.get("m3_concrete_mismatch_deferred", False):
             return SymbolicMatch.deferred([
                 DynamicCheck("CheckSubjectIdentity", req, ev, "Mutant deferred concrete mismatch")
@@ -191,7 +243,6 @@ def match_term(
         return SymbolicMatch.refuted(f"ConcreteMismatch: {req.identity_key} != {ev.identity_key}")
 
     # Either is opaque or unverified ValueRef without digest -> Deferred (B4)
-    # Mutation M4: opaque unknown => Refuted (FAIL B4)
     if muts.get("m4_opaque_unknown_refuted", False):
         return SymbolicMatch.refuted("MutantRefutedOpaque")
 
@@ -209,7 +260,6 @@ def match_binding(
     muts = mutations or {}
 
     # 1. Predicate check (B11)
-    # Mutation M9: predicate mismatch ignored (FAIL B11)
     if not muts.get("m9_predicate_mismatch_ignored", False):
         if req.predicate != ev.predicate:
             return SymbolicMatch.refuted(f"PredicateMismatch: expected {req.predicate}, got {ev.predicate}")
@@ -223,7 +273,6 @@ def match_binding(
     all_checks.extend(subj_match.deferred_checks)
 
     # 3. Base state check (B5, B6)
-    # Mutation M5: ignore base binding (FAIL B5)
     if req.base is not None and not muts.get("m5_ignore_base_binding", False):
         if ev.base_binding is None:
             return SymbolicMatch.refuted("MissingBaseBinding: requirement specified base state but evidence has none")
@@ -235,7 +284,6 @@ def match_binding(
 
         # Currentness verification (B6)
         if req.base.kind == TermKind.STATE_REF:
-            # Mutation M6: lexical StateRef => current shortcut (FAIL B6)
             if not muts.get("m6_lexical_state_current_shortcut", False):
                 if ev.currentness_witness is False:
                     if not muts.get("m8_deferred_overrides_refuted", False):
@@ -254,15 +302,17 @@ def match_binding(
             return scope_match
         all_checks.extend(scope_match.deferred_checks)
 
-    # 5. Validity check
+    # 5. Validity check (R2: Bounded validity/freshness rule)
     if req.validity is not None:
-        if ev.validity_binding is None:
-            all_checks.append(DynamicCheck("CheckValidity", req.validity, None, "Validity verification needed"))
-        else:
-            val_match = match_term(req.validity, ev.validity_binding, ctx, muts)
-            if val_match.is_refuted and not muts.get("m8_deferred_overrides_refuted", False):
-                return val_match
-            all_checks.extend(val_match.deferred_checks)
+        if ev.validity_witness is False:
+            if not muts.get("m8_deferred_overrides_refuted", False):
+                return SymbolicMatch.refuted("ExpiredValidity: validity witness reported expired/invalid")
+        elif ev.validity_witness is True:
+            pass  # Proved statically valid
+        elif ev.validity_witness is None:
+            all_checks.append(
+                DynamicCheck("CheckValidity", req.validity, ev.validity_binding, "Dynamic validity witness required")
+            )
 
     # Mutation M7: drop deferred checks (FAIL B7 / B9)
     if muts.get("m7_drop_deferred_checks", False):
@@ -282,6 +332,57 @@ def match_binding(
     return SymbolicMatch.deferred(all_checks)
 
 
+def dynamic_gate_resolve(
+    req: BindingRequirement,
+    ev: BindingEvidence,
+    ctx: PathFactContext,
+    witness_proofs: Dict[str, bool],
+    mutations: Optional[dict[str, Any]] = None,
+) -> Tuple[SymbolicMatch, BindingEvidence]:
+    """R3: Minimal executable dynamic gate resolution operation for Deferred checks (B10).
+    
+    Proves that dynamic resolution validates the original binding without rebinding or widening.
+    """
+    muts = mutations or {}
+
+    match_res = match_binding(req, ev, ctx, muts)
+    if match_res.is_refuted:
+        return match_res, ev
+
+    # Check all dynamic obligations against provided witness proofs
+    for check in match_res.deferred_checks:
+        if not witness_proofs.get(check.check_type, False):
+            return SymbolicMatch.refuted(f"DynamicCheckFailed: {check.check_type}"), ev
+
+    # Mutation M11: dynamic resolution rebinds subject (FAIL B10)
+    if muts.get("m11_dynamic_resolution_rebinds_subject", False):
+        widened_subj = muts.get("widened_subject", ev.subject_binding)
+        mutated_ev = BindingEvidence(
+            predicate=ev.predicate,
+            subject_binding=widened_subj,
+            base_binding=ev.base_binding,
+            scope_binding=ev.scope_binding,
+            validity_binding=ev.validity_binding,
+            provenance="DynamicGateWidened",
+            currentness_witness=True,
+            validity_witness=True,
+        )
+        return SymbolicMatch.proved(), mutated_ev
+
+    # Sound dynamic resolution: validates the EXACT original binding
+    resolved_ev = BindingEvidence(
+        predicate=ev.predicate,
+        subject_binding=ev.subject_binding,
+        base_binding=ev.base_binding,
+        scope_binding=ev.scope_binding,
+        validity_binding=ev.validity_binding,
+        provenance=ev.provenance,
+        currentness_witness=True,
+        validity_witness=True,
+    )
+    return SymbolicMatch.proved(), resolved_ev
+
+
 def conservative_cfg_join(
     path_a: BindingEvidence,
     path_b: BindingEvidence,
@@ -299,10 +400,9 @@ def conservative_cfg_join(
         return None
 
     # Merge subject
-    if ctx.are_equal(path_a.subject_binding, path_b.subject_binding):
+    if ctx.are_equal(path_a.subject_binding, path_b.subject_binding, muts):
         merged_subject = path_a.subject_binding
     else:
-        # Cannot prove equality at merge point -> downgrade to opaque union or None
         return None
 
     # Merge base
@@ -311,8 +411,8 @@ def conservative_cfg_join(
     else:
         merged_base = None
 
-    # Currentness witness
     merged_witness = path_a.currentness_witness if path_a.currentness_witness == path_b.currentness_witness else None
+    merged_validity = path_a.validity_witness if path_a.validity_witness == path_b.validity_witness else None
 
     return BindingEvidence(
         predicate=path_a.predicate,
@@ -322,4 +422,5 @@ def conservative_cfg_join(
         validity_binding=path_a.validity_binding if path_a.validity_binding == path_b.validity_binding else None,
         provenance="Merged",
         currentness_witness=merged_witness,
+        validity_witness=merged_validity,
     )

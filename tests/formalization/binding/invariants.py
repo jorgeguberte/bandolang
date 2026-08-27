@@ -16,6 +16,7 @@ try:
         match_binding,
         match_term,
         conservative_cfg_join,
+        dynamic_gate_resolve,
     )
 except ImportError:
     from model import (
@@ -28,6 +29,7 @@ except ImportError:
         match_binding,
         match_term,
         conservative_cfg_join,
+        dynamic_gate_resolve,
     )
 
 
@@ -178,14 +180,32 @@ def assert_b9_deferred_checks_are_explicit(
 
 
 def assert_b10_gate_cannot_widen_binding(
+    req: BindingRequirement,
     ev: BindingEvidence,
     widened_subject: BindingTerm,
     ctx: PathFactContext,
+    mutations: Optional[dict[str, Any]] = None,
 ):
-    """B10: Dynamic gate evaluation cannot reinterpret an attestation for a different subject."""
-    assert not ctx.are_equal(ev.subject_binding, widened_subject)
-    # The binding identity remains immutable
-    assert ev.subject_binding != widened_subject
+    """B10 (R3): Dynamic gate evaluation cannot reinterpret or widen an attestation for a different subject."""
+    muts = dict(mutations or {})
+    muts["widened_subject"] = widened_subject
+
+    # 1. Evaluate initial match -> should be Deferred (waiting on dynamic checks)
+    initial_match = match_binding(req, ev, ctx)
+    assert len(initial_match.deferred_checks) > 0, "Precondition: initial match must be Deferred"
+
+    # 2. Perform dynamic gate resolution with witness proofs
+    witness_proofs = {chk.check_type: True for chk in initial_match.deferred_checks}
+    resolved_match, resolved_ev = dynamic_gate_resolve(req, ev, ctx, witness_proofs, muts)
+
+    # 3. Prove that successful resolution validates the original binding without rebinding
+    assert resolved_match.is_proved, "Dynamic resolution must prove the valid obligation"
+    assert resolved_ev.subject_binding == ev.subject_binding, (
+        f"VIOLATION OF B10: Dynamic resolution rebound subject to {resolved_ev.subject_binding.identity_key}!"
+    )
+    assert resolved_ev.subject_binding != widened_subject, (
+        f"VIOLATION OF B10: Dynamic gate widened attestation subject to {widened_subject.identity_key}!"
+    )
 
 
 def assert_b11_attestation_predicate_exact(

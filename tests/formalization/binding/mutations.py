@@ -1,6 +1,6 @@
 """mutations.py — Causal Mutation Suite for SOMA Binding Contract v0.
 
-Defines deliberate semantic shortcuts (M1–M10) to verify that the formal invariant
+Defines deliberate semantic shortcuts (M1–M11) to verify that the formal invariant
 battery strictly catches and kills each unsound implementation variant.
 """
 from __future__ import annotations
@@ -18,6 +18,7 @@ try:
         assert_b7_static_success_requires_complete_proof,
         assert_b8_refutation_dominates_deferred,
         assert_b9_deferred_checks_are_explicit,
+        assert_b10_gate_cannot_widen_binding,
         assert_b11_attestation_predicate_exact,
         assert_b12_cfg_joins_conservative,
     )
@@ -41,6 +42,7 @@ except ImportError:
         assert_b7_static_success_requires_complete_proof,
         assert_b8_refutation_dominates_deferred,
         assert_b9_deferred_checks_are_explicit,
+        assert_b10_gate_cannot_widen_binding,
         assert_b11_attestation_predicate_exact,
         assert_b12_cfg_joins_conservative,
     )
@@ -218,6 +220,43 @@ def get_all_mutants() -> List[MutantDescriptor]:
         description="Conflicting CFG join arbitrarily picks branch A instead of conservative join",
         target_invariant="B12",
         run_killer=kill_m10,
+    ))
+
+    # M11: dynamic resolution rebinds subject (R3, Killed by B10)
+    def kill_m11():
+        subj_req = BindingTerm.opaque_ref("agent_x", "tok_orig", "Diff")
+        subj_ev = BindingTerm.opaque_ref("agent_x", "tok_orig", "Diff")
+        widened_subj = BindingTerm.stable_digest("sha256", "unauthorized_diff_rebound")
+        req = BindingRequirement(predicate="TestsPassed", subject=subj_req)
+        ev = BindingEvidence(predicate="TestsPassed", subject_binding=subj_ev)
+        ctx = PathFactContext()
+        assert_b10_gate_cannot_widen_binding(
+            req,
+            ev,
+            widened_subject=widened_subj,
+            ctx=ctx,
+            mutations={"m11_dynamic_resolution_rebinds_subject": True},
+        )
+
+    mutants.append(MutantDescriptor(
+        mutant_id="M11",
+        description="Dynamic gate resolution rebinds attestation to a widened/different subject",
+        target_invariant="B10",
+        run_killer=kill_m11,
+    ))
+
+    # M12: alias overrides concrete contradiction (R4, Killed by B3)
+    def kill_m12():
+        v1 = BindingTerm.value_ref("v1", "Diff", digest="hash_alpha")
+        v2 = BindingTerm.value_ref("v2", "Diff", digest="hash_beta")
+        ctx = PathFactContext(known_aliases={"v1": "v2"})
+        assert_b3_exact_known_mismatch_is_refuted(v1, v2, ctx, {"m3_alias_overrides_contradiction": True})
+
+    mutants.append(MutantDescriptor(
+        mutant_id="M12",
+        description="Path-fact alias overrides explicit concrete digest contradiction",
+        target_invariant="B3",
+        run_killer=kill_m12,
     ))
 
     return mutants

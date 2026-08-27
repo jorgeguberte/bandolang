@@ -82,3 +82,8 @@ jobs:
           python tests/ir/item3/test_scenarios.py
           python tests/ir/item3/test_mutation_kills.py
           python tests/ir/item3/test_differential.py
+
+      - name: Binding Contract v0 Formalization
+        run: |
+          python tests/formalization/binding/test_scenarios.py
+          python tests/formalization/binding/test_mutation_kills.py
