@@ -456,7 +456,7 @@ def s2c08_deferred_subject_binding_fails_zero_mutation():
 
 
 def s2c09_static_refuted():
-    # RequiresStaticProof with mismatched subject -> RefutedRequirement!
+    # RequiresStaticProof with mismatched subject of SAME TYPE (String vs String) -> RefutedRequirement!
     prog = {
         "name": "S2C09_static_refuted", "entry_func": "main", "inputs": {},
         "registry": {
@@ -488,13 +488,13 @@ def s2c09_static_refuted():
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "expected_val"}, "ty": make_type_string()}},
-                            {"Pure": {"dest": 2, "val": {"kind": "I64", "payload": 999}, "ty": make_type_i64()}},
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "artifact-A"}, "ty": make_type_string()}},
+                            {"Pure": {"dest": 2, "val": {"kind": "String", "payload": "artifact-B"}, "ty": make_type_string()}},
                             {"Verify": {"dest": 3, "verifier_id": "v_audit", "subject": 1}},
                             {"Act": {
                                 "dest": 4, "op_id": "simple_act",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [2], "evidence": [3]  # arg 2 has type I64, evidence has subject String -> Refuted!
+                                "args": [2], "evidence": [3]  # arg 2 has value "artifact-B", evidence has subject "artifact-A" (SAME TYPE String!) -> Refuted!
                             }}
                         ],
                         "terminator": {"Return": 1}

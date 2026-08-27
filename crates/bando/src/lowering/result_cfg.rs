@@ -466,30 +466,23 @@ impl LoweringContext {
                 dest,
                 verifier_id,
                 subject,
-                output_predicate,
-                subject_type,
-                verifier_effects,
+                ..
             } => {
-                // Q1: Authoritative descriptor lookup in registry
-                let (out_p, subj_t, mut effs) = if let Some(reg) = &self.registry {
-                    if let Some(desc) = reg.verifiers.get(verifier_id) {
-                        (
-                            desc.output_predicate.clone(),
-                            desc.subject_type.clone(),
-                            desc.effect_envelope.effects.iter().cloned().collect(),
+                // Q1: Authoritative descriptor lookup in registry (fail-closed, no legacy fallback)
+                let (out_p, subj_t, mut effs) = {
+                    let reg = self.registry.as_ref().expect(
+                        "Lowering Instruction::Verify requires an authenticated RegistrySnapshot",
+                    );
+                    let desc = reg.verifiers.get(verifier_id).unwrap_or_else(|| {
+                        panic!(
+                            "Lowering failed: VerifierId {:?} not found in trusted registry",
+                            verifier_id
                         )
-                    } else {
-                        (
-                            output_predicate.clone(),
-                            subject_type.clone(),
-                            verifier_effects.clone(),
-                        )
-                    }
-                } else {
+                    });
                     (
-                        output_predicate.clone(),
-                        subject_type.clone(),
-                        verifier_effects.clone(),
+                        desc.output_predicate.clone(),
+                        desc.subject_type.clone(),
+                        desc.effect_envelope.effects.iter().cloned().collect::<Vec<_>>(),
                     )
                 };
 
@@ -497,10 +490,13 @@ impl LoweringContext {
                     effs.pop();
                 }
 
+                let vm_dest = self.map_value(*dest);
+                let vm_subject = self.map_value(*subject);
+
                 VmInstruction::VmVerify {
-                    dest: self.map_value(*dest),
+                    dest: vm_dest,
                     verifier_id: verifier_id.clone(),
-                    subject: self.map_value(*subject),
+                    subject: vm_subject,
                     output_predicate: out_p,
                     subject_type: subj_t,
                     verifier_effects: effs,
@@ -509,28 +505,30 @@ impl LoweringContext {
             Instruction::Act {
                 dest,
                 op_id,
-                target_domain,
                 success_type,
                 failure_type,
                 args,
                 evidence,
-                gate_effects,
                 latent,
+                ..
             } => {
-                // Q1: Authoritative descriptor lookup in registry
-                let (target_d, effs) = if let Some(reg) = &self.registry {
-                    if let Some(op_desc) = reg.operations.get(op_id) {
-                        let g_effs = op_desc
-                            .requirements
-                            .iter()
-                            .flat_map(|r| r.required_gate_effects())
-                            .collect();
-                        (op_desc.target_domain.clone(), g_effs)
-                    } else {
-                        (target_domain.clone(), gate_effects.clone())
-                    }
-                } else {
-                    (target_domain.clone(), gate_effects.clone())
+                // Q1: Authoritative descriptor lookup in registry (fail-closed, no legacy fallback)
+                let (target_d, effs) = {
+                    let reg = self.registry.as_ref().expect(
+                        "Lowering Instruction::Act requires an authenticated RegistrySnapshot",
+                    );
+                    let op_desc = reg.operations.get(op_id).unwrap_or_else(|| {
+                        panic!(
+                            "Lowering failed: OperationId {:?} not found in trusted registry",
+                            op_id
+                        )
+                    });
+                    let g_effs = op_desc
+                        .requirements
+                        .iter()
+                        .flat_map(|r| r.required_gate_effects())
+                        .collect::<Vec<_>>();
+                    (op_desc.target_domain.clone(), g_effs)
                 };
 
                 let gate_effs = if self.mutations.s2m06_gate_effect_omitted_from_act {
@@ -539,14 +537,18 @@ impl LoweringContext {
                     effs
                 };
 
+                let vm_dest = self.map_value(*dest);
+                let vm_args = args.iter().map(|a| self.map_value(*a)).collect();
+                let vm_evidence = evidence.iter().map(|e| self.map_value(*e)).collect();
+
                 VmInstruction::VmAct {
-                    dest: self.map_value(*dest),
+                    dest: vm_dest,
                     op_id: op_id.clone(),
                     target_domain: target_d,
                     success_type: success_type.clone(),
                     failure_type: failure_type.clone(),
-                    args: args.iter().map(|a| self.map_value(*a)).collect(),
-                    evidence: evidence.iter().map(|e| self.map_value(*e)).collect(),
+                    args: vm_args,
+                    evidence: vm_evidence,
                     gate_effects: gate_effs,
                     latent: latent.clone(),
                 }

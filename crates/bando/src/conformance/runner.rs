@@ -20,8 +20,8 @@ use crate::{
 pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 {
     let registry = prog.registry.clone().unwrap_or_else(RegistrySnapshot::new);
 
-    // 1. High-level verifier (with trusted registry binding, P1)
-    if let Err(diags) = HighLevelVerifier::verify_module_with_registry(&prog.module, &registry) {
+    // 1. High-level verifier (with trusted registry binding, P1, Q2, Q3, Q4)
+    if let Err((diags, gate_resolutions)) = HighLevelVerifier::verify_module_with_registry(&prog.module, &registry) {
         return ConformanceObservationV0 {
             status: "verifier_error".to_string(),
             return_val: None,
@@ -34,7 +34,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
             diagnostics: diags,
             mutation_trace: Vec::new(),
             final_world: None,
-            gate_resolutions: Vec::new(),
+            gate_resolutions,
             gate_trace: Vec::new(),
         };
     }

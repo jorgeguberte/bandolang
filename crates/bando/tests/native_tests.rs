@@ -13,10 +13,10 @@ use bando::{
         types::Type,
         values::{BlockId, Value, ValueId},
     },
-    lowering::LoweringContext,
+    lowering::{CompilerMutations, LoweringContext},
     registry::{
-        AtomicityGuarantee, MutationFootprint, OperationDescriptor, OperationId,
-        PolicyRequirement, RegistrySnapshot, VerifierDescriptor, VerifierId,
+        AtomicityGuarantee, CallerAuthority, MutationFootprint, OperationDescriptor, OperationId,
+        PolicyRequirement, RegistrySnapshot, TrustedRuntimeAuthority, VerifierDescriptor, VerifierId,
     },
     verifier::HighLevelVerifier,
     vm::{
@@ -277,6 +277,13 @@ fn test_slice2_verify_and_gated_act() {
     registry.register_operation(op_desc);
     registry.trust_policy.trust_verifier("PassesAudit", VerifierId::new("auditor_v1"));
 
+    registry.caller_authority = Some(CallerAuthority {
+        effects: BTreeSet::from([Effect::Read("workspace".to_string()), Effect::Act("workspace".to_string())]),
+    });
+    registry.runtime_authority = Some(TrustedRuntimeAuthority {
+        effects: BTreeSet::from([Effect::Read("trust_store".to_string())]),
+    });
+
     let mut func = Function::new("main", BlockId(0), Type::String);
     func.declared_effects = EffectRow::empty()
         .with(Effect::Read("workspace".to_string()))
@@ -318,9 +325,9 @@ fn test_slice2_verify_and_gated_act() {
     let mut module = Module::new("test_s2");
     module.functions.push(func);
 
-    assert!(HighLevelVerifier::verify_module(&module).is_ok());
+    assert!(HighLevelVerifier::verify_module_with_registry(&module, &registry).is_ok());
 
-    let mut lowering = LoweringContext::new();
+    let mut lowering = LoweringContext::with_registry(registry.clone(), CompilerMutations::default());
     let vm_module = lowering.lower_module(&module);
     assert!(VmVerifier::verify_module(&vm_module).is_ok());
 

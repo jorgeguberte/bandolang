@@ -50,6 +50,8 @@ def s2v01_verify_subject_type_mismatch():
         "name": "S2V01_subject_type_mismatch",
         "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {
                 "auditor_v1": {
                     "verifier_id": "auditor_v1", "version": "1.0.0",

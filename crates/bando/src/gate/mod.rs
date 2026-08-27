@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    conformance::schema::GateCheckObservation,
     ir::{effects::Effect, values::Value},
     registry::{AuthoritySource, CallerAuthority, PolicyRequirement, TrustPolicy, TrustedRuntimeAuthority, VerifierId},
     world::WorldState,
@@ -61,6 +62,12 @@ pub enum GateError {
     BaseVersionMismatch,
     AuthorityInsufficient(String),
     GateRejected(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateEvaluationOutput {
+    pub witness: Result<GateWitness, GateError>,
+    pub trace: Vec<GateCheckObservation>,
 }
 
 pub struct GateEngine;
@@ -183,21 +190,53 @@ impl GateEngine {
         caller_authority: Option<&CallerAuthority>,
         runtime_authority: Option<&TrustedRuntimeAuthority>,
         require_caller_authority_for_all: bool,
-    ) -> Result<GateWitness, GateError> {
+    ) -> GateEvaluationOutput {
         let mut witness_version = None;
         let executed_effects = gate_effects.to_vec();
+        let mut trace = Vec::new();
 
         for check in checks {
             let required_effects = check.required_effects();
             let source = check.authority_source();
+
+            let check_name = match check {
+                DeferredCheck::CheckSubjectBinding { .. } => "CheckSubjectBinding",
+                DeferredCheck::CheckTrustPolicy { .. } => "CheckTrustPolicy",
+                DeferredCheck::CheckStateBaseVersion { .. } => "CheckStateBaseVersion",
+            };
+            let auth_name = match source {
+                AuthoritySource::Caller => "Caller",
+                AuthoritySource::TrustedRuntime => "TrustedRuntime",
+            };
+            let eff_strings: Vec<String> = required_effects.iter().map(|e| e.to_string()).collect();
 
             // Authority check (Rule #10, Rule #17)
             match source {
                 AuthoritySource::Caller => {
                     if let Some(ca) = caller_authority {
                         if !ca.covers(&required_effects) {
-                            return Err(GateError::AuthorityInsufficient("Caller lacks authority for check".to_string()));
+                            trace.push(GateCheckObservation {
+                                check_kind: check_name.to_string(),
+                                authority_source: auth_name.to_string(),
+                                effects: eff_strings,
+                                result: "Fail".to_string(),
+                            });
+                            return GateEvaluationOutput {
+                                witness: Err(GateError::AuthorityInsufficient("Caller lacks authority for check".to_string())),
+                                trace,
+                            };
                         }
+                    } else {
+                        trace.push(GateCheckObservation {
+                            check_kind: check_name.to_string(),
+                            authority_source: auth_name.to_string(),
+                            effects: eff_strings,
+                            result: "Fail".to_string(),
+                        });
+                        return GateEvaluationOutput {
+                            witness: Err(GateError::AuthorityInsufficient("Caller authority absent".to_string())),
+                            trace,
+                        };
                     }
                 }
                 AuthoritySource::TrustedRuntime => {
@@ -205,15 +244,55 @@ impl GateEngine {
                         // S2M07 mutation: falsely requires caller authority for trusted gate check!
                         if let Some(ca) = caller_authority {
                             if !ca.covers(&required_effects) {
-                                return Err(GateError::AuthorityInsufficient("S2M07: Caller lacks authority for trusted check".to_string()));
+                                trace.push(GateCheckObservation {
+                                    check_kind: check_name.to_string(),
+                                    authority_source: auth_name.to_string(),
+                                    effects: eff_strings,
+                                    result: "Fail".to_string(),
+                                });
+                                return GateEvaluationOutput {
+                                    witness: Err(GateError::AuthorityInsufficient("S2M07: Caller lacks authority for trusted check".to_string())),
+                                    trace,
+                                };
                             }
+                        } else {
+                            trace.push(GateCheckObservation {
+                                check_kind: check_name.to_string(),
+                                authority_source: auth_name.to_string(),
+                                effects: eff_strings,
+                                result: "Fail".to_string(),
+                            });
+                            return GateEvaluationOutput {
+                                witness: Err(GateError::AuthorityInsufficient("Caller authority absent for S2M07 check".to_string())),
+                                trace,
+                            };
                         }
                     } else {
                         // Baseline: trusted runtime authority covers the check
                         if let Some(ra) = runtime_authority {
                             if !ra.covers(&required_effects) {
-                                return Err(GateError::AuthorityInsufficient("Runtime lacks authority for check".to_string()));
+                                trace.push(GateCheckObservation {
+                                    check_kind: check_name.to_string(),
+                                    authority_source: auth_name.to_string(),
+                                    effects: eff_strings,
+                                    result: "Fail".to_string(),
+                                });
+                                return GateEvaluationOutput {
+                                    witness: Err(GateError::AuthorityInsufficient("Runtime lacks authority for check".to_string())),
+                                    trace,
+                                };
                             }
+                        } else {
+                            trace.push(GateCheckObservation {
+                                check_kind: check_name.to_string(),
+                                authority_source: auth_name.to_string(),
+                                effects: eff_strings,
+                                result: "Fail".to_string(),
+                            });
+                            return GateEvaluationOutput {
+                                witness: Err(GateError::AuthorityInsufficient("Runtime authority absent".to_string())),
+                                trace,
+                            };
                         }
                     }
                 }
@@ -222,27 +301,64 @@ impl GateEngine {
             match check {
                 DeferredCheck::CheckSubjectBinding { expected_subject, attestation_subject } => {
                     if expected_subject != attestation_subject {
-                        return Err(GateError::SubjectMismatch);
+                        trace.push(GateCheckObservation {
+                            check_kind: check_name.to_string(),
+                            authority_source: auth_name.to_string(),
+                            effects: eff_strings,
+                            result: "Fail".to_string(),
+                        });
+                        return GateEvaluationOutput {
+                            witness: Err(GateError::SubjectMismatch),
+                            trace,
+                        };
                     }
                 }
                 DeferredCheck::CheckTrustPolicy { predicate, issuer } => {
                     if !trust_policy.is_trusted(predicate, issuer) {
-                        return Err(GateError::UntrustedIssuer(issuer.0.clone()));
+                        trace.push(GateCheckObservation {
+                            check_kind: check_name.to_string(),
+                            authority_source: auth_name.to_string(),
+                            effects: eff_strings,
+                            result: "Fail".to_string(),
+                        });
+                        return GateEvaluationOutput {
+                            witness: Err(GateError::UntrustedIssuer(issuer.0.clone())),
+                            trace,
+                        };
                     }
                 }
                 DeferredCheck::CheckStateBaseVersion { key, expected_version } => {
                     let actual_ver = world.get(key).map(|(_, v)| v).unwrap_or(0);
                     if actual_ver != *expected_version {
-                        return Err(GateError::BaseVersionMismatch);
+                        trace.push(GateCheckObservation {
+                            check_kind: check_name.to_string(),
+                            authority_source: auth_name.to_string(),
+                            effects: eff_strings,
+                            result: "Fail".to_string(),
+                        });
+                        return GateEvaluationOutput {
+                            witness: Err(GateError::BaseVersionMismatch),
+                            trace,
+                        };
                     }
                     witness_version = Some(actual_ver);
                 }
             }
+
+            trace.push(GateCheckObservation {
+                check_kind: check_name.to_string(),
+                authority_source: auth_name.to_string(),
+                effects: eff_strings,
+                result: "Pass".to_string(),
+            });
         }
 
-        Ok(GateWitness {
-            observed_state_version: witness_version,
-            gate_effects_executed: executed_effects,
-        })
+        GateEvaluationOutput {
+            witness: Ok(GateWitness {
+                observed_state_version: witness_version,
+                gate_effects_executed: executed_effects,
+            }),
+            trace,
+        }
     }
 }

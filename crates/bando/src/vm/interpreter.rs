@@ -419,17 +419,6 @@ impl<'a> VmInterpreter<'a> {
                     }
                     RequirementResolution::Deferred(checks) => {
                         for check in checks {
-                            let check_name = match check {
-                                DeferredCheck::CheckSubjectBinding { .. } => "CheckSubjectBinding",
-                                DeferredCheck::CheckTrustPolicy { .. } => "CheckTrustPolicy",
-                                DeferredCheck::CheckStateBaseVersion { .. } => "CheckStateBaseVersion",
-                            };
-                            let auth_name = match check.authority_source() {
-                                crate::registry::AuthoritySource::Caller => "Caller",
-                                crate::registry::AuthoritySource::TrustedRuntime => "TrustedRuntime",
-                            };
-                            let check_effs: Vec<String> = check.required_effects().iter().map(|e| e.to_string()).collect();
-
                             for eff in check.required_effects() {
                                 match eff {
                                     crate::ir::effects::Effect::Read(d) => {
@@ -443,13 +432,6 @@ impl<'a> VmInterpreter<'a> {
                                     }
                                 }
                             }
-
-                            state.gate_trace.push(GateCheckObservation {
-                                check_kind: check_name.to_string(),
-                                authority_source: auth_name.to_string(),
-                                effects: check_effs,
-                                result: "Pass".to_string(),
-                            });
                         }
 
                         // Record gate check effects in observable trace (Rule #15)
@@ -471,7 +453,7 @@ impl<'a> VmInterpreter<'a> {
                             }
                         }
 
-                        let gate_eval = GateEngine::evaluate_deferred(
+                        let gate_eval_out = GateEngine::evaluate_deferred(
                             checks,
                             &state.world,
                             &trust_policy,
@@ -481,7 +463,10 @@ impl<'a> VmInterpreter<'a> {
                             self.mutations.s2m07_trusted_gate_requires_caller_authority,
                         );
 
-                        match gate_eval {
+                        // Q4: Genuine check trace recorded after execution
+                        state.gate_trace.extend(gate_eval_out.trace);
+
+                        match gate_eval_out.witness {
                             Ok(w) => {
                                 witness_version =
                                     if self.mutations.s2m08_toctou_revalidation_omitted {

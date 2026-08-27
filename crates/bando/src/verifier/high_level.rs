@@ -2,22 +2,35 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     analysis::DominanceTree,
+    conformance::schema::GateResolutionObservation,
     diagnostics::{Diagnostic, DiagnosticCode},
     ir::{
         effects::Effect,
         ops::{Instruction, Region, RegionTerminator, Terminator},
         types::Type,
-        values::{BlockId, ValueId},
-        Function, Module,
+        BlockId, Function, Module, ValueId,
     },
     registry::RegistrySnapshot,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueOrigin {
+    Literal(String),
+    VerifySubject {
+        predicate: String,
+        subject_val_id: ValueId,
+        subject_literal: Option<String>,
+    },
+    Other(ValueId),
+}
+
 pub struct HighLevelVerifier<'a> {
     pub func: &'a Function,
     pub registry: Option<&'a RegistrySnapshot>,
-    pub all_defined_values: BTreeMap<ValueId, Type>,
     pub diagnostics: Vec<Diagnostic>,
+    pub all_defined_values: BTreeMap<ValueId, Type>,
+    pub value_origins: BTreeMap<ValueId, ValueOrigin>,
+    pub static_gate_resolutions: Vec<GateResolutionObservation>,
 }
 
 impl<'a> HighLevelVerifier<'a> {
@@ -25,8 +38,10 @@ impl<'a> HighLevelVerifier<'a> {
         Self {
             func,
             registry: None,
-            all_defined_values: BTreeMap::new(),
             diagnostics: Vec::new(),
+            all_defined_values: BTreeMap::new(),
+            value_origins: BTreeMap::new(),
+            static_gate_resolutions: Vec::new(),
         }
     }
 
@@ -34,17 +49,19 @@ impl<'a> HighLevelVerifier<'a> {
         Self {
             func,
             registry: Some(registry),
-            all_defined_values: BTreeMap::new(),
             diagnostics: Vec::new(),
+            all_defined_values: BTreeMap::new(),
+            value_origins: BTreeMap::new(),
+            static_gate_resolutions: Vec::new(),
         }
     }
 
-    pub fn verify_module(module: &'a Module) -> Result<(), Vec<Diagnostic>> {
+    pub fn verify_module(module: &Module) -> Result<(), Vec<Diagnostic>> {
         let mut all_diags = Vec::new();
         for func in &module.functions {
-            let mut verifier = HighLevelVerifier::new(func);
-            verifier.verify();
-            all_diags.extend(verifier.diagnostics);
+            let mut v = HighLevelVerifier::new(func);
+            v.verify();
+            all_diags.extend(v.diagnostics);
         }
         if all_diags.is_empty() {
             Ok(())
@@ -54,159 +71,181 @@ impl<'a> HighLevelVerifier<'a> {
     }
 
     pub fn verify_module_with_registry(
-        module: &'a Module,
-        registry: &'a RegistrySnapshot,
-    ) -> Result<(), Vec<Diagnostic>> {
+        module: &Module,
+        registry: &RegistrySnapshot,
+    ) -> Result<Vec<GateResolutionObservation>, (Vec<Diagnostic>, Vec<GateResolutionObservation>)> {
         let mut all_diags = Vec::new();
+        let mut all_resolutions = Vec::new();
         for func in &module.functions {
-            let mut verifier = HighLevelVerifier::with_registry(func, registry);
-            verifier.verify();
-            all_diags.extend(verifier.diagnostics);
+            let mut v = HighLevelVerifier::with_registry(func, registry);
+            v.verify();
+            all_diags.extend(v.diagnostics);
+            all_resolutions.extend(v.static_gate_resolutions);
         }
         if all_diags.is_empty() {
-            Ok(())
+            Ok(all_resolutions)
         } else {
-            Err(all_diags)
+            Err((all_diags, all_resolutions))
         }
     }
 
     pub fn verify(&mut self) {
-        // 1. Check entry block exists
-        if !self.func.blocks.contains_key(&self.func.entry) {
-            self.diagnostics.push(Diagnostic::error(
-                DiagnosticCode::CfgBadTarget,
-                format!(
-                    "Entry block {:?} does not exist in function",
-                    self.func.entry
-                ),
-            ));
+        // Collect function parameter definitions
+        for (param_id, param_ty) in &self.func.params {
+            self.all_defined_values.insert(*param_id, param_ty.clone());
+            self.value_origins.insert(*param_id, ValueOrigin::Other(*param_id));
         }
 
-        // 2. Collect and verify all definitions (R3 SSA single-def)
-        for (param_id, ty) in &self.func.params {
-            self.register_def(*param_id, ty.clone());
-        }
-
-        for (block_id, block) in &self.func.blocks {
-            if block_id != &self.func.entry {
-                for (param_id, ty) in &block.params {
-                    self.register_def(*param_id, ty.clone());
+        // Collect block parameter definitions
+        for (b_id, block) in &self.func.blocks {
+            if b_id != &self.func.entry {
+                for (p_id, p_ty) in &block.params {
+                    self.all_defined_values.insert(*p_id, p_ty.clone());
+                    self.value_origins.insert(*p_id, ValueOrigin::Other(*p_id));
                 }
             }
+        }
 
+        // Collect all instruction defs
+        for block in self.func.blocks.values() {
             for inst in &block.instructions {
-                let dest = inst.dest();
-                let ty = self.infer_instruction_type(inst);
-                self.register_def(dest, ty);
+                let (dest, ty) = self.instruction_def_type(inst);
+                if let Some(existing) = self.all_defined_values.insert(dest, ty.clone()) {
+                    self.diagnostics.push(Diagnostic::error(
+                        DiagnosticCode::SsaDuplicateDef,
+                        format!("SSA value {:?} defined multiple times with types {:?} and {:?}", dest, existing, ty),
+                    ));
+                }
             }
+        }
 
-            // Register definitions in region arguments for MatchResult / MatchActOutcome
-            match &block.terminator {
-                Terminator::MatchResult {
-                    result_val,
-                    ok_arg,
-                    ok_body: _,
-                    err_arg,
-                    err_body: _,
+        // Build dominance tree
+        let dom_tree = self.compute_dominance_tree();
+
+        for (b_id, block) in &self.func.blocks {
+            let mut visible = BTreeSet::new();
+            for (param_id, _) in &self.func.params {
+                visible.insert(*param_id);
+            }
+            for (&other_id, other_block) in &self.func.blocks {
+                if other_id != *b_id && dom_tree.dominates(other_id, *b_id) {
+                    for (p_id, _) in &other_block.params {
+                        visible.insert(*p_id);
+                    }
+                    for inst in &other_block.instructions {
+                        let (dest, _) = self.instruction_def_type(inst);
+                        visible.insert(dest);
+                    }
+                }
+            }
+            self.verify_block(block, &visible);
+        }
+    }
+
+    fn compute_dominance_tree(&self) -> DominanceTree<BlockId> {
+        let block_ids: Vec<BlockId> = self.func.blocks.keys().copied().collect();
+        DominanceTree::compute(self.func.entry, &block_ids, |b| self.get_predecessors(b))
+    }
+
+    fn get_predecessors(&self, target: BlockId) -> Vec<BlockId> {
+        let mut preds = Vec::new();
+        for (b_id, b) in &self.func.blocks {
+            match &b.terminator {
+                Terminator::Br { target: t, .. } => {
+                    if t == &target {
+                        preds.push(*b_id);
+                    }
+                }
+                Terminator::CondBr {
+                    true_target,
+                    false_target,
+                    ..
                 } => {
-                    let (ok_ty, err_ty) = match self.all_defined_values.get(result_val) {
-                        Some(Type::Result { ok, err }) => (*ok.clone(), *err.clone()),
-                        _ => (Type::String, Type::String),
-                    };
-                    self.register_def(*ok_arg, ok_ty);
-                    self.register_def(*err_arg, err_ty);
+                    if true_target == &target || false_target == &target {
+                        preds.push(*b_id);
+                    }
+                }
+                Terminator::MatchResult {
+                    ok_body,
+                    err_body,
+                    ..
+                } => {
+                    if let RegionTerminator::Br { target: ok_t, .. } = &ok_body.terminator {
+                        if ok_t == &target {
+                            preds.push(*b_id);
+                        }
+                    }
+                    if let RegionTerminator::Br { target: err_t, .. } = &err_body.terminator {
+                        if err_t == &target {
+                            preds.push(*b_id);
+                        }
+                    }
                 }
                 Terminator::MatchActOutcome {
-                    outcome_val,
-                    success_arg,
-                    success_body: _,
-                    failure_arg,
-                    failure_body: _,
-                    partial_arg,
-                    partial_body: _,
-                    unknown_arg,
-                    unknown_body: _,
+                    success_body,
+                    failure_body,
+                    partial_body,
+                    unknown_body,
+                    ..
                 } => {
-                    let (succ_ty, fail_ty) = match self.all_defined_values.get(outcome_val) {
-                        Some(Type::ActOutcome { success, failure }) => {
-                            (*success.clone(), *failure.clone())
+                    if let RegionTerminator::Br { target: t, .. } = &success_body.terminator {
+                        if t == &target {
+                            preds.push(*b_id);
                         }
-                        _ => (Type::String, Type::String),
-                    };
-
-                    self.register_def(*success_arg, succ_ty);
-                    self.register_def(*failure_arg, fail_ty);
-                    self.register_def(*partial_arg, Type::PartialReport);
-                    self.register_def(*unknown_arg, Type::String);
+                    }
+                    if let RegionTerminator::Br { target: t, .. } = &failure_body.terminator {
+                        if t == &target {
+                            preds.push(*b_id);
+                        }
+                    }
+                    if let RegionTerminator::Br { target: t, .. } = &partial_body.terminator {
+                        if t == &target {
+                            preds.push(*b_id);
+                        }
+                    }
+                    if let RegionTerminator::Br { target: t, .. } = &unknown_body.terminator {
+                        if t == &target {
+                            preds.push(*b_id);
+                        }
+                    }
                 }
                 _ => {}
             }
         }
-
-        // 3. Compute dominance tree over blocks (R3)
-        let block_ids: Vec<BlockId> = self.func.blocks.keys().copied().collect();
-        let dom_tree =
-            DominanceTree::compute(self.func.entry, &block_ids, |b| self.find_predecessors(b));
-
-        // 4. Verify instructions & terminators with SSA dominance / lexical visibility
-        for (block_id, block) in &self.func.blocks {
-            let mut visible_in_block = BTreeSet::new();
-
-            // All definitions from strictly dominating blocks are visible
-            for other_id in &block_ids {
-                if dom_tree.dominates(*other_id, *block_id) {
-                    if let Some(other_block) = self.func.blocks.get(other_id) {
-                        for (p, _) in &other_block.params {
-                            visible_in_block.insert(*p);
-                        }
-                        for inst in &other_block.instructions {
-                            visible_in_block.insert(inst.dest());
-                        }
-                    }
-                }
-            }
-
-            // Function params always visible
-            for (p, _) in &self.func.params {
-                visible_in_block.insert(*p);
-            }
-
-            // Current block params visible
-            for (p, _) in &block.params {
-                visible_in_block.insert(*p);
-            }
-
-            // Verify instructions in block
-            for inst in &block.instructions {
-                self.verify_instruction(inst, &visible_in_block);
-                visible_in_block.insert(inst.dest());
-            }
-
-            // Verify terminator
-            self.verify_terminator(&block.terminator, *block_id, &mut visible_in_block);
-        }
+        preds
     }
 
-    fn register_def(&mut self, val_id: ValueId, ty: Type) {
-        if self.all_defined_values.insert(val_id, ty).is_some() {
-            self.diagnostics.push(Diagnostic::error(
-                DiagnosticCode::SsaDuplicateDef,
-                format!("Duplicate definition of SSA value {:?}", val_id),
-            ));
+    fn verify_block(&mut self, block: &crate::ir::Block, visible: &BTreeSet<ValueId>) {
+        let mut block_visible = visible.clone();
+        for (p_id, _) in &block.params {
+            block_visible.insert(*p_id);
         }
+        for inst in &block.instructions {
+            self.verify_instruction(inst, &block_visible);
+            let (dest, _) = self.instruction_def_type(inst);
+            block_visible.insert(dest);
+        }
+        self.verify_terminator(&block.terminator, block.id, &block_visible);
     }
 
-    fn infer_instruction_type(&self, inst: &Instruction) -> Type {
+    fn instruction_def_type(&self, inst: &Instruction) -> (ValueId, Type) {
         match inst {
-            Instruction::Pure { ty, .. } => ty.clone(),
+            Instruction::Pure { dest, ty, .. } => (*dest, ty.clone()),
             Instruction::Read {
-                ok_type, err_type, ..
-            } => Type::result(ok_type.clone(), err_type.clone()),
+                dest,
+                ok_type,
+                err_type,
+                ..
+            } => (*dest, Type::result(ok_type.clone(), err_type.clone())),
             Instruction::Infer {
-                ok_type, err_type, ..
-            } => Type::result(ok_type.clone(), err_type.clone()),
-            Instruction::Assign { ty, .. } => ty.clone(),
+                dest,
+                ok_type,
+                err_type,
+                ..
+            } => (*dest, Type::result(ok_type.clone(), err_type.clone())),
+            Instruction::Assign { dest, ty, .. } => (*dest, ty.clone()),
             Instruction::Verify {
+                dest,
                 verifier_id,
                 output_predicate,
                 subject_type,
@@ -214,28 +253,25 @@ impl<'a> HighLevelVerifier<'a> {
             } => {
                 if let Some(reg) = self.registry {
                     if let Some(desc) = reg.verifiers.get(verifier_id) {
-                        let att_ty =
-                            Type::attestation(desc.output_predicate.clone(), desc.subject_type.clone());
-                        return Type::result(att_ty, Type::String);
+                        let att_ty = Type::attestation(
+                            desc.output_predicate.clone(),
+                            desc.subject_type.clone(),
+                        );
+                        return (*dest, Type::result(att_ty, Type::String));
                     }
                 }
-                let att_ty =
-                    Type::attestation(output_predicate.clone(), subject_type.clone());
-                Type::result(att_ty, Type::String)
+                let att_ty = Type::attestation(output_predicate.clone(), subject_type.clone());
+                (*dest, Type::result(att_ty, Type::String))
             }
             Instruction::Act {
-                op_id,
+                dest,
                 success_type,
                 failure_type,
                 ..
-            } => {
-                if let Some(reg) = self.registry {
-                    if let Some(_desc) = reg.operations.get(op_id) {
-                        return Type::act_outcome(success_type.clone(), failure_type.clone());
-                    }
-                }
-                Type::act_outcome(success_type.clone(), failure_type.clone())
-            }
+            } => (
+                *dest,
+                Type::act_outcome(success_type.clone(), failure_type.clone()),
+            ),
         }
     }
 
@@ -258,12 +294,66 @@ impl<'a> HighLevelVerifier<'a> {
     }
 
     fn verify_instruction(&mut self, inst: &Instruction, visible: &BTreeSet<ValueId>) {
-        // Rule #1 & #9: check required effects and caller authority
+        // Track value origins
+        match inst {
+            Instruction::Pure { dest, val, .. } => {
+                if let crate::ir::values::Value::String(s) = val {
+                    self.value_origins.insert(*dest, ValueOrigin::Literal(s.clone()));
+                } else {
+                    self.value_origins.insert(*dest, ValueOrigin::Other(*dest));
+                }
+            }
+            Instruction::Verify { dest, verifier_id, subject, .. } => {
+                let subj_lit = if let Some(ValueOrigin::Literal(s)) = self.value_origins.get(subject) {
+                    Some(s.clone())
+                } else {
+                    None
+                };
+                let pred = if let Some(reg) = self.registry {
+                    if let Some(desc) = reg.verifiers.get(verifier_id) {
+                        desc.output_predicate.clone()
+                    } else {
+                        "UnknownPredicate".to_string()
+                    }
+                } else {
+                    "UnknownPredicate".to_string()
+                };
+                self.value_origins.insert(*dest, ValueOrigin::VerifySubject {
+                    predicate: pred,
+                    subject_val_id: *subject,
+                    subject_literal: subj_lit,
+                });
+            }
+            _ => {}
+        }
+
+        // Q1 & Q2: Check required effects and fail-closed authorities
         let required_effects = match inst {
-            Instruction::Verify { verifier_id, verifier_effects, .. } => {
+            Instruction::Verify { verifier_id, verifier_effects, subject, .. } => {
                 if let Some(reg) = self.registry {
                     if let Some(desc) = reg.verifiers.get(verifier_id) {
+                        if let Some(subj_ty) = self.check_visible(*subject, visible) {
+                            if subj_ty != desc.subject_type {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::TypeMismatch,
+                                    format!("Verify subject type mismatch: expected {:?}, got {:?}", desc.subject_type, subj_ty),
+                                ));
+                            }
+                        }
+
                         let effs: Vec<_> = desc.effect_envelope.effects.iter().cloned().collect();
+
+                        // 1. Semantic row must contain verifier effects (Rule #1, Q2)
+                        for eff in &effs {
+                            if !self.func.declared_effects.contains(eff) {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::EffectUndeclared,
+                                    format!("Verifier requires effect {:?} not declared in function effects", eff),
+                                ));
+                            }
+                        }
+
+                        // 2. Caller authority check (Q2, fail-closed)
                         if let Some(ca) = &reg.caller_authority {
                             if !ca.covers(&effs) {
                                 self.diagnostics.push(Diagnostic::error(
@@ -271,7 +361,13 @@ impl<'a> HighLevelVerifier<'a> {
                                     format!("Caller authority insufficient for verifier {:?}", verifier_id),
                                 ));
                             }
+                        } else {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::AuthorityInsufficient,
+                                format!("Caller authority absent for verifier {:?}", verifier_id),
+                            ));
                         }
+
                         effs
                     } else {
                         self.diagnostics.push(Diagnostic::error(
@@ -285,10 +381,18 @@ impl<'a> HighLevelVerifier<'a> {
                 }
             }
             Instruction::Act { op_id, target_domain, gate_effects, args, evidence, .. } => {
+                for a in args {
+                    self.check_visible(*a, visible);
+                }
+                for e in evidence {
+                    self.check_visible(*e, visible);
+                }
+
                 if let Some(reg) = self.registry {
                     if let Some(op_desc) = reg.operations.get(op_id) {
-                        // 1. Caller authority must contain act[target_domain] (Q2, S2C11)
                         let act_eff = Effect::Act(op_desc.target_domain.clone());
+
+                        // 1. Caller authority must contain act[target_domain] (Q2, fail-closed)
                         if let Some(ca) = &reg.caller_authority {
                             if !ca.contains(&act_eff) {
                                 self.diagnostics.push(Diagnostic::error(
@@ -296,10 +400,10 @@ impl<'a> HighLevelVerifier<'a> {
                                     format!("Caller authority lacks target capability {:?}", act_eff),
                                 ));
                             }
-                        } else if !self.func.declared_effects.contains(&act_eff) {
+                        } else {
                             self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::EffectUndeclared,
-                                format!("Caller lacks target capability {:?}", act_eff),
+                                DiagnosticCode::AuthorityInsufficient,
+                                format!("Caller authority absent for operation {:?}", op_id),
                             ));
                         }
 
@@ -309,10 +413,37 @@ impl<'a> HighLevelVerifier<'a> {
                             gate_effs.extend(req.required_gate_effects());
                         }
 
+                        // 3. Runtime authority must cover all gate check effects (Q2, fail-closed)
+                        for g_eff in &gate_effs {
+                            if let Some(ra) = &reg.runtime_authority {
+                                if !ra.contains(g_eff) {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        DiagnosticCode::AuthorityInsufficient,
+                                        format!("Runtime authority lacks gate capability {:?}", g_eff),
+                                    ));
+                                }
+                            } else {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::AuthorityInsufficient,
+                                    format!("Runtime authority absent for gate check {:?}", g_eff),
+                                ));
+                            }
+                        }
+
                         let mut full_act_effs = vec![act_eff];
                         full_act_effs.extend(gate_effs);
 
-                        // 3. Enforce declared envelope (Rule #11, S2C13)
+                        // 4. Function declared effects MUST contain all semantic effects Σ_act (Q2)
+                        for eff in &full_act_effs {
+                            if !self.func.declared_effects.contains(eff) {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::EffectUndeclared,
+                                    format!("Operation requires effect {:?} not declared in function effects", eff),
+                                ));
+                            }
+                        }
+
+                        // 5. Enforce declared envelope (Rule #11, S2C13)
                         for eff in &full_act_effs {
                             if !op_desc.declared_envelope.contains(eff) {
                                 self.diagnostics.push(Diagnostic::error(
@@ -322,84 +453,112 @@ impl<'a> HighLevelVerifier<'a> {
                             }
                         }
 
-                        // 4. Static requirement resolution over evidence types (P3, S2C09, S2C10)
+                        // 6. Static requirement resolution over SSA subject identity (Q3)
                         for req in &op_desc.requirements {
                             match req {
                                 crate::registry::PolicyRequirement::RequiresStaticProof { predicate, subject_arg_idx } => {
-                                    let matching = evidence.iter().find_map(|e| {
-                                        let ty = self.all_defined_values.get(e)?;
-                                        match ty {
-                                            Type::Attestation { predicate: p, subject_ty } => {
-                                                if p == predicate { Some(subject_ty.clone()) } else { None }
-                                            }
-                                            Type::Result { ok, .. } => match ok.as_ref() {
-                                                Type::Attestation { predicate: p, subject_ty } => {
-                                                    if p == predicate { Some(subject_ty.clone()) } else { None }
+                                    let mut matching_ev = None;
+                                    for e in evidence {
+                                        if let Some(origin) = self.value_origins.get(e) {
+                                            if let ValueOrigin::VerifySubject { predicate: p, subject_val_id, subject_literal } = origin {
+                                                if p == predicate {
+                                                    matching_ev = Some((*subject_val_id, subject_literal.clone()));
+                                                    break;
                                                 }
-                                                _ => None,
-                                            },
-                                            _ => None,
+                                            }
                                         }
-                                    });
+                                    }
 
-                                    match matching {
-                                        Some(subj_ty) => {
-                                            let arg_val_id = args.get(*subject_arg_idx);
-                                            let expected_ty = arg_val_id.and_then(|id| self.all_defined_values.get(id));
-                                            if expected_ty == Some(&subj_ty) {
-                                                // Proved!
+                                    match matching_ev {
+                                        Some((sub_val_id, sub_lit)) => {
+                                            let arg_val_id = args.get(*subject_arg_idx).cloned();
+                                            let arg_lit = arg_val_id.and_then(|id| {
+                                                if let Some(ValueOrigin::Literal(s)) = self.value_origins.get(&id) {
+                                                    Some(s.clone())
+                                                } else {
+                                                    None
+                                                }
+                                            });
+
+                                            if arg_val_id == Some(sub_val_id) {
+                                                // Statically Proved by identical SSA ValueId!
+                                                self.static_gate_resolutions.push(GateResolutionObservation {
+                                                    op_id: op_id.0.clone(),
+                                                    resolution: "Proved".to_string(),
+                                                });
+                                            } else if sub_lit.is_some() && arg_lit.is_some() {
+                                                if sub_lit == arg_lit {
+                                                    // Statically Proved by identical compile-time literal!
+                                                    self.static_gate_resolutions.push(GateResolutionObservation {
+                                                        op_id: op_id.0.clone(),
+                                                        resolution: "Proved".to_string(),
+                                                    });
+                                                } else {
+                                                    // Statically Refuted by distinct compile-time literal! (Q3, S2C09)
+                                                    self.static_gate_resolutions.push(GateResolutionObservation {
+                                                        op_id: op_id.0.clone(),
+                                                        resolution: "Refuted".to_string(),
+                                                    });
+                                                    self.diagnostics.push(Diagnostic::error(
+                                                        DiagnosticCode::RefutedRequirement,
+                                                        format!("Requirement statically refuted for operation {:?}: expected subject literal {:?}, got {:?}", op_id, arg_lit, sub_lit),
+                                                    ));
+                                                }
                                             } else {
-                                                self.diagnostics.push(Diagnostic::error(
-                                                    DiagnosticCode::RefutedRequirement,
-                                                    format!("Requirement statically refuted for operation {:?}", op_id),
-                                                ));
+                                                // Deferred dynamic check
+                                                self.static_gate_resolutions.push(GateResolutionObservation {
+                                                    op_id: op_id.0.clone(),
+                                                    resolution: "Deferred".to_string(),
+                                                });
                                             }
                                         }
                                         None => {
+                                            self.static_gate_resolutions.push(GateResolutionObservation {
+                                                op_id: op_id.0.clone(),
+                                                resolution: "Uncovered".to_string(),
+                                            });
                                             self.diagnostics.push(Diagnostic::error(
                                                 DiagnosticCode::UncoveredRequirement,
-                                                format!("Requirement uncovered for operation {:?}", op_id),
+                                                format!("Static proof requirement for predicate '{}' uncovered for operation {:?}", predicate, op_id),
                                             ));
                                         }
                                     }
                                 }
-                                crate::registry::PolicyRequirement::RequiresAttestation { predicate, subject_arg_idx } => {
-                                    let matching = evidence.iter().find_map(|e| {
-                                        let ty = self.all_defined_values.get(e)?;
-                                        match ty {
-                                            Type::Attestation { predicate: p, subject_ty } => {
-                                                if p == predicate { Some(subject_ty.clone()) } else { None }
-                                            }
-                                            Type::Result { ok, .. } => match ok.as_ref() {
-                                                Type::Attestation { predicate: p, subject_ty } => {
-                                                    if p == predicate { Some(subject_ty.clone()) } else { None }
+                                crate::registry::PolicyRequirement::RequiresAttestation { predicate, .. } => {
+                                    let mut matching_ev = false;
+                                    for e in evidence {
+                                        if let Some(origin) = self.value_origins.get(e) {
+                                            if let ValueOrigin::VerifySubject { predicate: p, .. } = origin {
+                                                if p == predicate {
+                                                    matching_ev = true;
+                                                    break;
                                                 }
-                                                _ => None,
-                                            },
-                                            _ => None,
-                                        }
-                                    });
-
-                                    match matching {
-                                        Some(subj_ty) => {
-                                            let arg_val_id = args.get(*subject_arg_idx);
-                                            let expected_ty = arg_val_id.and_then(|id| self.all_defined_values.get(id));
-                                            if expected_ty != Some(&subj_ty) {
-                                                self.diagnostics.push(Diagnostic::error(
-                                                    DiagnosticCode::RefutedRequirement,
-                                                    format!("Requirement statically refuted for operation {:?}", op_id),
-                                                ));
                                             }
                                         }
-                                        None => {
-                                            self.diagnostics.push(Diagnostic::error(
-                                                DiagnosticCode::UncoveredRequirement,
-                                                format!("Requirement uncovered for operation {:?}", op_id),
-                                            ));
-                                        }
+                                    }
+
+                                    if matching_ev {
+                                        self.static_gate_resolutions.push(GateResolutionObservation {
+                                            op_id: op_id.0.clone(),
+                                            resolution: "Deferred".to_string(),
+                                        });
+                                    } else {
+                                        self.static_gate_resolutions.push(GateResolutionObservation {
+                                            op_id: op_id.0.clone(),
+                                            resolution: "Uncovered".to_string(),
+                                        });
+                                        self.diagnostics.push(Diagnostic::error(
+                                            DiagnosticCode::UncoveredRequirement,
+                                            format!("Attestation requirement for predicate '{}' uncovered for operation {:?}", predicate, op_id),
+                                        ));
                                     }
                                 }
-                                crate::registry::PolicyRequirement::RequiresStateBase { .. } => {}
+                                crate::registry::PolicyRequirement::RequiresStateBase { .. } => {
+                                    self.static_gate_resolutions.push(GateResolutionObservation {
+                                        op_id: op_id.0.clone(),
+                                        resolution: "Deferred".to_string(),
+                                    });
+                                }
                             }
                         }
 
@@ -413,88 +572,26 @@ impl<'a> HighLevelVerifier<'a> {
                     }
                 } else {
                     let mut effs = vec![Effect::Act(target_domain.clone())];
-                    effs.extend(gate_effects.iter().cloned());
+                    effs.extend(gate_effects.clone());
                     effs
                 }
             }
-            _ => inst.required_effects(),
+            Instruction::Read { domain, .. } => vec![Effect::Read(domain.clone())],
+            Instruction::Infer { .. } => vec![Effect::Infer],
+            Instruction::Pure { .. } => Vec::new(),
+            Instruction::Assign { source, .. } => {
+                self.check_visible(*source, visible);
+                Vec::new()
+            }
         };
 
+        // Rule #1 & #9: check that required effects are declared in function signature
         for eff in &required_effects {
-            // Act gate effects may come from trusted runtime authority; caller only needs act[D]
-            if let Effect::Act(_) = eff {
-                if !self.func.declared_effects.contains(eff) {
-                    self.diagnostics.push(Diagnostic::error(
-                        DiagnosticCode::EffectUndeclared,
-                        format!(
-                            "Instruction requires effect {:?} not declared in function effects {:?}",
-                            eff, self.func.declared_effects
-                        ),
-                    ));
-                }
-            } else if !matches!(inst, Instruction::Act { .. }) {
-                if !self.func.declared_effects.contains(eff) {
-                    self.diagnostics.push(Diagnostic::error(
-                        DiagnosticCode::EffectUndeclared,
-                        format!(
-                            "Instruction requires effect {:?} not declared in function effects {:?}",
-                            eff, self.func.declared_effects
-                        ),
-                    ));
-                }
-            }
-        }
-
-        match inst {
-            Instruction::Pure { .. } | Instruction::Read { .. } | Instruction::Infer { .. } => {}
-            Instruction::Assign { source, ty, .. } => {
-                if let Some(src_ty) = self.check_visible(*source, visible) {
-                    if &src_ty != ty {
-                        self.diagnostics.push(Diagnostic::error(
-                            DiagnosticCode::TypeMismatch,
-                            format!(
-                                "Assign type mismatch: source is {:?}, dest is {:?}",
-                                src_ty, ty
-                            ),
-                        ));
-                    }
-                }
-            }
-            Instruction::Verify {
-                subject,
-                subject_type,
-                verifier_id,
-                ..
-            } => {
-                let expected_subject_type = if let Some(reg) = self.registry {
-                    if let Some(desc) = reg.verifiers.get(verifier_id) {
-                        &desc.subject_type
-                    } else {
-                        subject_type
-                    }
-                } else {
-                    subject_type
-                };
-
-                if let Some(sub_ty) = self.check_visible(*subject, visible) {
-                    if &sub_ty != expected_subject_type {
-                        self.diagnostics.push(Diagnostic::error(
-                            DiagnosticCode::TypeMismatch,
-                            format!(
-                                "Verify subject type mismatch: expected {:?}, got {:?}",
-                                expected_subject_type, sub_ty
-                            ),
-                        ));
-                    }
-                }
-            }
-            Instruction::Act { args, evidence, .. } => {
-                for a in args {
-                    self.check_visible(*a, visible);
-                }
-                for e in evidence {
-                    self.check_visible(*e, visible);
-                }
+            if !self.func.declared_effects.contains(eff) {
+                self.diagnostics.push(Diagnostic::error(
+                    DiagnosticCode::EffectUndeclared,
+                    format!("Instruction requires effect {:?} not declared in function signature", eff),
+                ));
             }
         }
     }
@@ -502,35 +599,26 @@ impl<'a> HighLevelVerifier<'a> {
     fn verify_terminator(
         &mut self,
         term: &Terminator,
-        current_block: BlockId,
-        visible: &mut BTreeSet<ValueId>,
+        block_id: BlockId,
+        visible: &BTreeSet<ValueId>,
     ) {
         match term {
             Terminator::Return(val_opt) => {
-                if let Some(val_id) = val_opt {
-                    if let Some(val_ty) = self.check_visible(*val_id, visible) {
-                        if val_ty != self.func.return_type {
-                            self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::TypeMismatch,
-                                format!(
-                                    "Return type mismatch: function returns {:?}, got {:?}",
-                                    self.func.return_type, val_ty
-                                ),
-                            ));
-                        }
-                    }
-                } else if self.func.return_type != Type::Unit {
+                let ret_ty = if let Some(val_id) = val_opt {
+                    self.check_visible(*val_id, visible)
+                        .unwrap_or(Type::String)
+                } else {
+                    Type::String
+                };
+                if ret_ty != self.func.return_type {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::TypeMismatch,
-                        format!(
-                            "Return without value in function expecting {:?}",
-                            self.func.return_type
-                        ),
+                        format!("Return type mismatch in block {:?}: expected {:?}, got {:?}", block_id, self.func.return_type, ret_ty),
                     ));
                 }
             }
             Terminator::Br { target, args } => {
-                self.verify_branch_target(*target, args, visible);
+                self.verify_branch_target(*target, args, block_id, visible);
             }
             Terminator::CondBr {
                 cond,
@@ -543,12 +631,12 @@ impl<'a> HighLevelVerifier<'a> {
                     if cond_ty != Type::Bool {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::TypeMismatch,
-                            format!("CondBr condition must be Bool, got {:?}", cond_ty),
+                            format!("CondBr condition {:?} must have type Bool, got {:?}", cond, cond_ty),
                         ));
                     }
                 }
-                self.verify_branch_target(*true_target, true_args, visible);
-                self.verify_branch_target(*false_target, false_args, visible);
+                self.verify_branch_target(*true_target, true_args, block_id, visible);
+                self.verify_branch_target(*false_target, false_args, block_id, visible);
             }
             Terminator::MatchResult {
                 result_val,
@@ -557,20 +645,20 @@ impl<'a> HighLevelVerifier<'a> {
                 err_arg,
                 err_body,
             } => {
-                if let Some(res_ty) = self.check_visible(*result_val, visible) {
-                    match res_ty {
-                        Type::Result { ok, err } => {
-                            self.verify_region(ok_body, *ok_arg, &ok, current_block, visible);
-                            self.verify_region(err_body, *err_arg, &err, current_block, visible);
-                        }
-                        other => {
-                            self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::TypeMismatch,
-                                format!("MatchResult expects Result<T,E>, got {:?}", other),
-                            ));
-                        }
+                let (ok_ty, err_ty) = match self.check_visible(*result_val, visible) {
+                    Some(Type::Result { ok, err }) => (*ok, *err),
+                    Some(other) => {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::TypeMismatch,
+                            format!("MatchResult on non-result type {:?}", other),
+                        ));
+                        (Type::String, Type::String)
                     }
-                }
+                    None => (Type::String, Type::String),
+                };
+
+                self.verify_region(ok_body, *ok_arg, &ok_ty, block_id, visible);
+                self.verify_region(err_body, *err_arg, &err_ty, block_id, visible);
             }
             Terminator::MatchActOutcome {
                 outcome_val,
@@ -583,46 +671,22 @@ impl<'a> HighLevelVerifier<'a> {
                 unknown_arg,
                 unknown_body,
             } => {
-                if let Some(res_ty) = self.check_visible(*outcome_val, visible) {
-                    match res_ty {
-                        Type::ActOutcome { success, failure } => {
-                            self.verify_region(
-                                success_body,
-                                *success_arg,
-                                &success,
-                                current_block,
-                                visible,
-                            );
-                            self.verify_region(
-                                failure_body,
-                                *failure_arg,
-                                &failure,
-                                current_block,
-                                visible,
-                            );
-                            self.verify_region(
-                                partial_body,
-                                *partial_arg,
-                                &Type::PartialReport,
-                                current_block,
-                                visible,
-                            );
-                            self.verify_region(
-                                unknown_body,
-                                *unknown_arg,
-                                &Type::String,
-                                current_block,
-                                visible,
-                            );
-                        }
-                        other => {
-                            self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::TypeMismatch,
-                                format!("MatchActOutcome expects ActOutcome<T,E>, got {:?}", other),
-                            ));
-                        }
+                let (succ_ty, fail_ty) = match self.check_visible(*outcome_val, visible) {
+                    Some(Type::ActOutcome { success, failure }) => (*success, *failure),
+                    Some(other) => {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::TypeMismatch,
+                            format!("MatchActOutcome on non-act-outcome type {:?}", other),
+                        ));
+                        (Type::String, Type::String)
                     }
-                }
+                    None => (Type::String, Type::String),
+                };
+
+                self.verify_region(success_body, *success_arg, &succ_ty, block_id, visible);
+                self.verify_region(failure_body, *failure_arg, &fail_ty, block_id, visible);
+                self.verify_region(partial_body, *partial_arg, &Type::PartialReport, block_id, visible);
+                self.verify_region(unknown_body, *unknown_arg, &Type::String, block_id, visible);
             }
             Terminator::Unreachable => {}
         }
@@ -641,27 +705,27 @@ impl<'a> HighLevelVerifier<'a> {
 
         for inst in &region.instructions {
             self.verify_instruction(inst, &region_visible);
-            region_visible.insert(inst.dest());
+            let (dest, _) = self.instruction_def_type(inst);
+            region_visible.insert(dest);
         }
 
         match &region.terminator {
             RegionTerminator::Return(val_opt) => {
-                if let Some(val_id) = val_opt {
-                    if let Some(val_ty) = self.check_visible(*val_id, &region_visible) {
-                        if val_ty != self.func.return_type {
-                            self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::TypeMismatch,
-                                format!(
-                                    "Region Return type mismatch: expected {:?}, got {:?}",
-                                    self.func.return_type, val_ty
-                                ),
-                            ));
-                        }
-                    }
+                let ret_ty = if let Some(val_id) = val_opt {
+                    self.check_visible(*val_id, &region_visible)
+                        .unwrap_or(Type::String)
+                } else {
+                    Type::String
+                };
+                if ret_ty != self.func.return_type {
+                    self.diagnostics.push(Diagnostic::error(
+                        DiagnosticCode::TypeMismatch,
+                        format!("Region return type mismatch: expected {:?}, got {:?}", self.func.return_type, ret_ty),
+                    ));
                 }
             }
             RegionTerminator::Br { target, args } => {
-                self.verify_branch_target(*target, args, &region_visible);
+                self.verify_branch_target(*target, args, _parent_block, &region_visible);
             }
             RegionTerminator::Unreachable => {}
         }
@@ -671,138 +735,38 @@ impl<'a> HighLevelVerifier<'a> {
         &mut self,
         target: BlockId,
         args: &[ValueId],
+        source_block: BlockId,
         visible: &BTreeSet<ValueId>,
     ) {
-        let block = if let Some(b) = self.func.blocks.get(&target) {
-            b
-        } else {
-            self.diagnostics.push(Diagnostic::error(
-                DiagnosticCode::CfgBadTarget,
-                format!("Branch target block {:?} does not exist", target),
-            ));
-            return;
+        let target_block = match self.func.blocks.get(&target) {
+            Some(b) => b,
+            None => {
+                self.diagnostics.push(Diagnostic::error(
+                    DiagnosticCode::CfgBadTarget,
+                    format!("Branch from block {:?} to non-existent target block {:?}", source_block, target),
+                ));
+                return;
+            }
         };
 
-        if block.params.len() != args.len() {
+        if target_block.params.len() != args.len() {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::BlockArgArity,
-                format!(
-                    "Block {:?} expects {} arguments, got {}",
-                    target,
-                    block.params.len(),
-                    args.len()
-                ),
+                format!("Block {:?} expects {} arguments, but branch provided {}", target, target_block.params.len(), args.len()),
             ));
             return;
         }
 
-        for (i, (arg_id, (_, expected_ty))) in args.iter().zip(&block.params).enumerate() {
-            if let Some(arg_ty) = self.check_visible(*arg_id, visible) {
+        for (i, (param_id, expected_ty)) in target_block.params.iter().enumerate() {
+            let arg_id = args[i];
+            if let Some(arg_ty) = self.check_visible(arg_id, visible) {
                 if &arg_ty != expected_ty {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::BlockArgType,
-                        format!(
-                            "Block {:?} arg {} type mismatch: expected {:?}, got {:?}",
-                            target, i, expected_ty, arg_ty
-                        ),
+                        format!("Block {:?} parameter {} ({:?}) expects type {:?}, got {:?}", target, i, param_id, expected_ty, arg_ty),
                     ));
                 }
             }
         }
-    }
-
-    fn find_predecessors(&self, target: BlockId) -> Vec<BlockId> {
-        let mut preds = Vec::new();
-        for (b_id, b) in &self.func.blocks {
-            match &b.terminator {
-                Terminator::Br {
-                    target: t,
-                    args: _,
-                } => {
-                    if t == &target {
-                        preds.push(*b_id);
-                    }
-                }
-                Terminator::CondBr {
-                    true_target,
-                    false_target,
-                    ..
-                } => {
-                    if true_target == &target || false_target == &target {
-                        preds.push(*b_id);
-                    }
-                }
-                Terminator::MatchResult {
-                    ok_body,
-                    err_body,
-                    ..
-                } => {
-                    if let RegionTerminator::Br {
-                        target: ok_t,
-                        args: _,
-                    } = &ok_body.terminator
-                    {
-                        if ok_t == &target {
-                            preds.push(*b_id);
-                        }
-                    }
-                    if let RegionTerminator::Br {
-                        target: err_t,
-                        args: _,
-                    } = &err_body.terminator
-                    {
-                        if err_t == &target {
-                            preds.push(*b_id);
-                        }
-                    }
-                }
-                Terminator::MatchActOutcome {
-                    success_body,
-                    failure_body,
-                    partial_body,
-                    unknown_body,
-                    ..
-                } => {
-                    if let RegionTerminator::Br {
-                        target: t,
-                        args: _,
-                    } = &success_body.terminator
-                    {
-                        if t == &target {
-                            preds.push(*b_id);
-                        }
-                    }
-                    if let RegionTerminator::Br {
-                        target: t,
-                        args: _,
-                    } = &failure_body.terminator
-                    {
-                        if t == &target {
-                            preds.push(*b_id);
-                        }
-                    }
-                    if let RegionTerminator::Br {
-                        target: t,
-                        args: _,
-                    } = &partial_body.terminator
-                    {
-                        if t == &target {
-                            preds.push(*b_id);
-                        }
-                    }
-                    if let RegionTerminator::Br {
-                        target: t,
-                        args: _,
-                    } = &unknown_body.terminator
-                    {
-                        if t == &target {
-                            preds.push(*b_id);
-                        }
-                    }
-                }
-                Terminator::Return(_) | Terminator::Unreachable => {}
-            }
-        }
-        preds
     }
 }
