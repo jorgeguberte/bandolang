@@ -57,7 +57,9 @@ impl<'a> HighLevelVerifier<'a> {
             ));
         }
 
-        // 3. Collect and check duplicate definitions for block params and instructions
+        // 3. First pass: Collect all definitions across blocks and regions with exact types (S1)
+        // Note: Region-local definitions are registered globally for uniqueness and type tracking,
+        // but are NOT added to block_definitions[parent_block], preserving lexical region isolation.
         for (block_id, block) in &self.func.blocks {
             let mut block_defs = Vec::new();
             for (param_id, param_type) in &block.params {
@@ -67,28 +69,37 @@ impl<'a> HighLevelVerifier<'a> {
 
             for inst in &block.instructions {
                 let dest = inst.dest();
-                let ty = match inst {
-                    Instruction::Pure { ty, .. } => ty.clone(),
-                    Instruction::Read { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
-                    Instruction::Infer { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
-                    Instruction::Assign { ty, .. } => ty.clone(),
-                };
+                let ty = self.infer_instruction_type(inst);
                 self.register_def(dest, ty);
                 block_defs.push(dest);
             }
 
-            if let Terminator::MatchResult { ok_arg, ok_body, err_arg, err_body, .. } = &block.terminator {
-                self.register_def(*ok_arg, Type::String); // Checked properly during type check
-                block_defs.push(*ok_arg);
+            if let Terminator::MatchResult {
+                result_val,
+                ok_arg,
+                ok_body,
+                err_arg,
+                err_body,
+            } = &block.terminator
+            {
+                let (ok_ty, err_ty) = match self.all_defined_values.get(result_val) {
+                    Some(Type::Result { ok, err }) => (*ok.clone(), *err.clone()),
+                    _ => (Type::String, Type::String),
+                };
+
+                // Register region arguments with their actual types (S1)
+                self.register_def(*ok_arg, ok_ty);
                 for inst in &ok_body.instructions {
-                    self.register_def(inst.dest(), Type::String);
-                    block_defs.push(inst.dest());
+                    let dest = inst.dest();
+                    let ty = self.infer_instruction_type(inst);
+                    self.register_def(dest, ty);
                 }
-                self.register_def(*err_arg, Type::String);
-                block_defs.push(*err_arg);
+
+                self.register_def(*err_arg, err_ty);
                 for inst in &err_body.instructions {
-                    self.register_def(inst.dest(), Type::String);
-                    block_defs.push(inst.dest());
+                    let dest = inst.dest();
+                    let ty = self.infer_instruction_type(inst);
+                    self.register_def(dest, ty);
                 }
             }
 
@@ -99,7 +110,7 @@ impl<'a> HighLevelVerifier<'a> {
         let block_ids: Vec<BlockId> = self.func.blocks.keys().copied().collect();
         let dom_tree = DominanceTree::compute(self.func.entry, &block_ids, |b| self.find_predecessors(b));
 
-        // 5. Verify instructions & terminators with SSA dominance / visibility
+        // 5. Verify instructions & terminators with SSA dominance / lexical visibility (S1 & R3)
         for (block_id, block) in &self.func.blocks {
             let mut visible_values = BTreeSet::new();
 
@@ -143,6 +154,15 @@ impl<'a> HighLevelVerifier<'a> {
         }
     }
 
+    fn infer_instruction_type(&self, inst: &Instruction) -> Type {
+        match inst {
+            Instruction::Pure { ty, .. } => ty.clone(),
+            Instruction::Read { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
+            Instruction::Infer { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
+            Instruction::Assign { ty, .. } => ty.clone(),
+        }
+    }
+
     fn find_predecessors(&self, target: BlockId) -> Vec<BlockId> {
         let mut preds = Vec::new();
         for (b_id, b) in &self.func.blocks {
@@ -152,7 +172,11 @@ impl<'a> HighLevelVerifier<'a> {
                         preds.push(*b_id);
                     }
                 }
-                Terminator::CondBr { true_target, false_target, .. } => {
+                Terminator::CondBr {
+                    true_target,
+                    false_target,
+                    ..
+                } => {
                     if true_target == &target || false_target == &target {
                         preds.push(*b_id);
                     }
@@ -178,7 +202,7 @@ impl<'a> HighLevelVerifier<'a> {
         if !visible.contains(&val_id) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::SsaUseBeforeDef,
-                format!("Use of SSA value {:?} outside its dominating scope", val_id),
+                format!("Use of SSA value {:?} outside its dominating/lexical scope", val_id),
             ));
             return None;
         }
@@ -280,13 +304,13 @@ impl<'a> HighLevelVerifier<'a> {
         &mut self,
         region: &Region,
         arg_id: ValueId,
-        expected_arg_ty: &Type,
+        _expected_arg_ty: &Type,
         _parent_block: BlockId,
         parent_visible: &BTreeSet<ValueId>,
     ) {
+        // S1: Region-local scope starts with parent visible values + region argument
         let mut region_visible = parent_visible.clone();
         region_visible.insert(arg_id);
-        self.all_defined_values.insert(arg_id, expected_arg_ty.clone());
 
         for inst in &region.instructions {
             self.verify_instruction(inst, &region_visible);

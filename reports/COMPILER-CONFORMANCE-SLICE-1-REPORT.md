@@ -1,12 +1,10 @@
-# SOMA — Compiler Conformance v0 (Slice 1: Result / CFG / Pure-Read-Infer) Execution Report — REPAIR GATE (R1–R5)
+# SOMA — Compiler Conformance v0 (Slice 1: Result / CFG / Pure-Read-Infer) Execution Report — FINAL BOUNDED ACCEPTANCE (S1–S3)
 
-> **Compiler Conformance v0 — Slice 1 execution report after R1–R5 repair gate.**
+> **Compiler Conformance v0 — Slice 1 final execution report.**
 > 
-> 1. **R1 (Real Structured → CFG Lowering)**: High-level SOMA-IR implements structured `MatchResult { result_val, ok_arg, ok_body: Region, err_arg, err_body: Region }`. The Rust lowering pass allocates fresh VM blocks, binds block parameters, generates flat `VmTerminator::SwitchResult`, and lowers region bodies into basic blocks without pre-baking CFG shapes in high-level ASTs.
-> 2. **R2 (Preserve Effect Rows into VM IR)**: `VmFunction` preserves `declared_effects: EffectRow`. `VmInstruction` exposes `required_effects()`. `VmVerifier` statically verifies that every instruction's required effects are declared in `vm_func.declared_effects`. C11/C12 assert static effect-row preservation.
-> 3. **R3 (Real SSA Dominance & Visibility)**: Replaced global definition checks with real CFG dominance analysis (`DominanceTree::compute`). Definitions must dominate uses or be explicitly transported via block arguments. Tested against sibling-block leaks and diamond-merge leaks.
-> 4. **R4 (Real Compiler Mutation Kills)**: M01–M10 test real compiler/lowering/analysis mutations (dropping Err edge, swapping Ok/Err targets, corrupting block argument types, dropping latent metadata, eager fact materialization, union merge, dropping effect rows, stale SSA IDs, single-pass loop analysis). Every mutation is caught by verifiers or differential tests.
-> 5. **R5 (Complete Python ↔ Rust Differential)**: `compare_exact_observables` compares every declared shared observable in `ConformanceObservationV0` (status, return value, observable effects, exact $\Psi$ facts, latent facts, types, bindings, lineage, diagnostics). Verified with 3 negative comparator probes.
+> 1. **S1 (Region-Local SSA Scoping & Type Registration)**: High-level verifier enforces strict lexical region isolation. Definitions inside `ok_body` and `err_body` are not attributed to the parent block's definition set, preventing leakage past `MatchResult` without explicit transport via block arguments. Region parameters and instructions are registered with their exact types. Tested against region definition leakage and cross-region contamination.
+> 2. **S2 (Genuine Killed M10 Mutation on Loop Fixed-Point)**: M10 verifies loop fixed-point analysis by comparing baseline multi-pass analysis against mutated single-pass analysis (`m10_single_pass_loop_analysis`). In baseline, backedge intersection eliminates entry-only facts; in single-pass mutant, backedge revisitation is skipped, causing fact divergence (`mutant_obs != baseline_obs`), killing the mutation deterministically.
+> 3. **S3 (True Exact Equality Across All 9 Shared Observables)**: `compare_exact_observables` executes full structural equality on all 9 observables: `status`, `return_val`, `effects`, `active_facts`, `latent_facts`, `types`, `bindings`, `lineage`, `diagnostics`. Rejects phantom extra entries and unexpected diagnostics via 4 adversarial negative probes.
 > 
 > Status:
 > - Compiler Conformance v0 Slice 1: **VERIFIED IN TESTED REGIME**
@@ -21,11 +19,12 @@
 
 ```text
 Rust Native Tests (crates/bando/tests/):
-    5/5 PASS
+    6/6 PASS
     - test_c01_pure_value [PASS]
     - test_c02_structured_match_result_and_lowering [PASS]
     - test_c05_c06_diamond_must_fact_merge [PASS]
     - test_r3_ssa_dominance_and_scope_visibility [PASS]
+    - test_s1_region_local_definition_isolation_and_dominance [PASS]
     - test_negative_verifier_undeclared_effect [PASS]
 
 Golden Conformance Programs (C01–C12, R1 & R2 Verified):
@@ -42,8 +41,8 @@ Golden Conformance Programs (C01–C12, R1 & R2 Verified):
     - C11_read_effect_preservation (static VM effect-row verified) [PASS]
     - C12_infer_effect_preservation (static VM effect-row verified) [PASS]
 
-Negative Verifier Cases (V01–V12, R3 Verified):
-    12/12 PASS
+Negative Verifier Cases (V01–V14, R3 & S1 Verified):
+    14/14 PASS
     - V01_duplicate_ssa (SsaDuplicateDef) [PASS]
     - V02_use_before_definition (SsaUseBeforeDef) [PASS]
     - V03_wrong_ok_payload_type (TypeMismatch) [PASS]
@@ -56,8 +55,10 @@ Negative Verifier Cases (V01–V12, R3 Verified):
     - V10_type_mismatch_assign (TypeMismatch) [PASS]
     - V11_return_type_mismatch (TypeMismatch) [PASS]
     - V12_sibling_block_ssa_use_without_block_arg (SsaUseBeforeDef) [PASS]
+    - V13_region_local_def_leak (SsaUseBeforeDef) [PASS]
+    - V14_region_cross_use (SsaUseBeforeDef) [PASS]
 
-Real Compiler Mutation Kills (M01–M10, R4 Verified):
+Real Compiler Mutation Kills (M01–M10, R4 & S2 Verified):
     10/10 PASS
     - M01_drop_err_edge (caught by CfgBadTarget) [PASS]
     - M02_swap_ok_err_payloads (caught by ResultPayloadType/differential) [PASS]
@@ -68,17 +69,18 @@ Real Compiler Mutation Kills (M01–M10, R4 Verified):
     - M07_omit_read_effect (caught by EffectUndeclared in VM Verifier) [PASS]
     - M08_omit_infer_effect (caught by EffectUndeclared in VM Verifier) [PASS]
     - M09_stale_ssa_reference (caught by SsaUseBeforeDef in VM Verifier) [PASS]
-    - M10_single_pass_loop_leakage (caught by loop analysis check) [PASS]
+    - M10_single_pass_loop_leakage (demonstrably killed via fact divergence) [PASS]
 
-Python Oracle ↔ Rust Toolchain Exact Differential (R5 Verified):
-    7/7 PASS
+Python Oracle ↔ Rust Toolchain Exact Differential (R5 & S3 Verified):
+    8/8 PASS
     - C01_pure_value [PASS]
     - C02_read_ok [PASS]
     - C03_read_err [PASS]
     - C09_infer_ok [PASS]
-    - PROBE_wrong_lineage_fails [PASS]
-    - PROBE_lost_latent_facts_fails [PASS]
-    - PROBE_wrong_type_binding_fails [PASS]
+    - PROBE_extra_lineage_fails [PASS]
+    - PROBE_extra_latent_fact_fails [PASS]
+    - PROBE_extra_binding_entry_fails [PASS]
+    - PROBE_unexpected_diagnostic_fails [PASS]
 
 Item 3 Regression Battery:
     53/53 PASS (zero regressions)
@@ -87,7 +89,7 @@ Phase D Lowering Regression Battery:
     81/81 PASS (zero regressions)
 
 Total test suite across repository:
-    178/178 PASS
+    183/183 PASS
 ```
 
 ---

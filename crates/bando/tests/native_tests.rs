@@ -174,7 +174,7 @@ fn test_r3_ssa_dominance_and_scope_visibility() {
     b0.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::I64 });
     func_ok.blocks.insert(BlockId(0), b0);
 
-    let mut b1 = Block::new(BlockId(1), Terminator::Return(Some(ValueId(1)))); // Value 1 from dominating b0
+    let b1 = Block::new(BlockId(1), Terminator::Return(Some(ValueId(1)))); // Value 1 from dominating b0
     func_ok.blocks.insert(BlockId(1), b1);
 
     let mut mod_ok = Module::new("m_ok");
@@ -191,13 +191,85 @@ fn test_r3_ssa_dominance_and_scope_visibility() {
     b_left.instructions.push(Instruction::Pure { dest: ValueId(2), val: Value::I64(100), ty: Type::I64 });
     func_bad.blocks.insert(BlockId(1), b_left);
 
-    let mut b_right = Block::new(BlockId(2), Terminator::Return(Some(ValueId(2)))); // Value 2 defined in sibling block 1!
+    let b_right = Block::new(BlockId(2), Terminator::Return(Some(ValueId(2)))); // Value 2 defined in sibling block 1!
     func_bad.blocks.insert(BlockId(2), b_right);
 
     let mut mod_bad = Module::new("m_bad");
     mod_bad.functions.push(func_bad);
     let diags = HighLevelVerifier::verify_module(&mod_bad).unwrap_err();
     assert!(diags.iter().any(|d| d.code == DiagnosticCode::SsaUseBeforeDef));
+}
+
+#[test]
+fn test_s1_region_local_definition_isolation_and_dominance() {
+    // 1. Dominating parent value used inside both ok_body and err_body => ACCEPTED
+    let mut func_dom = Function::new("main", BlockId(0), Type::I64);
+    let mut entry = Block::new(
+        BlockId(0),
+        Terminator::MatchResult {
+            result_val: ValueId(1),
+            ok_arg: ValueId(3),
+            ok_body: Region::new(RegionTerminator::Return(Some(ValueId(2)))), // Value 2 from parent!
+            err_arg: ValueId(4),
+            err_body: Region::new(RegionTerminator::Return(Some(ValueId(2)))), // Value 2 from parent!
+        },
+    );
+    entry.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::result(Type::I64, Type::I64) });
+    entry.instructions.push(Instruction::Pure { dest: ValueId(2), val: Value::I64(100), ty: Type::I64 });
+    func_dom.blocks.insert(BlockId(0), entry);
+
+    let mut mod_dom = Module::new("m_dom");
+    mod_dom.functions.push(func_dom);
+    assert!(HighLevelVerifier::verify_module(&mod_dom).is_ok());
+
+    // 2. Region-local Ok definition used outside MatchResult without block arg => REJECTED
+    let mut func_leak = Function::new("main", BlockId(0), Type::I64);
+    let mut entry_leak = Block::new(
+        BlockId(0),
+        Terminator::MatchResult {
+            result_val: ValueId(1),
+            ok_arg: ValueId(2),
+            ok_body: Region {
+                instructions: vec![Instruction::Pure { dest: ValueId(4), val: Value::I64(42), ty: Type::I64 }],
+                terminator: RegionTerminator::Br { target: BlockId(1), args: vec![] }, // Did not transport 4!
+            },
+            err_arg: ValueId(3),
+            err_body: Region::new(RegionTerminator::Br { target: BlockId(1), args: vec![] }),
+        },
+    );
+    entry_leak.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::result(Type::I64, Type::I64) });
+    func_leak.blocks.insert(BlockId(0), entry_leak);
+
+    let b_merge = Block::new(BlockId(1), Terminator::Return(Some(ValueId(4)))); // ILLEGAL USE OF REGION-LOCAL VALUE 4!
+    func_leak.blocks.insert(BlockId(1), b_merge);
+
+    let mut mod_leak = Module::new("m_leak");
+    mod_leak.functions.push(func_leak);
+    let diags = HighLevelVerifier::verify_module(&mod_leak).unwrap_err();
+    assert!(diags.iter().any(|d| d.code == DiagnosticCode::SsaUseBeforeDef));
+
+    // 3. Region-local Err definition used from Ok region => REJECTED
+    let mut func_cross = Function::new("main", BlockId(0), Type::I64);
+    let mut entry_cross = Block::new(
+        BlockId(0),
+        Terminator::MatchResult {
+            result_val: ValueId(1),
+            ok_arg: ValueId(2),
+            ok_body: Region::new(RegionTerminator::Return(Some(ValueId(4)))), // Uses Value 4 defined in err_body!
+            err_arg: ValueId(3),
+            err_body: Region {
+                instructions: vec![Instruction::Pure { dest: ValueId(4), val: Value::I64(99), ty: Type::I64 }],
+                terminator: RegionTerminator::Return(Some(ValueId(4))),
+            },
+        },
+    );
+    entry_cross.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::result(Type::I64, Type::I64) });
+    func_cross.blocks.insert(BlockId(0), entry_cross);
+
+    let mut mod_cross = Module::new("m_cross");
+    mod_cross.functions.push(func_cross);
+    let diags_cross = HighLevelVerifier::verify_module(&mod_cross).unwrap_err();
+    assert!(diags_cross.iter().any(|d| d.code == DiagnosticCode::SsaUseBeforeDef));
 }
 
 #[test]

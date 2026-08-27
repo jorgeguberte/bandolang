@@ -1,17 +1,17 @@
-"""test_mutations.py — Real Compiler Mutation Testing M01–M10 for Compiler Conformance v0 (Slice 1, R4).
+"""test_mutations.py — Real Compiler Mutation Testing M01–M10 for Compiler Conformance v0 (Slice 1, R4 & S2).
 
 Takes valid golden high-level programs and enables real compiler/lowering/analysis mutations
 to prove that every mutation causes a test failure.
 """
 from __future__ import annotations
 
+import copy
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent))
 
 from protocol import invoke_rust_conformance
-import test_golden
 
 PASS, FAIL = 0, 0
 
@@ -149,7 +149,6 @@ def m02_swap_ok_err_targets():
     prog = base_c02_program()
     prog["mutations"] = {"m02_swap_ok_err_targets": True}
     obs = invoke_rust_conformance(prog)
-    # Target parameter names / payloads mismatched
     return obs["status"] != "ok" or obs.get("return_val") != {"kind": "String", "payload": "data_of(docs)"}
 
 
@@ -166,7 +165,6 @@ def m04_lose_latent_postcondition():
     prog = base_c02_program()
     prog["mutations"] = {"m04_drop_latent_metadata": True}
     obs = invoke_rust_conformance(prog)
-    # Oracle expects ObservedAt, but mutation dropped it
     return not any(f.get("predicate") == "ObservedAt" for f in obs.get("active_facts", []))
 
 
@@ -197,7 +195,6 @@ def m05_eager_on_ok_materialization():
         }
     }
     obs = invoke_rust_conformance(prog)
-    # Mutation falsely placed ObservedAt in unrefined entry block!
     return any(f.get("predicate") == "ObservedAt" for f in obs.get("active_facts", []))
 
 
@@ -206,7 +203,6 @@ def m06_merge_union_instead_of_intersection():
     prog = base_diamond_program()
     prog["mutations"] = {"m06_merge_union_facts": True}
     obs = invoke_rust_conformance(prog)
-    # ExclusiveOk fact falsely survived merge!
     return any(f.get("predicate") == "ExclusiveOk" for f in obs.get("active_facts", []))
 
 
@@ -284,33 +280,85 @@ def m09_stale_ssa_reference():
 
 
 def m10_single_pass_loop_leakage():
-    # R4: Analyzer executes single pass loop analysis
+    # S2: Loop requires backedge fixed point convergence to eliminate entry-only fact
     prog = {
-        "name": "C08_loop",
+        "name": "M10_loop_fixed_point_kill",
         "entry_func": "main",
         "inputs": {"v1": {"kind": "Bool", "payload": False}},
-        "mutations": {"m10_single_pass_loop_analysis": True},
         "module": {
-            "name": "m",
+            "name": "mod_m10",
             "functions": [{
-                "name": "main", "params": [[1, {"kind": "Bool"}]], "return_type": {"kind": "I64"},
-                "declared_effects": {"effects": []}, "entry": 0,
+                "name": "main",
+                "params": [[1, {"kind": "Bool"}]],
+                "return_type": {"kind": "I64"},
+                "declared_effects": {"effects": [{"Read": "doc"}]},
+                "entry": 0,
                 "blocks": {
-                    "0": {"id": 0, "params": [], "instructions": [{"Pure": {"dest": 2, "val": {"kind": "I64", "payload": 0}, "ty": {"kind": "I64"}}}], "terminator": {"Br": {"target": 1, "args": [2]}}},
-                    "1": {"id": 1, "params": [[3, {"kind": "I64"}]], "instructions": [], "terminator": {"CondBr": {"cond": 1, "true_target": 2, "true_args": [3], "false_target": 3, "false_args": [3]}}},
-                    "2": {"id": 2, "params": [[4, {"kind": "I64"}]], "instructions": [], "terminator": {"Br": {"target": 1, "args": [4]}}},
-                    "3": {"id": 3, "params": [[5, {"kind": "I64"}]], "instructions": [], "terminator": {"Return": 5}}
+                    "0": {
+                        "id": 0, "name": "entry", "params": [],
+                        "instructions": [
+                            {"Read": {
+                                "dest": 2, "domain": "doc", "ok_type": {"kind": "I64"}, "err_type": {"kind": "I64"},
+                                "latent": {
+                                    "on_ok": [{"predicate": "EntryOnlyFact", "args": [{"Symbol": "$value"}]}],
+                                    "on_err": []
+                                }
+                            }}
+                        ],
+                        "terminator": {
+                            "MatchResult": {
+                                "result_val": 2,
+                                "ok_arg": 3,
+                                "ok_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": [3]}}},
+                                "err_arg": 4,
+                                "err_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": [4]}}}
+                            }
+                        }
+                    },
+                    "1": {
+                        "id": 1, "name": "loop_header", "params": [[5, {"kind": "I64"}]],
+                        "instructions": [],
+                        "terminator": {
+                            "CondBr": {
+                                "cond": 1,
+                                "true_target": 2,
+                                "true_args": [5],
+                                "false_target": 3,
+                                "false_args": [5]
+                            }
+                        }
+                    },
+                    "2": {
+                        "id": 2, "name": "loop_body", "params": [[6, {"kind": "I64"}]],
+                        "instructions": [],
+                        "terminator": {"Br": {"target": 1, "args": [6]}}
+                    },
+                    "3": {
+                        "id": 3, "name": "exit", "params": [[7, {"kind": "I64"}]],
+                        "instructions": [],
+                        "terminator": {"Return": 7}
+                    }
                 }
             }]
         }
     }
-    obs = invoke_rust_conformance(prog)
-    return obs["status"] == "ok"
+
+    # 1. Baseline analysis (without mutation): full fixed-point iteration produces canonical facts
+    baseline_prog = copy.deepcopy(prog)
+    baseline_obs = invoke_rust_conformance(baseline_prog)
+
+    # 2. Mutant analysis (with single-pass): skips fixed point re-evaluations and produces a divergent fact set
+    mutant_prog = copy.deepcopy(prog)
+    mutant_prog["mutations"] = {"m10_single_pass_loop_analysis": True}
+    mutant_obs = invoke_rust_conformance(mutant_prog)
+
+    # Mutation is killed because mutant produces an incorrect, divergent fact set from baseline fixed point (S2)
+    return baseline_obs.get("active_facts") != mutant_obs.get("active_facts")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("SOMA COMPILER CONFORMANCE v0 (SLICE 1) — Real Mutation Kills M01–M10 (R4)")
+    print("SOMA COMPILER CONFORMANCE v0 (SLICE 1) — Real Mutation Kills M01–M10 (R4 & S2)")
     kill_mutation("M01_drop_err_edge", m01_drop_err_edge)
     kill_mutation("M02_swap_ok_err_payloads", m02_swap_ok_err_targets)
     kill_mutation("M03_corrupt_block_arg_type", m03_corrupt_block_arg_type)

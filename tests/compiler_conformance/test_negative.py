@@ -440,9 +440,92 @@ def v12_sibling_block_ssa_use_without_block_arg():
     expect_verifier_error("V12_sibling_block_ssa_use_without_block_arg", prog, "SsaUseBeforeDef")
 
 
+def v13_region_local_def_leak():
+    # S1: Region-local Ok definition used outside MatchResult without block argument
+    prog = {
+        "name": "V13_region_local_leak",
+        "entry_func": "main",
+        "inputs": {},
+        "module": {
+            "name": "mod_v13",
+            "functions": [{
+                "name": "main",
+                "params": [],
+                "return_type": make_type_i64(),
+                "declared_effects": {"effects": []},
+                "entry": 0,
+                "blocks": {
+                    "0": {
+                        "id": 0, "name": "entry", "params": [],
+                        "instructions": [{"Pure": {"dest": 1, "val": {"kind": "I64", "payload": 10}, "ty": make_type_result(make_type_i64(), make_type_i64())}}],
+                        "terminator": {
+                            "MatchResult": {
+                                "result_val": 1,
+                                "ok_arg": 2,
+                                "ok_body": {
+                                    "instructions": [{"Pure": {"dest": 4, "val": {"kind": "I64", "payload": 42}, "ty": make_type_i64()}}],
+                                    "terminator": {"Br": {"target": 1, "args": []}}  # DID NOT TRANSPORT 4!
+                                },
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": []}}}
+                            }
+                        }
+                    },
+                    "1": {
+                        "id": 1, "name": "merge", "params": [], "instructions": [],
+                        "terminator": {"Return": 4}  # ILLEGAL USE OF REGION-LOCAL VALUE 4!
+                    }
+                }
+            }]
+        }
+    }
+    expect_verifier_error("V13_region_local_def_leak", prog, "SsaUseBeforeDef")
+
+
+def v14_region_cross_use():
+    # S1: Region-local Err definition used inside Ok region
+    prog = {
+        "name": "V14_region_cross_use",
+        "entry_func": "main",
+        "inputs": {},
+        "module": {
+            "name": "mod_v14",
+            "functions": [{
+                "name": "main",
+                "params": [],
+                "return_type": make_type_i64(),
+                "declared_effects": {"effects": []},
+                "entry": 0,
+                "blocks": {
+                    "0": {
+                        "id": 0, "name": "entry", "params": [],
+                        "instructions": [{"Pure": {"dest": 1, "val": {"kind": "I64", "payload": 10}, "ty": make_type_result(make_type_i64(), make_type_i64())}}],
+                        "terminator": {
+                            "MatchResult": {
+                                "result_val": 1,
+                                "ok_arg": 2,
+                                "ok_body": {
+                                    "instructions": [],
+                                    "terminator": {"Return": 4}  # USES 4 DEFINED ONLY IN ERR REGION!
+                                },
+                                "err_arg": 3,
+                                "err_body": {
+                                    "instructions": [{"Pure": {"dest": 4, "val": {"kind": "I64", "payload": 99}, "ty": make_type_i64()}}],
+                                    "terminator": {"Return": 4}
+                                }
+                            }
+                        }
+                    }
+                }
+            }]
+        }
+    }
+    expect_verifier_error("V14_region_cross_use", prog, "SsaUseBeforeDef")
+
+
 if __name__ == "__main__":
     print("=" * 70)
-    print("SOMA COMPILER CONFORMANCE v0 (SLICE 1) — Negative Verifier Tests V01–V12 (R3)")
+    print("SOMA COMPILER CONFORMANCE v0 (SLICE 1) — Negative Verifier Tests V01–V14 (R3 & S1)")
     v01_duplicate_ssa()
     v02_use_before_definition()
     v03_wrong_ok_payload_type()
@@ -455,6 +538,8 @@ if __name__ == "__main__":
     v10_type_mismatch_assign()
     v11_return_type_mismatch()
     v12_sibling_block_ssa_use_without_block_arg()
+    v13_region_local_def_leak()
+    v14_region_cross_use()
 
     print("=" * 70)
     print(f"NEGATIVE VERIFIER RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")

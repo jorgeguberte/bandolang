@@ -121,7 +121,7 @@ impl<'a> PathFactAnalyzer<'a> {
                 };
 
                 let changed = block_in_facts.get(&succ_id) != Some(&new_succ_in);
-                if !visited.contains(&succ_id) || changed {
+                if !visited.contains(&succ_id) || (changed && !self.mutations.m10_single_pass_loop_analysis) {
                     visited.insert(succ_id);
                     block_in_facts.insert(succ_id, new_succ_in);
                     if !worklist.contains(&succ_id) {
