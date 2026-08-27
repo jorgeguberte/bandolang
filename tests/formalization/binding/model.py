@@ -1,0 +1,325 @@
+"""model.py — SOMA Binding Contract v0 Formal Model.
+
+Defines the minimal, decidable, finite representation for expressible bindings
+without requiring full dependent types.
+"""
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import Any, List, Optional, Set, Union
+
+
+class TermKind(Enum):
+    VALUE_REF = "ValueRef"
+    ARTIFACT_IDENTITY = "ArtifactIdentity"
+    STABLE_DIGEST = "StableDigest"
+    STATE_REF = "StateRef"
+    LITERAL = "Literal"
+    TRUSTED_OPAQUE_REF = "TrustedOpaqueRef"
+
+
+@dataclass(frozen=True)
+class BindingTerm:
+    kind: TermKind
+    val_type: str
+    identity_key: str
+    digest: Optional[str] = None
+    lineage_ids: frozenset[str] = field(default_factory=frozenset)
+    domain: Optional[str] = None
+
+    @staticmethod
+    def value_ref(name: str, val_type: str, lineage_ids: Optional[Set[str]] = None) -> BindingTerm:
+        return BindingTerm(
+            kind=TermKind.VALUE_REF,
+            val_type=val_type,
+            identity_key=name,
+            lineage_ids=frozenset(lineage_ids or set()),
+        )
+
+    @staticmethod
+    def stable_digest(algorithm: str, hex_hash: str, val_type: str = "Artifact") -> BindingTerm:
+        return BindingTerm(
+            kind=TermKind.STABLE_DIGEST,
+            val_type=val_type,
+            identity_key=f"{algorithm}:{hex_hash}",
+            digest=hex_hash,
+        )
+
+    @staticmethod
+    def artifact_identity(kind_name: str, uri: str, digest: Optional[str] = None) -> BindingTerm:
+        return BindingTerm(
+            kind=TermKind.ARTIFACT_IDENTITY,
+            val_type="Artifact",
+            identity_key=f"{kind_name}::{uri}",
+            digest=digest,
+        )
+
+    @staticmethod
+    def state_ref(domain: str, resource_id: str) -> BindingTerm:
+        return BindingTerm(
+            kind=TermKind.STATE_REF,
+            val_type="State",
+            identity_key=f"{domain}::{resource_id}",
+            domain=domain,
+        )
+
+    @staticmethod
+    def literal(val: Any, val_type: str) -> BindingTerm:
+        return BindingTerm(
+            kind=TermKind.LITERAL,
+            val_type=val_type,
+            identity_key=repr(val),
+        )
+
+    @staticmethod
+    def opaque_ref(origin: str, token: str, val_type: str = "Unknown") -> BindingTerm:
+        return BindingTerm(
+            kind=TermKind.TRUSTED_OPAQUE_REF,
+            val_type=val_type,
+            identity_key=f"opaque::{origin}::{token}",
+        )
+
+
+@dataclass(frozen=True)
+class BindingRequirement:
+    predicate: str
+    subject: BindingTerm
+    base: Optional[BindingTerm] = None
+    scope: Optional[BindingTerm] = None
+    validity: Optional[BindingTerm] = None
+
+
+@dataclass(frozen=True)
+class BindingEvidence:
+    predicate: str
+    subject_binding: BindingTerm
+    base_binding: Optional[BindingTerm] = None
+    scope_binding: Optional[BindingTerm] = None
+    validity_binding: Optional[BindingTerm] = None
+    provenance: str = "Concrete"  # "Concrete" | "Delegated" | "External"
+    currentness_witness: Optional[bool] = None  # None = unknown, True = current, False = stale
+
+
+@dataclass(frozen=True)
+class DynamicCheck:
+    check_type: str
+    required_term: Optional[BindingTerm]
+    evidence_term: Optional[BindingTerm]
+    details: str
+
+
+@dataclass(frozen=True)
+class SymbolicMatch:
+    is_proved: bool = False
+    is_refuted: bool = False
+    refute_reason: Optional[str] = None
+    deferred_checks: tuple[DynamicCheck, ...] = field(default_factory=tuple)
+
+    @staticmethod
+    def proved() -> SymbolicMatch:
+        return SymbolicMatch(is_proved=True)
+
+    @staticmethod
+    def refuted(reason: str) -> SymbolicMatch:
+        return SymbolicMatch(is_refuted=True, refute_reason=reason)
+
+    @staticmethod
+    def deferred(checks: List[DynamicCheck]) -> SymbolicMatch:
+        return SymbolicMatch(deferred_checks=tuple(checks))
+
+
+@dataclass
+class PathFactContext:
+    known_aliases: dict[str, str] = field(default_factory=dict)
+    known_equal_digests: set[tuple[str, str]] = field(default_factory=set)
+
+    def are_equal(self, a: BindingTerm, b: BindingTerm) -> bool:
+        if a == b:
+            return True
+        if a.identity_key == b.identity_key:
+            return True
+        if a.digest and b.digest and a.digest == b.digest:
+            return True
+        if self.known_aliases.get(a.identity_key) == b.identity_key:
+            return True
+        if self.known_aliases.get(b.identity_key) == a.identity_key:
+            return True
+        if a.digest and b.digest:
+            if (a.digest, b.digest) in self.known_equal_digests or (b.digest, a.digest) in self.known_equal_digests:
+                return True
+        return False
+
+
+def match_term(
+    req: BindingTerm,
+    ev: BindingTerm,
+    ctx: PathFactContext,
+    mutations: Optional[dict[str, bool]] = None,
+) -> SymbolicMatch:
+    muts = mutations or {}
+
+    # Mutation M1: type equality => subject equality shortcut (FAIL B1)
+    if muts.get("m1_type_equality_shortcut", False):
+        if req.val_type == ev.val_type:
+            return SymbolicMatch.proved()
+
+    # Mutation M2: lineage overlap => subject equality shortcut (FAIL B2)
+    if muts.get("m2_lineage_overlap_shortcut", False):
+        if req.lineage_ids and ev.lineage_ids and (req.lineage_ids & ev.lineage_ids):
+            return SymbolicMatch.proved()
+
+    # Direct / proven equality
+    if ctx.are_equal(req, ev):
+        return SymbolicMatch.proved()
+
+    # Concrete known digests or literals that mismatch -> Refuted (B3)
+    both_concrete = (
+        (req.kind in (TermKind.STABLE_DIGEST, TermKind.LITERAL, TermKind.ARTIFACT_IDENTITY)
+         or (req.kind == TermKind.VALUE_REF and req.digest is not None))
+        and
+        (ev.kind in (TermKind.STABLE_DIGEST, TermKind.LITERAL, TermKind.ARTIFACT_IDENTITY)
+         or (ev.kind == TermKind.VALUE_REF and ev.digest is not None))
+    )
+
+    if both_concrete:
+        # Mutation M3: concrete mismatch => Deferred (FAIL B3)
+        if muts.get("m3_concrete_mismatch_deferred", False):
+            return SymbolicMatch.deferred([
+                DynamicCheck("CheckSubjectIdentity", req, ev, "Mutant deferred concrete mismatch")
+            ])
+        return SymbolicMatch.refuted(f"ConcreteMismatch: {req.identity_key} != {ev.identity_key}")
+
+    # Either is opaque or unverified ValueRef without digest -> Deferred (B4)
+    # Mutation M4: opaque unknown => Refuted (FAIL B4)
+    if muts.get("m4_opaque_unknown_refuted", False):
+        return SymbolicMatch.refuted("MutantRefutedOpaque")
+
+    return SymbolicMatch.deferred([
+        DynamicCheck("CheckSubjectIdentity", req, ev, f"Dynamic identity verification needed between {req.identity_key} and {ev.identity_key}")
+    ])
+
+
+def match_binding(
+    req: BindingRequirement,
+    ev: BindingEvidence,
+    ctx: PathFactContext,
+    mutations: Optional[dict[str, bool]] = None,
+) -> SymbolicMatch:
+    muts = mutations or {}
+
+    # 1. Predicate check (B11)
+    # Mutation M9: predicate mismatch ignored (FAIL B11)
+    if not muts.get("m9_predicate_mismatch_ignored", False):
+        if req.predicate != ev.predicate:
+            return SymbolicMatch.refuted(f"PredicateMismatch: expected {req.predicate}, got {ev.predicate}")
+
+    all_checks: List[DynamicCheck] = []
+
+    # 2. Subject check
+    subj_match = match_term(req.subject, ev.subject_binding, ctx, muts)
+    if subj_match.is_refuted and not muts.get("m8_deferred_overrides_refuted", False):
+        return subj_match
+    all_checks.extend(subj_match.deferred_checks)
+
+    # 3. Base state check (B5, B6)
+    # Mutation M5: ignore base binding (FAIL B5)
+    if req.base is not None and not muts.get("m5_ignore_base_binding", False):
+        if ev.base_binding is None:
+            return SymbolicMatch.refuted("MissingBaseBinding: requirement specified base state but evidence has none")
+        
+        base_match = match_term(req.base, ev.base_binding, ctx, muts)
+        if base_match.is_refuted and not muts.get("m8_deferred_overrides_refuted", False):
+            return base_match
+        all_checks.extend(base_match.deferred_checks)
+
+        # Currentness verification (B6)
+        if req.base.kind == TermKind.STATE_REF:
+            # Mutation M6: lexical StateRef => current shortcut (FAIL B6)
+            if not muts.get("m6_lexical_state_current_shortcut", False):
+                if ev.currentness_witness is False:
+                    if not muts.get("m8_deferred_overrides_refuted", False):
+                        return SymbolicMatch.refuted("StaleBaseState: witness reported stale base state")
+                elif ev.currentness_witness is None:
+                    all_checks.append(
+                        DynamicCheck("CheckCurrentBase", req.base, ev.base_binding, "Dynamic currentness witness required")
+                    )
+
+    # 4. Scope check
+    if req.scope is not None:
+        if ev.scope_binding is None:
+            return SymbolicMatch.refuted("MissingScopeBinding")
+        scope_match = match_term(req.scope, ev.scope_binding, ctx, muts)
+        if scope_match.is_refuted and not muts.get("m8_deferred_overrides_refuted", False):
+            return scope_match
+        all_checks.extend(scope_match.deferred_checks)
+
+    # 5. Validity check
+    if req.validity is not None:
+        if ev.validity_binding is None:
+            all_checks.append(DynamicCheck("CheckValidity", req.validity, None, "Validity verification needed"))
+        else:
+            val_match = match_term(req.validity, ev.validity_binding, ctx, muts)
+            if val_match.is_refuted and not muts.get("m8_deferred_overrides_refuted", False):
+                return val_match
+            all_checks.extend(val_match.deferred_checks)
+
+    # Mutation M7: drop deferred checks (FAIL B7 / B9)
+    if muts.get("m7_drop_deferred_checks", False):
+        all_checks.clear()
+
+    # Mutation M8: Deferred overrides Refuted (FAIL B8)
+    if muts.get("m8_deferred_overrides_refuted", False) and all_checks:
+        return SymbolicMatch.deferred(all_checks)
+
+    if subj_match.is_refuted:
+        return subj_match
+
+    # Decision aggregation (B7, B8, B9)
+    if not all_checks:
+        return SymbolicMatch.proved()
+    
+    return SymbolicMatch.deferred(all_checks)
+
+
+def conservative_cfg_join(
+    path_a: BindingEvidence,
+    path_b: BindingEvidence,
+    ctx: PathFactContext,
+    mutations: Optional[dict[str, bool]] = None,
+) -> Optional[BindingEvidence]:
+    """Conservative merge of bindings from divergent CFG branches (B12)."""
+    muts = mutations or {}
+
+    # Mutation M10: conflicting CFG join picks one branch (FAIL B12)
+    if muts.get("m10_cfg_join_picks_branch", False):
+        return path_a
+
+    if path_a.predicate != path_b.predicate:
+        return None
+
+    # Merge subject
+    if ctx.are_equal(path_a.subject_binding, path_b.subject_binding):
+        merged_subject = path_a.subject_binding
+    else:
+        # Cannot prove equality at merge point -> downgrade to opaque union or None
+        return None
+
+    # Merge base
+    if path_a.base_binding == path_b.base_binding:
+        merged_base = path_a.base_binding
+    else:
+        merged_base = None
+
+    # Currentness witness
+    merged_witness = path_a.currentness_witness if path_a.currentness_witness == path_b.currentness_witness else None
+
+    return BindingEvidence(
+        predicate=path_a.predicate,
+        subject_binding=merged_subject,
+        base_binding=merged_base,
+        scope_binding=path_a.scope_binding if path_a.scope_binding == path_b.scope_binding else None,
+        validity_binding=path_a.validity_binding if path_a.validity_binding == path_b.validity_binding else None,
+        provenance="Merged",
+        currentness_witness=merged_witness,
+    )
