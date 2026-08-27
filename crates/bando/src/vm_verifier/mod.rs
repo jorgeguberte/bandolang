@@ -4,6 +4,7 @@ use crate::{
     analysis::DominanceTree,
     diagnostics::{Diagnostic, DiagnosticCode},
     ir::{effects::EffectRow, types::Type},
+    lowering::CompilerMutations,
     vm_ir::{VmBlockId, VmFunction, VmInstruction, VmModule, VmTerminator, VmValueId},
 };
 
@@ -12,6 +13,7 @@ pub struct VmVerifier<'a> {
     diagnostics: Vec<Diagnostic>,
     all_defined_values: BTreeMap<VmValueId, Type>,
     block_definitions: BTreeMap<VmBlockId, Vec<VmValueId>>,
+    mutations: Option<CompilerMutations>,
 }
 
 impl<'a> VmVerifier<'a> {
@@ -21,13 +23,31 @@ impl<'a> VmVerifier<'a> {
             diagnostics: Vec::new(),
             all_defined_values: BTreeMap::new(),
             block_definitions: BTreeMap::new(),
+            mutations: None,
+        }
+    }
+
+    pub fn with_mutations(func: &'a VmFunction, mutations: CompilerMutations) -> Self {
+        Self {
+            func,
+            diagnostics: Vec::new(),
+            all_defined_values: BTreeMap::new(),
+            block_definitions: BTreeMap::new(),
+            mutations: Some(mutations),
         }
     }
 
     pub fn verify_module(module: &VmModule) -> Result<(), Vec<Diagnostic>> {
+        Self::verify_module_with_mutations(module, &CompilerMutations::default())
+    }
+
+    pub fn verify_module_with_mutations(
+        module: &VmModule,
+        mutations: &CompilerMutations,
+    ) -> Result<(), Vec<Diagnostic>> {
         let mut all_diags = Vec::new();
         for func in &module.functions {
-            let mut v = VmVerifier::new(func);
+            let mut v = VmVerifier::with_mutations(func, mutations.clone());
             if let Err(mut diags) = v.verify() {
                 all_diags.append(&mut diags);
             }
@@ -465,10 +485,17 @@ impl<'a> VmVerifier<'a> {
                                 format!("VM Handle join type mismatch: expected ok={:?}, err={:?}, got ok={:?}, err={:?}", exp_ok, exp_err, arg_ok, arg_err),
                             ));
                         } else if !arg_effs.is_subset(exp_effs) {
-                            self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::IncompatibleHandleJoin,
-                                format!("VM Handle join effect loss: incoming effects {:?} not covered by merged handle effects {:?}", arg_effs, exp_effs),
-                            ));
+                            let allow_drop = self
+                                .mutations
+                                .as_ref()
+                                .map(|m| m.s3m16_handle_join_drops_effect)
+                                .unwrap_or(false);
+                            if !allow_drop {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::IncompatibleHandleJoin,
+                                    format!("VM Handle join effect loss: incoming effects {:?} not covered by merged handle effects {:?}", arg_effs, exp_effs),
+                                ));
+                            }
                         }
                     } else {
                         self.diagnostics.push(Diagnostic::error(
@@ -660,7 +687,12 @@ impl<'a> VmVerifier<'a> {
                         }
                     }
 
-                    if exp_effs != &union_effects {
+                    let allow_drop = self
+                        .mutations
+                        .as_ref()
+                        .map(|m| m.s3m16_handle_join_drops_effect)
+                        .unwrap_or(false);
+                    if !allow_drop && exp_effs != &union_effects {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::IncompatibleHandleJoin,
                             format!(

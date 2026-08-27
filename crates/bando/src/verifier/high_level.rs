@@ -1234,10 +1234,16 @@ impl<'a> HighLevelVerifier<'a> {
                                 format!("Handle join type mismatch: expected ok={:?}, err={:?}, got ok={:?}, err={:?}", exp_ok, exp_err, arg_ok, arg_err),
                             ));
                         } else if !arg_effs.is_subset(exp_effs) {
-                            self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::IncompatibleHandleJoin,
-                                format!("Handle join effect loss: incoming effects {:?} not covered by merged handle effects {:?}", arg_effs, exp_effs),
-                            ));
+                            let allow_drop = self
+                                .mutations
+                                .map(|m| m.s3m16_handle_join_drops_effect)
+                                .unwrap_or(false);
+                            if !allow_drop {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::IncompatibleHandleJoin,
+                                    format!("Handle join effect loss: incoming effects {:?} not covered by merged handle effects {:?}", arg_effs, exp_effs),
+                                ));
+                            }
                         }
                     } else {
                         self.diagnostics.push(Diagnostic::error(

@@ -96,6 +96,8 @@ pub struct ConformanceProgramV0 {
     #[serde(default)]
     pub child_scenarios: BTreeMap<String, crate::child::ChildScenarioConfig>,
     #[serde(default)]
+    pub simulate_suspension_and_resume: bool,
+    #[serde(default)]
     pub mutations: crate::lowering::CompilerMutations,
 }
 

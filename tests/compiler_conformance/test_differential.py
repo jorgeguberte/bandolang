@@ -171,7 +171,7 @@ def test_diff_c02_read_ok():
                 "v1": {"kind": "Ok", "payload": {"kind": "String", "payload": "data_of(docs)"}},
                 "v2": {"kind": "String", "payload": "data_of(docs)"}
             },
-            "lineage": {"v1": ["read(docs)"]},
+            "lineage": {"v1": ["read(docs)"], "v2": ["read(docs)"]},
             "diagnostics": [],
         }
         prog = {
@@ -230,7 +230,7 @@ def test_diff_c03_read_err():
                 "v1": {"kind": "Err", "payload": {"kind": "String", "payload": "disk_failure"}},
                 "v3": {"kind": "String", "payload": "disk_failure"}
             },
-            "lineage": {"v1": ["read(docs)"]},
+            "lineage": {"v1": ["read(docs)"], "v3": ["read(docs)"]},
             "diagnostics": [],
         }
         prog = {
@@ -293,7 +293,7 @@ def test_diff_c09_infer_ok():
                 "v1": {"kind": "Ok", "payload": {"kind": "String", "payload": "infer_of(query_users)"}},
                 "v2": {"kind": "String", "payload": "infer_of(query_users)"}
             },
-            "lineage": {"v1": ["infer(query_users)"]},
+            "lineage": {"v1": ["infer(query_users)"], "v2": ["infer(query_users)"]},
             "diagnostics": [],
         }
         prog = {

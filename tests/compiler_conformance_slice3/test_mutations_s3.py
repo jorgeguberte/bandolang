@@ -33,12 +33,22 @@ def make_type_belief(payload):
 def make_type_child_handle(ok, err, effects):
     return {"kind": "ChildHandle", "payload": {"ok": ok, "err": err, "effects": {"effects": effects}}}
 
+def canonical_repr(d):
+    import json
+    return json.dumps(d, sort_keys=True)
+
 def run_mutation_kill(name: str, baseline_prog: dict, mutant_prog: dict, check_fn) -> None:
     global PASS, FAIL
     print(f"\n--- MUTATION KILL TEST (Slice 3): {name}")
     try:
         baseline_obs = invoke_rust_conformance(baseline_prog)
         mutant_obs = invoke_rust_conformance(mutant_prog)
+
+        if canonical_repr(baseline_obs) == canonical_repr(mutant_obs):
+            print(f"  ✗ FAIL {name}: baseline and mutant observations are identical (mutation had no observable effect!)")
+            FAIL += 1
+            return
+
         killed, reason = check_fn(baseline_obs, mutant_obs)
         if killed:
             print(f"  ✓ PASS {name} (real compiler/runtime mutation caught and killed: {reason})")
@@ -747,14 +757,14 @@ def s3m16_handle_join_drops_effect():
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Delegate": {"dest": 1, "intent_id": "task", "args": [], "requested_effects": [{"Read": "a"}, {"Infer": None}], "authority_grant": [], "budget_grant": 0}}
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
+                            {"Delegate": {"dest": 2, "intent_id": "task", "args": [], "requested_effects": [{"Read": "a"}, {"Infer": None}], "authority_grant": [], "budget_grant": 0}}
                         ],
-                        "terminator": {"Br": {"target": 1, "args": [1]}}
+                        "terminator": {"Br": {"target": 1, "args": [2]}}
                     },
                     "1": {
                         "id": 1, "params": [
-                            # Expected type has only read[a], losing infer!
-                            [2, make_type_child_handle(make_type_string(), make_type_string(), [{"Read": "a"}])]
+                            [3, make_type_child_handle(make_type_string(), make_type_string(), [{"Read": "a"}])] # Drops infer!
                         ],
                         "instructions": [],
                         "terminator": {"Return": 1}
@@ -767,44 +777,74 @@ def s3m16_handle_join_drops_effect():
     mutant["mutations"] = {"s3m16_handle_join_drops_effect": True}
 
     def check(base, mut):
-        if base["status"] == "verifier_error":
-            return True, "baseline rejected handle join that drops incoming effect"
-        return False, "join permitted effect loss"
+        if base["status"] == "verifier_error" and mut["status"] == "ok":
+            return True, "baseline rejected handle join that drops incoming effect, mutant bypassed check"
+        return False, f"base={base['status']}, mut={mut['status']}"
 
     run_mutation_kill("S3M16_handle_join_drops_effect", prog, mutant, check)
 
 def s3m17_handle_join_invents_provenance():
     prog = {
-        "name": "S3M17", "entry_func": "main", "inputs": {},
+        "name": "S3M17", "entry_func": "main",
+        "inputs": {"cond": {"kind": "Bool", "payload": True}},
         "registry": {
-            "agents": {"w": {"agent_id": "w", "native_authority": [{"Read": "a"}]}},
+            "agents": {
+                "w1": {"agent_id": "w1", "native_authority": [{"Read": "a"}]},
+                "w2": {"agent_id": "w2", "native_authority": [{"Infer": None}]}
+            },
             "intents": {
-                "task": {
-                    "intent_id": "task", "target_agent_id": "w",
+                "fetch1": {
+                    "intent_id": "fetch1", "target_agent_id": "w1",
                     "input_types": [], "output_type": make_type_string(), "error_type": make_type_string(),
                     "child_effects": {"effects": [{"Read": "a"}]},
                     "exported_envelope": {"effects": [{"Read": "a"}]}, "declared_envelope": {"effects": [{"Read": "a"}]},
                     "authority_policy": "AllowNative"
+                },
+                "fetch2": {
+                    "intent_id": "fetch2", "target_agent_id": "w2",
+                    "input_types": [], "output_type": make_type_string(), "error_type": make_type_string(),
+                    "child_effects": {"effects": [{"Infer": None}]},
+                    "exported_envelope": {"effects": [{"Infer": None}]}, "declared_envelope": {"effects": [{"Infer": None}]},
+                    "authority_policy": "AllowNative"
                 }
             },
-            "caller_authority": {"effects": [{"Read": "a"}]}
+            "caller_authority": {"effects": [{"Read": "a"}, {"Infer": None}]}
         },
         "module": {
             "name": "m", "functions": [{
-                "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "a"}]}, "entry": 0,
+                "name": "main", "params": [[10, make_type_bool()]], "return_type": make_type_string(),
+                "declared_effects": {"effects": [{"Read": "a"}, {"Infer": None}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
-                            {"Delegate": {"dest": 2, "intent_id": "task", "args": [], "requested_effects": [{"Read": "a"}], "authority_grant": [], "budget_grant": 0}}
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}}
                         ],
-                        "terminator": {"Br": {"target": 1, "args": [2]}}
+                        "terminator": {
+                            "CondBr": {
+                                "cond": 10,
+                                "true_target": 1, "true_args": [],
+                                "false_target": 2, "false_args": []
+                            }
+                        }
                     },
                     "1": {
-                        "id": 1, "params": [
-                            [3, make_type_child_handle(make_type_string(), make_type_string(), [{"Read": "a"}, {"Infer": None}])]
+                        "id": 1, "params": [],
+                        "instructions": [
+                            {"Delegate": {"dest": 2, "intent_id": "fetch1", "args": [], "requested_effects": [{"Read": "a"}], "authority_grant": [], "budget_grant": 0}}
+                        ],
+                        "terminator": {"Br": {"target": 3, "args": [2]}}
+                    },
+                    "2": {
+                        "id": 2, "params": [],
+                        "instructions": [
+                            {"Delegate": {"dest": 3, "intent_id": "fetch2", "args": [], "requested_effects": [{"Infer": None}], "authority_grant": [], "budget_grant": 0}}
+                        ],
+                        "terminator": {"Br": {"target": 3, "args": [3]}}
+                    },
+                    "3": {
+                        "id": 3, "params": [
+                            [4, make_type_child_handle(make_type_string(), make_type_string(), [{"Read": "a"}, {"Infer": None}])]
                         ],
                         "instructions": [],
                         "terminator": {"Return": 1}
@@ -817,10 +857,11 @@ def s3m17_handle_join_invents_provenance():
     mutant["mutations"] = {"s3m17_handle_join_invents_provenance": True}
 
     def check(base, mut):
-        b_prov = base.get("result_provenance", {})
-        if len(b_prov) == 0:
-            return True, "baseline did not invent concrete result provenance on handle join before await"
-        return False, "provenance invented"
+        b_prov = len(base.get("result_provenance", {}))
+        m_prov = len(mut.get("result_provenance", {}))
+        if b_prov == 0 and m_prov > 0:
+            return True, "baseline did not invent concrete result provenance on handle join before await, mutant invented it"
+        return False, f"base={b_prov}, mut={m_prov}"
 
     run_mutation_kill("S3M17_handle_join_invents_provenance", prog, mutant, check)
 
@@ -863,8 +904,11 @@ def s3m18_duplicate_await_duplicate_settlement():
     mutant["mutations"] = {"s3m18_duplicate_await_duplicate_settlement": True}
 
     def check(base, mut):
-        b_events = base.get("child_events", [])
-        return True, "duplicate await verified"
+        b_avail = base.get("frame_ledgers", {}).get("root", {}).get("available", {}).get("compute", 0)
+        m_avail = mut.get("frame_ledgers", {}).get("root", {}).get("available", {}).get("compute", 0)
+        if b_avail == 100 and m_avail > 100:
+            return True, f"baseline settled once (root available 100), mutant refunded twice (root available {m_avail})"
+        return False, f"base={b_avail}, mut={m_avail}"
 
     run_mutation_kill("S3M18_duplicate_await_duplicate_settlement", prog, mutant, check)
 
@@ -956,8 +1000,8 @@ def s3m21_failed_internalize_materializes_fact():
         "registry": {
             "internalization_policies": {
                 "p": {
-                    "policy_id": "p", "accepted_claim_contract": {"AcceptSubjectLiteral": "valid_literal"},
-                    "validation_requirements": ["CheckSubjectLiteral"], "validation_effect_envelope": {"effects": []}
+                    "policy_id": "p", "accepted_claim_contract": "AcceptAll",
+                    "validation_requirements": ["CheckDocApproved"], "validation_effect_envelope": {"effects": []}
                 }
             },
             "caller_authority": {"effects": []}
@@ -970,10 +1014,11 @@ def s3m21_failed_internalize_materializes_fact():
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "bad_literal"}}, "ty": make_type_claim(make_type_string())}},
+                            {"Pure": {"dest": 1, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "unapproved_doc"}}, "ty": make_type_claim(make_type_string())}},
+                            {"Pure": {"dest": 10, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
                             {"Internalize": {"dest": 2, "policy_id": "p", "claim": 1}}
                         ],
-                        "terminator": {"Return": 1}
+                        "terminator": {"Return": 10}
                     }
                 }
             }]
@@ -983,7 +1028,11 @@ def s3m21_failed_internalize_materializes_fact():
     mutant["mutations"] = {"s3m21_failed_internalize_materializes_fact": True}
 
     def check(base, mut):
-        return True, "latent Internalized fact is success-conditional"
+        b_facts = [f for f in base.get("active_facts", []) if f.get("predicate") == "Internalized"]
+        m_facts = [f for f in mut.get("active_facts", []) if f.get("predicate") == "Internalized"]
+        if len(b_facts) == 0 and len(m_facts) > 0:
+            return True, "baseline did not materialize Internalized fact on failure, mutant materialized it"
+        return False, f"base={b_facts}, mut={m_facts}"
 
     run_mutation_kill("S3M21_failed_internalize_materializes_fact", prog, mutant, check)
 
@@ -1092,42 +1141,61 @@ def s3m23_delegated_provenance_removed():
     mutant["mutations"] = {"s3m23_delegated_provenance_removed_on_internalize": True}
 
     def check(base, mut):
-        b_prov = base.get("result_provenance", {}).get("v3", {})
-        if b_prov.get("child_id") == "child_worker_1":
-            return True, "baseline preserved delegated child provenance across await and internalization"
-        return False, f"provenance: {b_prov}"
+        b_prov = base.get("beliefs", {}).get("v5", {}).get("provenance", [])
+        m_prov = mut.get("beliefs", {}).get("v5", {}).get("provenance", [])
+        if len(b_prov) > 1 and len(m_prov) == 1 and m_prov == ["internalize(p)"]:
+            return True, f"baseline preserved delegated provenance chain {b_prov}, mutant removed it to {m_prov}"
+        return False, f"base={b_prov}, mut={m_prov}"
 
     run_mutation_kill("S3M23_delegated_provenance_removed", prog, mutant, check)
 
 def s3m24_effect_summary_used_as_clean_provenance():
     prog = {
         "name": "S3M24", "entry_func": "main", "inputs": {},
+        "child_scenarios": {"task": {"mode": "returns_claim", "payload_string": "verified_claim"}},
         "registry": {
-            "agents": {"w": {"agent_id": "w", "native_authority": [{"Read": "data"}]}},
+            "agents": {"w": {"agent_id": "w", "native_authority": []}},
             "intents": {
                 "task": {
                     "intent_id": "task", "target_agent_id": "w",
-                    "input_types": [], "output_type": make_type_string(), "error_type": make_type_string(),
-                    "child_effects": {"effects": [{"Read": "data"}]},
-                    "exported_envelope": {"effects": [{"Read": "data"}]}, "declared_envelope": {"effects": [{"Read": "data"}]},
+                    "input_types": [], "output_type": make_type_claim(make_type_string()), "error_type": make_type_string(),
+                    "child_effects": {"effects": []},
+                    "exported_envelope": {"effects": []}, "declared_envelope": {"effects": []},
                     "authority_policy": "AllowNative"
                 }
             },
-            "caller_authority": {"effects": [{"Read": "data"}]}
+            "internalization_policies": {
+                "p": {
+                    "policy_id": "p", "accepted_claim_contract": "AcceptAll",
+                    "validation_requirements": [], "validation_effect_envelope": {"effects": []}
+                }
+            },
+            "caller_authority": {"effects": []}
         },
         "module": {
             "name": "m", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "data"}]}, "entry": 0,
+                "declared_effects": {"effects": []}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
-                            {"Delegate": {"dest": 2, "intent_id": "task", "args": [], "requested_effects": [{"Read": "data"}], "authority_grant": [], "budget_grant": 0}},
+                            {"Delegate": {"dest": 2, "intent_id": "task", "args": [], "requested_effects": [], "authority_grant": [], "budget_grant": 0}},
                             {"Await": {"dest": 3, "handle": 2}}
                         ],
-                        "terminator": {"Return": 1}
+                        "terminator": {
+                            "MatchResult": {
+                                "result_val": 3,
+                                "ok_arg": 4, "ok_body": {
+                                    "instructions": [
+                                        {"Internalize": {"dest": 5, "policy_id": "p", "claim": 4}}
+                                    ],
+                                    "terminator": {"Return": 1}
+                                },
+                                "err_arg": 6, "err_body": {"instructions": [], "terminator": {"Return": 1}}
+                            }
+                        }
                     }
                 }
             }]
@@ -1137,10 +1205,11 @@ def s3m24_effect_summary_used_as_clean_provenance():
     mutant["mutations"] = {"s3m24_effect_summary_used_as_clean_provenance": True}
 
     def check(base, mut):
-        b_prov = base.get("result_provenance", {}).get("v3", {})
-        if b_prov.get("target_agent_id") == "w":
-            return True, "result provenance tracks concrete child invocation, not effect row"
-        return False, "provenance mismatch"
+        b_prov = base.get("beliefs", {}).get("v5", {}).get("provenance", [])
+        m_prov = mut.get("beliefs", {}).get("v5", {}).get("provenance", [])
+        if "local_clean(p)" not in b_prov and "local_clean(p)" in m_prov:
+            return True, "baseline preserved full provenance, mutant fabricated clean local provenance from effect row"
+        return False, f"base={b_prov}, mut={m_prov}"
 
     run_mutation_kill("S3M24_effect_summary_used_as_clean_provenance", prog, mutant, check)
 

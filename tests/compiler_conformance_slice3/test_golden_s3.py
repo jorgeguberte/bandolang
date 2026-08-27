@@ -581,6 +581,8 @@ def s3c12_outstanding_commitment_blocks_settlement():
     run_golden("S3C12_commitment_blocks_settlement", prog, expected_status="error: SettlementFailed")
 
 def s3c13_nested_budget_conservation():
+    global PASS, FAIL
+    print("\n--- GOLDEN PROGRAM (Slice 3): S3C13_nested_budget")
     prog = {
         "name": "S3C13_nested_budget", "entry_func": "main", "inputs": {},
         "initial_budget": {"compute": 100},
@@ -623,7 +625,31 @@ def s3c13_nested_budget_conservation():
             }]
         }
     }
-    run_golden("S3C13_nested_budget", prog)
+    obs = invoke_rust_conformance(prog)
+    if obs["status"] != "ok":
+        print(f"  ✗ FAIL S3C13_nested_budget: status={obs['status']}")
+        FAIL += 1
+        return
+
+    ledgers = obs.get("frame_ledgers", {})
+    root_b = ledgers.get("root", {})
+    child_b = ledgers.get("h_1", {})
+    gc_b = ledgers.get("h_1_gc", {})
+
+    root_avail = root_b.get("available", {}).get("compute", 0)
+    child_spent = child_b.get("spent", {}).get("compute", 0)
+    gc_spent = gc_b.get("spent", {}).get("compute", 0)
+
+    assert root_avail == 88, f"expected root available 88, got {root_avail}"
+    assert child_spent == 5, f"expected child spent 5, got {child_spent}"
+    assert gc_spent == 7, f"expected grandchild spent 7, got {gc_spent}"
+    assert root_avail + child_spent + gc_spent == 100, f"Budget conservation failed: {root_avail} + {child_spent} + {gc_spent} != 100"
+    assert len(root_b.get("reserved", {})) == 0, "root has shadow reservation"
+    assert len(child_b.get("reserved", {})) == 0, "child has shadow reservation"
+    assert len(gc_b.get("reserved", {})) == 0, "grandchild has shadow reservation"
+
+    print("  ✓ PASS S3C13_nested_budget (three-frame conservation strictly verified: root=88 + child_spent=5 + gc_spent=7 == 100)")
+    PASS += 1
 
 # ==============================================================================
 # S3C14–S3C20: Await Lifecycle & Generation Binding & Suspension
@@ -761,8 +787,9 @@ def s3c16_settlement_unknown():
 def s3c17_resume_after_settlement():
     prog = {
         "name": "S3C17_resume_after_settlement", "entry_func": "main", "inputs": {},
+        "simulate_suspension_and_resume": True,
         "child_scenarios": {
-            "fetch": {"mode": "settlement_unknown", "auto_resume_settlement": True}
+            "fetch": {"mode": "settlement_unknown"}
         },
         "registry": {
             "agents": {"w": {"agent_id": "w", "native_authority": [{"Read": "data"}]}},

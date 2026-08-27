@@ -51,6 +51,14 @@ pub trait ChildExecutor: Send + Sync {
     ) -> Result<BTreeMap<String, u64>, String>;
 
     fn get_scenario(&self, intent_id: &str) -> Option<ChildScenarioConfig>;
+
+    fn take_extra_child_handles(&mut self) -> Vec<ChildHandleRecord> {
+        Vec::new()
+    }
+
+    fn take_extra_child_events(&mut self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -60,6 +68,9 @@ pub struct DefaultTestChildExecutor {
     pub observed_child_effects: Vec<String>,
     pub child_budgets: BTreeMap<String, FrameBudget>,
     pub settled_handle_ids: BTreeSet<String>,
+    pub extra_child_handles: Vec<ChildHandleRecord>,
+    pub extra_child_events: Vec<String>,
+    pub mutations: crate::lowering::CompilerMutations,
 }
 
 impl ChildExecutor for DefaultTestChildExecutor {
@@ -92,7 +103,9 @@ impl ChildExecutor for DefaultTestChildExecutor {
         // Section 12: Confinement check on attempted child effects
         if let Some(sc) = &scenario {
             if let Some(attempted_eff) = &sc.attempt_out_of_ceiling_effect {
-                if !requested_effects.contains(attempted_eff) {
+                if !requested_effects.contains(attempted_eff)
+                    && !self.mutations.s3m06_child_runtime_allows_out_of_ceiling
+                {
                     return Err(format!(
                         "ConfinementViolation: child attempted effect {:?} outside invocation ceiling {:?}",
                         attempted_eff, requested_effects
@@ -112,15 +125,42 @@ impl ChildExecutor for DefaultTestChildExecutor {
         if let Some(sc) = &scenario {
             if sc.mode == "nested_delegation" {
                 // Section 19: Root -> Child -> Grandchild nested delegation
+                let gc_handle_id = format!("{}_gc", handle_id);
+                let gc_child_id = format!("child_grandchild_{}", self.next_child_seq);
                 let mut grandchild_budget = FrameBudget::new();
                 let _ = budget.transfer_to_child("compute", 15, &mut grandchild_budget);
                 let gc_spend = sc.nested_grandchild_spend.unwrap_or(7);
                 let _ = grandchild_budget.spend_direct("compute", gc_spend);
+
+                let mut gc_rec = ChildHandleRecord::new(
+                    gc_handle_id.clone(),
+                    gc_child_id.clone(),
+                    child_id.clone(),
+                    generation_token,
+                    descriptor.child_effects.clone(),
+                    ChildResultProvenance::new(
+                        gc_child_id.clone(),
+                        "grandchild_intent".to_string(),
+                        "grandchild_agent".to_string(),
+                        format!("evt_{}_gc", self.next_child_seq),
+                    ),
+                );
+
+                self.extra_child_events
+                    .push("Spawned(grandchild_intent)".to_string());
+
                 let _ = budget.settle_from_child(&mut grandchild_budget);
+                gc_rec.settlement_state = ChildSettlementState::Settled;
+                gc_rec.budget = grandchild_budget.clone();
+                self.extra_child_events
+                    .push(format!("Settled({})", gc_handle_id));
+
+                self.child_budgets
+                    .insert(gc_handle_id.clone(), grandchild_budget);
+                self.extra_child_handles.push(gc_rec);
+
                 let child_spend = sc.spend_amount.unwrap_or(5);
                 let _ = budget.spend_direct("compute", child_spend);
-                self.child_budgets
-                    .insert(format!("{}_grandchild", handle_id), grandchild_budget);
             } else {
                 if let Some(sp) = sc.spend_amount {
                     let _ = budget.spend_direct("compute", sp);
@@ -289,5 +329,13 @@ impl ChildExecutor for DefaultTestChildExecutor {
 
     fn get_scenario(&self, intent_id: &str) -> Option<ChildScenarioConfig> {
         self.scenarios.get(intent_id).cloned()
+    }
+
+    fn take_extra_child_handles(&mut self) -> Vec<ChildHandleRecord> {
+        std::mem::take(&mut self.extra_child_handles)
+    }
+
+    fn take_extra_child_events(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.extra_child_events)
     }
 }

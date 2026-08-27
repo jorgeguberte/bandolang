@@ -63,7 +63,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
     let vm_module = lowering.lower_module(&prog.module);
 
     // 3. VM Verifier
-    if let Err(diags) = VmVerifier::verify_module(&vm_module) {
+    if let Err(diags) = VmVerifier::verify_module_with_mutations(&vm_module, &prog.mutations) {
         return ConformanceObservationV0 {
             status: "vm_verifier_error".to_string(),
             return_val: None,
@@ -139,6 +139,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
 
     let mut child_adapter = DefaultTestChildExecutor::default();
     child_adapter.scenarios = prog.child_scenarios.clone();
+    child_adapter.mutations = prog.mutations.clone();
 
     let mut adapters = RuntimeAdapters {
         read: Box::new(read_adapter),
@@ -172,7 +173,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
 
     let mut interpreter =
         VmInterpreter::with_mutations(func, &mut adapters, &registry, prog.mutations.clone());
-    let state = interpreter.execute(
+    let mut state = interpreter.execute(
         vm_inputs,
         initial_world,
         initial_facts,
@@ -180,6 +181,25 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
         prog.current_agent_id.clone(),
         1000,
     );
+
+    if prog.simulate_suspension_and_resume {
+        if let VmStatus::WaitingOnChild(ref h_id) = state.status {
+            let suspended_h = h_id.clone();
+            // External deterministic settlement event occurs!
+            if let Some(rec) = state.child_handles.get_mut(&suspended_h) {
+                rec.settlement_state = ChildSettlementState::Settled;
+                rec.result = Some(Ok(crate::ir::values::Value::String(
+                    "processed(payload_x)".to_string(),
+                )));
+                state.child_events.push(format!("Settled({})", suspended_h));
+                if let Some(b) = state.frame_ledgers.get_mut(&suspended_h) {
+                    b.available.clear();
+                }
+            }
+            state.status = VmStatus::Running;
+            interpreter.resume(&mut state, 1000);
+        }
+    }
 
     let status_str = match state.status {
         VmStatus::Running => "running".to_string(),

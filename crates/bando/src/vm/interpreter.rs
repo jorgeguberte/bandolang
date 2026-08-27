@@ -51,6 +51,7 @@ pub struct VmExecutionState {
     // Slice 3 additions
     pub current_agent_id: String,
     pub current_generation_token: String,
+    pub current_inst_index: usize,
     pub frame_budget: FrameBudget,
     pub child_handles: BTreeMap<String, ChildHandleRecord>,
     pub child_events: Vec<String>,
@@ -124,6 +125,7 @@ impl<'a> VmInterpreter<'a> {
             gate_trace: Vec::new(),
             current_agent_id: agent_id,
             current_generation_token: "gen_1".to_string(),
+            current_inst_index: 0,
             frame_budget: budget,
             child_handles: BTreeMap::new(),
             child_events: Vec::new(),
@@ -191,9 +193,13 @@ impl<'a> VmInterpreter<'a> {
             state.active_facts = facts;
 
             // Execute instructions
-            for inst in &block.instructions {
+            let inst_start = state.current_inst_index;
+            let mut completed_block_instructions = true;
+            for (idx, inst) in block.instructions.iter().enumerate().skip(inst_start) {
+                state.current_inst_index = idx;
                 self.execute_instruction(inst, &mut state);
                 if state.status != VmStatus::Running {
+                    completed_block_instructions = false;
                     break;
                 }
             }
@@ -202,8 +208,10 @@ impl<'a> VmInterpreter<'a> {
                 break;
             }
 
-            // Execute terminator
-            self.execute_terminator(&block.terminator, &mut state);
+            if completed_block_instructions {
+                // Execute terminator
+                self.execute_terminator(&block.terminator, &mut state);
+            }
         }
 
         if steps >= max_steps && state.status == VmStatus::Running {
@@ -770,6 +778,17 @@ impl<'a> VmInterpreter<'a> {
                             }
                         }
 
+                        // Collect extra nested child handles & events
+                        for h in self.adapters.child.take_extra_child_handles() {
+                            state
+                                .frame_ledgers
+                                .insert(h.handle_id.clone(), h.budget.clone());
+                            state.child_handles.insert(h.handle_id.clone(), h);
+                        }
+                        for ev in self.adapters.child.take_extra_child_events() {
+                            state.child_events.push(ev);
+                        }
+
                         state.types.insert(
                             dest_sym.clone(),
                             Type::child_handle(
@@ -959,13 +978,14 @@ impl<'a> VmInterpreter<'a> {
                         state
                             .result_provenance
                             .insert(dest_sym.clone(), rec.provenance.clone());
-                        state.lineage.insert(
-                            dest_sym.clone(),
-                            vec![
-                                format!("await_result({})", rec.handle_id),
-                                format!("delegated_result({})", rec.child_id),
-                            ],
-                        );
+                        let mut await_lin = vec![
+                            format!("await_result({})", rec.handle_id),
+                            format!("delegated_result({})", rec.child_id),
+                        ];
+                        if let Some(h_lin) = state.lineage.get(&handle_sym) {
+                            await_lin.extend(h_lin.clone());
+                        }
+                        state.lineage.insert(dest_sym.clone(), await_lin);
                         state
                             .child_events
                             .push(format!("AwaitResumed({})", rec.handle_id));
@@ -990,13 +1010,14 @@ impl<'a> VmInterpreter<'a> {
                         state
                             .result_provenance
                             .insert(dest_sym.clone(), rec.provenance.clone());
-                        state.lineage.insert(
-                            dest_sym.clone(),
-                            vec![
-                                format!("await_result({})", rec.handle_id),
-                                format!("delegated_result({})", rec.child_id),
-                            ],
-                        );
+                        let mut await_lin = vec![
+                            format!("await_result({})", rec.handle_id),
+                            format!("delegated_result({})", rec.child_id),
+                        ];
+                        if let Some(h_lin) = state.lineage.get(&handle_sym) {
+                            await_lin.extend(h_lin.clone());
+                        }
+                        state.lineage.insert(dest_sym.clone(), await_lin);
                         state
                             .child_events
                             .push(format!("AwaitResumed({})", rec.handle_id));
@@ -1129,8 +1150,14 @@ impl<'a> VmInterpreter<'a> {
                         });
                     }
                     if self.mutations.s3m21_failed_internalize_materializes_fact {
-                        let facts = latent.instantiate_ok(&dest_sym);
-                        state.active_facts.extend(facts);
+                        state.active_facts.insert(Fact {
+                            predicate: "Internalized".to_string(),
+                            args: vec![
+                                FactArg::Symbol(dest_sym.clone()),
+                                FactArg::Symbol(claim_sym.clone()),
+                                FactArg::Literal(policy_id.0.clone()),
+                            ],
+                        });
                     }
                     state.env.insert(
                         dest_sym,
@@ -1283,13 +1310,17 @@ impl<'a> VmInterpreter<'a> {
                 };
 
                 let target_sym = format!("v{}", target_arg.0);
-                state.env.insert(target_sym, payload_val);
+                state.env.insert(target_sym.clone(), payload_val);
+                if let Some(res_lin) = state.lineage.get(&res_sym) {
+                    state.lineage.insert(target_sym.clone(), res_lin.clone());
+                }
                 if let Some(tb) = self.func.blocks.get(&target_block) {
                     for (p, ty) in &tb.params {
                         state.types.insert(format!("v{}", p.0), ty.display_name());
                     }
                 }
                 state.current_block = target_block;
+                state.current_inst_index = 0;
             }
             VmTerminator::SwitchActOutcome {
                 outcome_val,
@@ -1383,10 +1414,80 @@ impl<'a> VmInterpreter<'a> {
                     let val = state.env.get(&arg_sym).cloned().unwrap_or(VmValue::Unit);
                     let param_sym = format!("v{}", param_id.0);
                     state.env.insert(param_sym.clone(), val);
-                    state.types.insert(param_sym, ty.display_name());
+                    state.types.insert(param_sym.clone(), ty.display_name());
+                    if let Some(arg_lin) = state.lineage.get(&arg_sym) {
+                        state.lineage.insert(param_sym.clone(), arg_lin.clone());
+                    }
+                    if self.mutations.s3m17_handle_join_invents_provenance {
+                        if matches!(ty, Type::ChildHandle { .. }) {
+                            state.result_provenance.insert(
+                                param_sym.clone(),
+                                crate::child::provenance::ChildResultProvenance::new(
+                                    "fake_child",
+                                    "fake_intent",
+                                    "fake_agent",
+                                    "fake_evt",
+                                ),
+                            );
+                        }
+                    }
                 }
             }
         }
         state.current_block = target;
+        state.current_inst_index = 0;
+    }
+
+    pub fn resume(&mut self, state: &mut VmExecutionState, max_steps: usize) {
+        let analysis =
+            PathFactAnalyzer::with_mutations(self.func, self.mutations.clone()).analyze();
+        let mut steps = 0;
+
+        while state.status == VmStatus::Running && steps < max_steps {
+            steps += 1;
+
+            let block = match self.func.blocks.get(&state.current_block) {
+                Some(b) => b.clone(),
+                None => {
+                    state.status = VmStatus::Error(format!(
+                        "Current block {:?} not found in function",
+                        state.current_block
+                    ));
+                    break;
+                }
+            };
+
+            let block_facts = analysis
+                .block_in_facts
+                .get(&state.current_block)
+                .cloned()
+                .unwrap_or_default();
+            let mut facts = state.active_facts.clone();
+            facts.extend(block_facts);
+            state.active_facts = facts;
+
+            let inst_start = state.current_inst_index;
+            let mut completed_block_instructions = true;
+            for (idx, inst) in block.instructions.iter().enumerate().skip(inst_start) {
+                state.current_inst_index = idx;
+                self.execute_instruction(inst, state);
+                if state.status != VmStatus::Running {
+                    completed_block_instructions = false;
+                    break;
+                }
+            }
+
+            if state.status != VmStatus::Running {
+                break;
+            }
+
+            if completed_block_instructions {
+                self.execute_terminator(&block.terminator, state);
+            }
+        }
+
+        if steps >= max_steps && state.status == VmStatus::Running {
+            state.status = VmStatus::Error("Execution step limit exceeded".to_string());
+        }
     }
 }
