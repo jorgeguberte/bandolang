@@ -1,9 +1,9 @@
-# SOMA — Compiler Conformance v0 (Slice 1: Result / CFG / Pure-Read-Infer) Execution Report — FINAL BOUNDED ACCEPTANCE (S1–S3)
+# SOMA — Compiler Conformance v0 (Slice 1: Result / CFG / Pure-Read-Infer) Execution Report — FINAL ACCEPTANCE (S2 REPAIR COMPLETE)
 
 > **Compiler Conformance v0 — Slice 1 final execution report.**
 > 
 > 1. **S1 (Region-Local SSA Scoping & Type Registration)**: High-level verifier enforces strict lexical region isolation. Definitions inside `ok_body` and `err_body` are not attributed to the parent block's definition set, preventing leakage past `MatchResult` without explicit transport via block arguments. Region parameters and instructions are registered with their exact types. Tested against region definition leakage and cross-region contamination.
-> 2. **S2 (Genuine Killed M10 Mutation on Loop Fixed-Point)**: M10 verifies loop fixed-point analysis by comparing baseline multi-pass analysis against mutated single-pass analysis (`m10_single_pass_loop_analysis`). In baseline, backedge intersection eliminates entry-only facts; in single-pass mutant, backedge revisitation is skipped, causing fact divergence (`mutant_obs != baseline_obs`), killing the mutation deterministically.
+> 2. **S2 (Genuine Killed M10 Mutation on Loop Fixed-Point)**: M10 verifies loop fixed-point analysis on a loop where `loop_header` has exactly one initial incoming edge carrying `LoopFact(%initial)` and the backedge transports fresh SSA `%fresh -> %h` with a divergent fact set. At baseline fixed point, backedge intersection eliminates `LoopFact` (`baseline_facts == EXPECTED_FIXED_POINT`). The single-pass mutant (`m10_single_pass_loop_analysis`) skips backedge re-evaluation, retaining stale facts (`mutant_facts != EXPECTED_FIXED_POINT`), demonstrably killing the mutation.
 > 3. **S3 (True Exact Equality Across All 9 Shared Observables)**: `compare_exact_observables` executes full structural equality on all 9 observables: `status`, `return_val`, `effects`, `active_facts`, `latent_facts`, `types`, `bindings`, `lineage`, `diagnostics`. Rejects phantom extra entries and unexpected diagnostics via 4 adversarial negative probes.
 > 
 > Status:
@@ -69,7 +69,7 @@ Real Compiler Mutation Kills (M01–M10, R4 & S2 Verified):
     - M07_omit_read_effect (caught by EffectUndeclared in VM Verifier) [PASS]
     - M08_omit_infer_effect (caught by EffectUndeclared in VM Verifier) [PASS]
     - M09_stale_ssa_reference (caught by SsaUseBeforeDef in VM Verifier) [PASS]
-    - M10_single_pass_loop_leakage (demonstrably killed via fact divergence) [PASS]
+    - M10_single_pass_loop_leakage (demonstrably killed via independent fixed-point property) [PASS]
 
 Python Oracle ↔ Rust Toolchain Exact Differential (R5 & S3 Verified):
     8/8 PASS

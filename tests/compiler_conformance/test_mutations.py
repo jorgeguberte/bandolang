@@ -280,7 +280,9 @@ def m09_stale_ssa_reference():
 
 
 def m10_single_pass_loop_leakage():
-    # S2: Loop requires backedge fixed point convergence to eliminate entry-only fact
+    # S2: Loop constructed so that loop_header has ONE initial incoming path with LoopFact,
+    # and loop_body backedge carries a different fact set (%fresh -> %h),
+    # requiring multi-pass fixed-point recomputation to eliminate LoopFact.
     prog = {
         "name": "M10_loop_fixed_point_kill",
         "entry_func": "main",
@@ -290,7 +292,7 @@ def m10_single_pass_loop_leakage():
             "functions": [{
                 "name": "main",
                 "params": [[1, {"kind": "Bool"}]],
-                "return_type": {"kind": "I64"},
+                "return_type": {"kind": "String"},
                 "declared_effects": {"effects": [{"Read": "doc"}]},
                 "entry": 0,
                 "blocks": {
@@ -298,9 +300,9 @@ def m10_single_pass_loop_leakage():
                         "id": 0, "name": "entry", "params": [],
                         "instructions": [
                             {"Read": {
-                                "dest": 2, "domain": "doc", "ok_type": {"kind": "I64"}, "err_type": {"kind": "I64"},
+                                "dest": 2, "domain": "doc", "ok_type": {"kind": "String"}, "err_type": {"kind": "String"},
                                 "latent": {
-                                    "on_ok": [{"predicate": "EntryOnlyFact", "args": [{"Symbol": "$value"}]}],
+                                    "on_ok": [{"predicate": "LoopFact", "args": [{"Symbol": "$value"}]}],
                                     "on_err": []
                                 }
                             }}
@@ -311,12 +313,12 @@ def m10_single_pass_loop_leakage():
                                 "ok_arg": 3,
                                 "ok_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": [3]}}},
                                 "err_arg": 4,
-                                "err_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": [4]}}}
+                                "err_body": {"instructions": [], "terminator": {"Return": 4}}  # NOT a predecessor of loop_header
                             }
                         }
                     },
                     "1": {
-                        "id": 1, "name": "loop_header", "params": [[5, {"kind": "I64"}]],
+                        "id": 1, "name": "loop_header", "params": [[5, {"kind": "String"}]],
                         "instructions": [],
                         "terminator": {
                             "CondBr": {
@@ -329,31 +331,44 @@ def m10_single_pass_loop_leakage():
                         }
                     },
                     "2": {
-                        "id": 2, "name": "loop_body", "params": [[6, {"kind": "I64"}]],
-                        "instructions": [],
-                        "terminator": {"Br": {"target": 1, "args": [6]}}
+                        "id": 2, "name": "loop_body", "params": [[6, {"kind": "String"}]],
+                        "instructions": [
+                            {"Pure": {"dest": 7, "val": {"kind": "String", "payload": "fresh"}, "ty": {"kind": "String"}}}
+                        ],
+                        "terminator": {"Br": {"target": 1, "args": [7]}}  # Transports fresh SSA %fresh -> %h
                     },
                     "3": {
-                        "id": 3, "name": "exit", "params": [[7, {"kind": "I64"}]],
+                        "id": 3, "name": "exit", "params": [[8, {"kind": "String"}]],
                         "instructions": [],
-                        "terminator": {"Return": 7}
+                        "terminator": {"Return": 8}
                     }
                 }
             }]
         }
     }
 
-    # 1. Baseline analysis (without mutation): full fixed-point iteration produces canonical facts
+    # 1. Independent expected baseline fixed point: LoopFact eliminated by backedge meet
+    EXPECTED_FIXED_POINT = [
+        {"predicate": "IsFalse", "args": [{"Symbol": "v1"}]},
+        {"predicate": "IsOk", "args": [{"Symbol": "v2"}]}
+    ]
+
     baseline_prog = copy.deepcopy(prog)
     baseline_obs = invoke_rust_conformance(baseline_prog)
+    baseline_facts = baseline_obs.get("active_facts", [])
 
-    # 2. Mutant analysis (with single-pass): skips fixed point re-evaluations and produces a divergent fact set
+    assert baseline_facts == EXPECTED_FIXED_POINT, f"baseline exit facts must match expected fixed point without LoopFact: got {baseline_facts}"
+    assert not any(f.get("predicate") == "LoopFact" for f in baseline_facts), "LoopFact must be removed at fixed point"
+
+    # 2. Mutant run (with m10_single_pass_loop_analysis): fails to revisit header on backedge arrival, retaining stale facts
     mutant_prog = copy.deepcopy(prog)
     mutant_prog["mutations"] = {"m10_single_pass_loop_analysis": True}
     mutant_obs = invoke_rust_conformance(mutant_prog)
+    mutant_facts = mutant_obs.get("active_facts", [])
 
-    # Mutation is killed because mutant produces an incorrect, divergent fact set from baseline fixed point (S2)
-    return baseline_obs.get("active_facts") != mutant_obs.get("active_facts")
+    # S2 Assert: mutant fact set violates expected fixed point property
+    assert mutant_facts != EXPECTED_FIXED_POINT, "mutant must fail to reach true fixed point"
+    return mutant_facts != EXPECTED_FIXED_POINT and (baseline_facts == EXPECTED_FIXED_POINT)
 
 
 if __name__ == "__main__":
