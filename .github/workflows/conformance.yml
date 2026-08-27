@@ -1,0 +1,77 @@
+name: Conformance
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  conformance:
+    name: SOMA Compiler & Runtime Conformance
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Build conformance binary
+        run: cargo build --bin bando-conformance
+
+      - name: Rust native_tests
+        run: cargo test
+
+      - name: Slice 1 Conformance
+        run: |
+          python tests/compiler_conformance/test_golden.py
+          python tests/compiler_conformance/test_negative.py
+          python tests/compiler_conformance/test_mutations.py
+          python tests/compiler_conformance/test_differential.py
+
+      - name: Slice 2 Conformance
+        run: |
+          python tests/compiler_conformance_slice2/test_golden_s2.py
+          python tests/compiler_conformance_slice2/test_negative_s2.py
+          python tests/compiler_conformance_slice2/test_mutations_s2.py
+          python tests/compiler_conformance_slice2/test_differential_s2.py
+
+      - name: Slice 3 Conformance
+        run: |
+          python tests/compiler_conformance_slice3/test_golden_s3.py
+          python tests/compiler_conformance_slice3/test_negative_s3.py
+          python tests/compiler_conformance_slice3/test_mutations_s3.py
+          python tests/compiler_conformance_slice3/test_differential_s3.py
+
+      - name: Slice 4 Conformance
+        run: |
+          python tests/compiler_conformance_slice4/test_golden_s4.py
+          python tests/compiler_conformance_slice4/test_negative_s4.py
+          python tests/compiler_conformance_slice4/test_mutations_s4.py
+          python tests/compiler_conformance_slice4/test_differential_s4.py
+
+      - name: Phase D Lowering Oracle
+        run: |
+          python tests/lowering/converge/test_scenarios.py
+          python tests/lowering/converge/test_invariant_kills.py
+          python tests/lowering/converge/test_differential_basic.py
+          python tests/lowering/converge/test_differential_fault.py
+
+      - name: Item 3 Battery
+        run: |
+          python tests/ir/item3/test_scenarios.py
+          python tests/ir/item3/test_mutation_kills.py
+          python tests/ir/item3/test_differential.py
