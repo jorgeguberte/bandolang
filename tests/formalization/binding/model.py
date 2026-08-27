@@ -302,17 +302,40 @@ def match_binding(
             return scope_match
         all_checks.extend(scope_match.deferred_checks)
 
-    # 5. Validity check (R2: Bounded validity/freshness rule)
+    # 5. Validity check (V1: Both term binding equality AND witness are required)
     if req.validity is not None:
-        if ev.validity_witness is False:
-            if not muts.get("m8_deferred_overrides_refuted", False):
-                return SymbolicMatch.refuted("ExpiredValidity: validity witness reported expired/invalid")
-        elif ev.validity_witness is True:
-            pass  # Proved statically valid
-        elif ev.validity_witness is None:
-            all_checks.append(
-                DynamicCheck("CheckValidity", req.validity, ev.validity_binding, "Dynamic validity witness required")
-            )
+        # Mutation M13: Validity witness ignores binding (FAIL V1)
+        if muts.get("m13_validity_witness_ignores_binding", False):
+            if ev.validity_witness is True:
+                pass  # Mutant shortcut ignores whether validity_binding matches!
+            elif ev.validity_witness is False:
+                if not muts.get("m8_deferred_overrides_refuted", False):
+                    return SymbolicMatch.refuted("ExpiredValidity: validity witness reported expired/invalid")
+            else:
+                all_checks.append(
+                    DynamicCheck("CheckValidity", req.validity, ev.validity_binding, "Dynamic validity witness required")
+                )
+        else:
+            if ev.validity_binding is None:
+                all_checks.append(
+                    DynamicCheck("CheckValidity", req.validity, None, "Validity verification needed (missing evidence binding)")
+                )
+            else:
+                val_match = match_term(req.validity, ev.validity_binding, ctx, muts)
+                if val_match.is_refuted and not muts.get("m8_deferred_overrides_refuted", False):
+                    return val_match
+                all_checks.extend(val_match.deferred_checks)
+
+                if val_match.is_proved:
+                    if ev.validity_witness is False:
+                        if not muts.get("m8_deferred_overrides_refuted", False):
+                            return SymbolicMatch.refuted("ExpiredValidity: validity witness reported expired/invalid")
+                    elif ev.validity_witness is True:
+                        pass  # Term matched and witness confirmed valid!
+                    elif ev.validity_witness is None:
+                        all_checks.append(
+                            DynamicCheck("CheckValidity", req.validity, ev.validity_binding, "Dynamic validity witness required")
+                        )
 
     # Mutation M7: drop deferred checks (FAIL B7 / B9)
     if muts.get("m7_drop_deferred_checks", False):
@@ -339,9 +362,9 @@ def dynamic_gate_resolve(
     witness_proofs: Dict[str, bool],
     mutations: Optional[dict[str, Any]] = None,
 ) -> Tuple[SymbolicMatch, BindingEvidence]:
-    """R3: Minimal executable dynamic gate resolution operation for Deferred checks (B10).
+    """R3 / V2: Minimal executable dynamic gate resolution operation for Deferred checks.
     
-    Proves that dynamic resolution validates the original binding without rebinding or widening.
+    Proves that dynamic resolution validates the original binding without rebinding or minting unrelated witnesses.
     """
     muts = mutations or {}
 
@@ -350,9 +373,11 @@ def dynamic_gate_resolve(
         return match_res, ev
 
     # Check all dynamic obligations against provided witness proofs
+    resolved_check_types = set()
     for check in match_res.deferred_checks:
         if not witness_proofs.get(check.check_type, False):
             return SymbolicMatch.refuted(f"DynamicCheckFailed: {check.check_type}"), ev
+        resolved_check_types.add(check.check_type)
 
     # Mutation M11: dynamic resolution rebinds subject (FAIL B10)
     if muts.get("m11_dynamic_resolution_rebinds_subject", False):
@@ -369,7 +394,24 @@ def dynamic_gate_resolve(
         )
         return SymbolicMatch.proved(), mutated_ev
 
-    # Sound dynamic resolution: validates the EXACT original binding
+    # Mutation M14: dynamic resolution mints unrelated witnesses (FAIL V2)
+    if muts.get("m14_dynamic_resolution_mints_unrelated_witnesses", False):
+        mutated_ev = BindingEvidence(
+            predicate=ev.predicate,
+            subject_binding=ev.subject_binding,
+            base_binding=ev.base_binding,
+            scope_binding=ev.scope_binding,
+            validity_binding=ev.validity_binding,
+            provenance=ev.provenance,
+            currentness_witness=True,  # Minted even if CheckCurrentBase was NOT in deferred_checks!
+            validity_witness=True,     # Minted even if CheckValidity was NOT in deferred_checks!
+        )
+        return SymbolicMatch.proved(), mutated_ev
+
+    # Sound dynamic resolution: updates ONLY witnesses for checks actually resolved!
+    resolved_currentness = True if "CheckCurrentBase" in resolved_check_types else ev.currentness_witness
+    resolved_validity = True if "CheckValidity" in resolved_check_types else ev.validity_witness
+
     resolved_ev = BindingEvidence(
         predicate=ev.predicate,
         subject_binding=ev.subject_binding,
@@ -377,8 +419,8 @@ def dynamic_gate_resolve(
         scope_binding=ev.scope_binding,
         validity_binding=ev.validity_binding,
         provenance=ev.provenance,
-        currentness_witness=True,
-        validity_witness=True,
+        currentness_witness=resolved_currentness,
+        validity_witness=resolved_validity,
     )
     return SymbolicMatch.proved(), resolved_ev
 

@@ -257,6 +257,45 @@ def get_all_scenarios() -> List[Dict[str, Any]]:
         "expected_checks_count": 0,
     })
 
+    # 17. validity_witness_true_wrong_binding -> Refuted (V1)
+    term_val_q3 = BindingTerm.literal("epoch_2026_Q3", "string")
+    term_val_q1 = BindingTerm.literal("epoch_2026_Q1", "string")
+    req_v1_wrong = BindingRequirement(predicate="Certified", subject=term_diff1, validity=term_val_q3)
+    ev_v1_wrong = BindingEvidence(predicate="Certified", subject_binding=term_diff1, validity_binding=term_val_q1, validity_witness=True)
+    scenarios.append({
+        "name": "validity_witness_true_wrong_binding",
+        "req": req_v1_wrong,
+        "ev": ev_v1_wrong,
+        "ctx": PathFactContext(),
+        "expected_proved": False,
+        "expected_refuted": True,
+        "expected_checks_count": 0,
+    })
+
+    # 18. validity_witness_true_missing_binding -> Deferred (V1)
+    ev_v1_missing = BindingEvidence(predicate="Certified", subject_binding=term_diff1, validity_binding=None, validity_witness=True)
+    scenarios.append({
+        "name": "validity_witness_true_missing_binding",
+        "req": req_v1_wrong,
+        "ev": ev_v1_missing,
+        "ctx": PathFactContext(),
+        "expected_proved": False,
+        "expected_refuted": False,
+        "expected_checks_count": 1,
+    })
+
+    # 19. validity_matching_binding_true -> Proved (V1)
+    ev_v1_matching = BindingEvidence(predicate="Certified", subject_binding=term_diff1, validity_binding=term_val_q3, validity_witness=True)
+    scenarios.append({
+        "name": "validity_matching_binding_true",
+        "req": req_v1_wrong,
+        "ev": ev_v1_matching,
+        "ctx": PathFactContext(),
+        "expected_proved": True,
+        "expected_refuted": False,
+        "expected_checks_count": 0,
+    })
+
     # 17. alias_proven_equal -> Proved
     term_val_x = BindingTerm.value_ref("vx", "Diff")
     term_val_y = BindingTerm.value_ref("vy", "Diff")

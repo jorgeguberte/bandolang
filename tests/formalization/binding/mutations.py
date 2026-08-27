@@ -30,6 +30,7 @@ try:
         SymbolicMatch,
         match_binding,
         match_term,
+        dynamic_gate_resolve,
     )
 except ImportError:
     from invariants import (
@@ -54,6 +55,7 @@ except ImportError:
         SymbolicMatch,
         match_binding,
         match_term,
+        dynamic_gate_resolve,
     )
 
 
@@ -257,6 +259,46 @@ def get_all_mutants() -> List[MutantDescriptor]:
         description="Path-fact alias overrides explicit concrete digest contradiction",
         target_invariant="B3",
         run_killer=kill_m12,
+    ))
+
+    # M13: validity witness ignores binding (V1)
+    def kill_m13():
+        diff = BindingTerm.stable_digest("sha256", "d1")
+        val_q3 = BindingTerm.literal("epoch_2026_Q3", "string")
+        val_q1 = BindingTerm.literal("epoch_2026_Q1", "string")
+        req = BindingRequirement(predicate="Certified", subject=diff, validity=val_q3)
+        ev = BindingEvidence(predicate="Certified", subject_binding=diff, validity_binding=val_q1, validity_witness=True)
+        ctx = PathFactContext()
+        res = match_binding(req, ev, ctx, {"m13_validity_witness_ignores_binding": True})
+        assert res.is_refuted, "VIOLATION OF V1: Validity witness must NOT ignore mismatched validity term binding!"
+
+    mutants.append(MutantDescriptor(
+        mutant_id="M13",
+        description="Validity witness ignores validity term binding equality",
+        target_invariant="V1",
+        run_killer=kill_m13,
+    ))
+
+    # M14: dynamic resolution mints unrelated witnesses (V2)
+    def kill_m14():
+        subj_req = BindingTerm.opaque_ref("agent_x", "tok_orig", "Diff")
+        subj_ev = BindingTerm.opaque_ref("agent_x", "tok_orig", "Diff")
+        req = BindingRequirement(predicate="TestsPassed", subject=subj_req)
+        ev = BindingEvidence(predicate="TestsPassed", subject_binding=subj_ev, currentness_witness=None, validity_witness=None)
+        ctx = PathFactContext()
+        resolved_match, resolved_ev = dynamic_gate_resolve(
+            req, ev, ctx,
+            witness_proofs={"CheckSubjectIdentity": True},
+            mutations={"m14_dynamic_resolution_mints_unrelated_witnesses": True},
+        )
+        assert resolved_ev.currentness_witness is None, "VIOLATION OF V2: Dynamic resolution minted unrelated currentness witness!"
+        assert resolved_ev.validity_witness is None, "VIOLATION OF V2: Dynamic resolution minted unrelated validity witness!"
+
+    mutants.append(MutantDescriptor(
+        mutant_id="M14",
+        description="Dynamic resolution mints unrelated witnesses (currentness/validity)",
+        target_invariant="V2",
+        run_killer=kill_m14,
     ))
 
     return mutants

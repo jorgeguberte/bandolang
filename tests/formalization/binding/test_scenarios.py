@@ -136,11 +136,17 @@ def main():
     assert_b9_deferred_checks_are_explicit(res_b9)
     print("  ✓ PASS B9: Deferred checks are explicit obligations")
 
-    # B10 (R3: Executable dynamic gate resolution)
+    # B10 (R3: Executable dynamic gate resolution & V2: non-minting of unrelated witnesses)
     req_b10 = BindingRequirement(predicate="TestsPassed", subject=t_dig_a)
-    ev_b10 = BindingEvidence(predicate="TestsPassed", subject_binding=t_opaque)
+    ev_b10 = BindingEvidence(predicate="TestsPassed", subject_binding=t_opaque, currentness_witness=None, validity_witness=None)
     assert_b10_gate_cannot_widen_binding(req_b10, ev_b10, widened_subject=t_dig_b, ctx=ctx)
-    print("  ✓ PASS B10: Gate cannot widen a binding (R3 executable resolution)")
+    
+    # V2 verification: dynamic resolution of subject identity does not mint validity or currentness
+    resolved_match, resolved_ev = dynamic_gate_resolve(req_b10, ev_b10, ctx, witness_proofs={"CheckSubjectIdentity": True})
+    assert resolved_match.is_proved
+    assert resolved_ev.validity_witness is None, "V2: dynamic subject resolution must not mint validity witness"
+    assert resolved_ev.currentness_witness is None, "V2: dynamic subject resolution must not mint currentness witness"
+    print("  ✓ PASS B10: Gate cannot widen a binding (R3 / V2 executable non-minting resolution)")
 
     # B11
     req_b11 = BindingRequirement(predicate="SafeToDeploy", subject=t_dig_a)
