@@ -115,24 +115,39 @@ pub enum VmInstruction {
     VmConvergeStage {
         handle_dest: VmValueId,
         frame_var: VmValueId,
+        node_ops: std::collections::BTreeMap<String, crate::ir::ops::SpaceOpDef>,
+        satisfier: crate::ir::ops::SatisfierDef,
+        fault_spec: crate::ir::ops::ConvergeFaultSpec,
     },
     VmConvergeEmit {
         frame_var: VmValueId,
         handle_var: VmValueId,
+        node_ops: std::collections::BTreeMap<String, crate::ir::ops::SpaceOpDef>,
+        satisfier: crate::ir::ops::SatisfierDef,
+        fault_spec: crate::ir::ops::ConvergeFaultSpec,
         space_effects: std::collections::BTreeSet<Effect>,
         satisfier_effects: std::collections::BTreeSet<Effect>,
     },
     VmConvergeAdmitCompletion {
         frame_var: VmValueId,
         handle_var: VmValueId,
+        successors: std::collections::BTreeMap<String, Vec<String>>,
+        node_ops: std::collections::BTreeMap<String, crate::ir::ops::SpaceOpDef>,
+        satisfier: crate::ir::ops::SatisfierDef,
+        space_faults: std::collections::BTreeMap<String, serde_json::Value>,
+        fault_spec: crate::ir::ops::ConvergeFaultSpec,
     },
     VmConvergeSettle {
         frame_var: VmValueId,
         handle_var: VmValueId,
+        node_ops: std::collections::BTreeMap<String, crate::ir::ops::SpaceOpDef>,
+        satisfier: crate::ir::ops::SatisfierDef,
+        fault_spec: crate::ir::ops::ConvergeFaultSpec,
     },
     VmConvergeApply {
         frame_var: VmValueId,
         handle_var: VmValueId,
+        fault_spec: crate::ir::ops::ConvergeFaultSpec,
     },
     VmConvergeFinish {
         dest: VmValueId,
@@ -143,25 +158,25 @@ pub enum VmInstruction {
 }
 
 impl VmInstruction {
-    pub fn dest(&self) -> VmValueId {
+    pub fn dest(&self) -> Option<VmValueId> {
         match self {
-            VmInstruction::VmPure { dest, .. } => *dest,
-            VmInstruction::VmRead { dest, .. } => *dest,
-            VmInstruction::VmInfer { dest, .. } => *dest,
-            VmInstruction::VmAssign { dest, .. } => *dest,
-            VmInstruction::VmVerify { dest, .. } => *dest,
-            VmInstruction::VmAct { dest, .. } => *dest,
-            VmInstruction::VmSpawnChild { dest, .. } => *dest,
-            VmInstruction::VmAwaitChild { dest, .. } => *dest,
-            VmInstruction::VmInternalize { dest, .. } => *dest,
-            VmInstruction::VmConvergeInit { frame_var, .. } => *frame_var,
-            VmInstruction::VmConvergeStep { dest, .. } => *dest,
-            VmInstruction::VmConvergeStage { handle_dest, .. } => *handle_dest,
-            VmInstruction::VmConvergeEmit { handle_var, .. } => *handle_var,
-            VmInstruction::VmConvergeAdmitCompletion { handle_var, .. } => *handle_var,
-            VmInstruction::VmConvergeSettle { handle_var, .. } => *handle_var,
-            VmInstruction::VmConvergeApply { handle_var, .. } => *handle_var,
-            VmInstruction::VmConvergeFinish { dest, .. } => *dest,
+            VmInstruction::VmPure { dest, .. } => Some(*dest),
+            VmInstruction::VmRead { dest, .. } => Some(*dest),
+            VmInstruction::VmInfer { dest, .. } => Some(*dest),
+            VmInstruction::VmAssign { dest, .. } => Some(*dest),
+            VmInstruction::VmVerify { dest, .. } => Some(*dest),
+            VmInstruction::VmAct { dest, .. } => Some(*dest),
+            VmInstruction::VmSpawnChild { dest, .. } => Some(*dest),
+            VmInstruction::VmAwaitChild { dest, .. } => Some(*dest),
+            VmInstruction::VmInternalize { dest, .. } => Some(*dest),
+            VmInstruction::VmConvergeInit { frame_var, .. } => Some(*frame_var),
+            VmInstruction::VmConvergeStep { dest, .. } => Some(*dest),
+            VmInstruction::VmConvergeStage { handle_dest, .. } => Some(*handle_dest),
+            VmInstruction::VmConvergeEmit { .. } => None,
+            VmInstruction::VmConvergeAdmitCompletion { .. } => None,
+            VmInstruction::VmConvergeSettle { .. } => None,
+            VmInstruction::VmConvergeApply { .. } => None,
+            VmInstruction::VmConvergeFinish { dest, .. } => Some(*dest),
         }
     }
 

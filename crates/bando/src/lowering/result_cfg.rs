@@ -433,7 +433,9 @@ impl LoweringContext {
                     let vm_dest = self.map_value(*dest);
                     let frame_var = self.alloc_value();
                     let step_status_var = self.alloc_value();
+                    let handle_var = self.alloc_value();
                     let loop_header_id = self.alloc_block();
+                    let tx_body_id = self.alloc_block();
                     let exit_block_id = self.alloc_block();
 
                     vm_block.instructions.push(VmInstruction::VmConvergeInit {
@@ -457,7 +459,7 @@ impl LoweringContext {
                     };
                     generated_blocks.insert(vm_block_id, vm_block);
 
-                    // Loop Header Block
+                    // 1. Loop Header Block (Scheduler Decision only)
                     let mut loop_block = VmBlock::new(loop_header_id, VmTerminator::Unreachable);
                     loop_block.name = Some("converge_step_loop".to_string());
                     loop_block.instructions.push(VmInstruction::VmConvergeStep {
@@ -477,14 +479,62 @@ impl LoweringContext {
                     });
                     loop_block.terminator = VmTerminator::CondBr {
                         cond: step_status_var,
-                        true_target: loop_header_id,
+                        true_target: tx_body_id,
                         true_args: Vec::new(),
                         false_target: exit_block_id,
                         false_args: Vec::new(),
                     };
                     generated_blocks.insert(loop_header_id, loop_block);
 
-                    // Exit Block
+                    // 2. Transactional Body Block (Explicit Stage -> Emit -> Admit -> Settle -> Apply)
+                    let mut tx_block = VmBlock::new(tx_body_id, VmTerminator::Unreachable);
+                    tx_block.name = Some("converge_tx_body".to_string());
+                    tx_block.instructions.push(VmInstruction::VmConvergeStage {
+                        handle_dest: handle_var,
+                        frame_var,
+                        node_ops: node_ops.clone(),
+                        satisfier: satisfier.clone(),
+                        fault_spec: fault_spec.clone(),
+                    });
+                    tx_block.instructions.push(VmInstruction::VmConvergeEmit {
+                        frame_var,
+                        handle_var,
+                        node_ops: node_ops.clone(),
+                        satisfier: satisfier.clone(),
+                        fault_spec: fault_spec.clone(),
+                        space_effects: space_effects.effects.iter().cloned().collect(),
+                        satisfier_effects: satisfier_effects.effects.iter().cloned().collect(),
+                    });
+                    tx_block
+                        .instructions
+                        .push(VmInstruction::VmConvergeAdmitCompletion {
+                            frame_var,
+                            handle_var,
+                            successors: successors.clone(),
+                            node_ops: node_ops.clone(),
+                            satisfier: satisfier.clone(),
+                            space_faults: space_faults.clone(),
+                            fault_spec: fault_spec.clone(),
+                        });
+                    tx_block.instructions.push(VmInstruction::VmConvergeSettle {
+                        frame_var,
+                        handle_var,
+                        node_ops: node_ops.clone(),
+                        satisfier: satisfier.clone(),
+                        fault_spec: fault_spec.clone(),
+                    });
+                    tx_block.instructions.push(VmInstruction::VmConvergeApply {
+                        frame_var,
+                        handle_var,
+                        fault_spec: fault_spec.clone(),
+                    });
+                    tx_block.terminator = VmTerminator::Br {
+                        target: loop_header_id,
+                        args: Vec::new(),
+                    };
+                    generated_blocks.insert(tx_body_id, tx_block);
+
+                    // 3. Exit Block
                     let mut exit_block = VmBlock::new(exit_block_id, VmTerminator::Unreachable);
                     exit_block.name = Some("converge_exit".to_string());
                     exit_block.instructions.push(VmInstruction::VmConvergeFinish {

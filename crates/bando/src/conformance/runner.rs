@@ -253,7 +253,26 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
                 d.frame_status = crate::converge::domain::SearchStatus::Searching;
             }
             state.status = VmStatus::Running;
+            if let Some((loop_b_id, _)) = vm_module.functions[0].blocks.iter().find(|(_, b)| b.name.as_deref() == Some("converge_step_loop")) {
+                state.current_block = *loop_b_id;
+                state.current_inst_index = 0;
+            }
             interpreter.resume(&mut state, 1000);
+        }
+    }
+
+    if let Some(d) = state.converge_domains.values().last() {
+        if d.handles.values().any(|h| h.settlement.is_some() && !h.applied) {
+            let snapshot_json = serde_json::to_string(&state).unwrap();
+            drop(interpreter);
+            state = serde_json::from_str(&snapshot_json).unwrap();
+            let mut new_interpreter = VmInterpreter::with_mutations(
+                &vm_module.functions[0],
+                &mut adapters,
+                &registry,
+                prog.mutations.clone(),
+            );
+            new_interpreter.resume(&mut state, 1000);
         }
     }
 

@@ -183,6 +183,15 @@ pub struct ExhaustionReport {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingAction {
+    pub node_id: String,
+    pub op_id: String,
+    pub kind: String, // "local" | "external"
+    pub cost: u64,
+    pub is_expansion: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConvergeTransactionDomain {
     // 1. Lifecycle & graph
     pub frame_status: SearchStatus,
@@ -206,6 +215,10 @@ pub struct ConvergeTransactionDomain {
     pub completions: BTreeMap<String, CompletionRecord>,
     pub applied_completions: Vec<String>,
     pub settlement_reconciliations: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub pending_action: Option<PendingAction>,
+    #[serde(default)]
+    pub last_staged_handle: Option<String>,
 
     // 4. Coordinated accounting
     pub scope_limit: BTreeMap<String, u64>,
@@ -249,6 +262,8 @@ impl Default for ConvergeTransactionDomain {
             completions: BTreeMap::new(),
             applied_completions: Vec::new(),
             settlement_reconciliations: BTreeMap::new(),
+            pending_action: None,
+            last_staged_handle: None,
             scope_limit: BTreeMap::new(),
             scope_committed: BTreeMap::new(),
             scope_spent: BTreeMap::new(),

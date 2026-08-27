@@ -85,69 +85,67 @@ impl<'a> VmVerifier<'a> {
             }
 
             for inst in &block.instructions {
-                let dest = inst.dest();
-                let ty = match inst {
-                    VmInstruction::VmPure { ty, .. } => ty.clone(),
-                    VmInstruction::VmRead {
-                        ok_type, err_type, ..
-                    } => Type::result(ok_type.clone(), err_type.clone()),
-                    VmInstruction::VmInfer {
-                        ok_type, err_type, ..
-                    } => Type::result(ok_type.clone(), err_type.clone()),
-                    VmInstruction::VmAssign { ty, .. } => ty.clone(),
-                    VmInstruction::VmVerify {
-                        output_predicate,
-                        subject_type,
-                        ..
-                    } => {
-                        let att_ty =
-                            Type::attestation(output_predicate.clone(), subject_type.clone());
-                        Type::result(att_ty, Type::String)
-                    }
-                    VmInstruction::VmAct {
-                        success_type,
-                        failure_type,
-                        ..
-                    } => Type::act_outcome(success_type.clone(), failure_type.clone()),
-                    VmInstruction::VmSpawnChild {
-                        ok_type,
-                        err_type,
-                        child_effects,
-                        ..
-                    } => Type::child_handle(
-                        ok_type.clone(),
-                        err_type.clone(),
-                        EffectRow {
-                            effects: child_effects.iter().cloned().collect(),
-                        },
-                    ),
-                    VmInstruction::VmAwaitChild {
-                        ok_type, err_type, ..
-                    } => Type::result(ok_type.clone(), err_type.clone()),
-                    VmInstruction::VmInternalize { payload_type, .. } => {
-                        Type::result(Type::belief(payload_type.clone()), Type::String)
-                    }
-                    VmInstruction::VmConvergeInit { .. } => Type::Unit,
-                    VmInstruction::VmConvergeStep { .. } => Type::Bool,
-                    VmInstruction::VmConvergeStage { .. } => Type::String,
-                    VmInstruction::VmConvergeEmit { .. } => Type::Unit,
-                    VmInstruction::VmConvergeAdmitCompletion { .. } => Type::Unit,
-                    VmInstruction::VmConvergeSettle { .. } => Type::Unit,
-                    VmInstruction::VmConvergeApply { .. } => Type::Unit,
-                    VmInstruction::VmConvergeFinish {
-                        partial_type,
-                        satisfied_type,
-                        ..
-                    } => {
-                        let outcome_ty = Type::convergence_outcome(
-                            satisfied_type.clone(),
-                            Type::exhaustion_report(partial_type.clone()),
-                        );
-                        Type::result(outcome_ty, Type::String)
-                    }
-                };
-                self.register_def(dest, ty);
-                block_defs.push(dest);
+                if let Some(dest) = inst.dest() {
+                    let ty = match inst {
+                        VmInstruction::VmPure { ty, .. } => ty.clone(),
+                        VmInstruction::VmRead {
+                            ok_type, err_type, ..
+                        } => Type::result(ok_type.clone(), err_type.clone()),
+                        VmInstruction::VmInfer {
+                            ok_type, err_type, ..
+                        } => Type::result(ok_type.clone(), err_type.clone()),
+                        VmInstruction::VmAssign { ty, .. } => ty.clone(),
+                        VmInstruction::VmVerify {
+                            output_predicate,
+                            subject_type,
+                            ..
+                        } => {
+                            let att_ty =
+                                Type::attestation(output_predicate.clone(), subject_type.clone());
+                            Type::result(att_ty, Type::String)
+                        }
+                        VmInstruction::VmAct {
+                            success_type,
+                            failure_type,
+                            ..
+                        } => Type::act_outcome(success_type.clone(), failure_type.clone()),
+                        VmInstruction::VmSpawnChild {
+                            ok_type,
+                            err_type,
+                            child_effects,
+                            ..
+                        } => Type::child_handle(
+                            ok_type.clone(),
+                            err_type.clone(),
+                            EffectRow {
+                                effects: child_effects.iter().cloned().collect(),
+                            },
+                        ),
+                        VmInstruction::VmAwaitChild {
+                            ok_type, err_type, ..
+                        } => Type::result(ok_type.clone(), err_type.clone()),
+                        VmInstruction::VmInternalize { payload_type, .. } => {
+                            Type::result(Type::belief(payload_type.clone()), Type::String)
+                        }
+                        VmInstruction::VmConvergeInit { .. } => Type::Unit,
+                        VmInstruction::VmConvergeStep { .. } => Type::Bool,
+                        VmInstruction::VmConvergeStage { .. } => Type::String,
+                        VmInstruction::VmConvergeFinish {
+                            partial_type,
+                            satisfied_type,
+                            ..
+                        } => {
+                            let outcome_ty = Type::convergence_outcome(
+                                satisfied_type.clone(),
+                                Type::exhaustion_report(partial_type.clone()),
+                            );
+                            Type::result(outcome_ty, Type::String)
+                        }
+                        _ => Type::Unit,
+                    };
+                    self.register_def(dest, ty);
+                    block_defs.push(dest);
+                }
             }
 
             self.block_definitions.insert(*block_id, block_defs);
@@ -184,7 +182,9 @@ impl<'a> VmVerifier<'a> {
 
             for inst in &block.instructions {
                 self.verify_instruction(inst, &visible_values);
-                visible_values.insert(inst.dest());
+                if let Some(dest) = inst.dest() {
+                    visible_values.insert(dest);
+                }
             }
 
             self.verify_terminator(&block.terminator, *block_id, &visible_values);
