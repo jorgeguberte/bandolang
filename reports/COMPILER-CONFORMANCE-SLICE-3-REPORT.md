@@ -10,7 +10,7 @@
 | Dimension | Specification | Actual Result | Status |
 | :--- | :--- | :--- | :--- |
 | **Mandate** | Compiler Conformance v0 — Slice 3 (`delegate`, `await`, `internalize`, `ChildHandle`) | Implemented in Rust `crates/bando` | **VERIFIED IN TESTED REGIME** |
-| **Baseline SHA** | `87a2060` | Checkpoint `d01709c` $\to$ `c3cf87a` | **VERIFIED** |
+| **Baseline SHA** | `87a2060` | Checkpoint `d01709c` $\to$ `8487320` $\to$ `fbfdb18` | **VERIFIED** |
 | **Bounded Repair Gate** | R1–R7 Bounded Repair | Full satisfaction of R1–R7 | **PASS** |
 | **Production Types** | `ChildHandle<T,E,Σ>`, `Claim<T>`, `Belief<T>` | Real Rust types in `ir/types.rs`, `ir/values.rs` | **PASS** |
 | **Trusted Registry** | `AgentDescriptor`, `IntentInvocationDescriptor`, `InternalizationPolicyDescriptor` | Implemented in `registry/` | **PASS** |
