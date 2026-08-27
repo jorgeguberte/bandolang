@@ -112,6 +112,14 @@ pub enum VmInstruction {
         space_effects: std::collections::BTreeSet<Effect>,
         satisfier_effects: std::collections::BTreeSet<Effect>,
     },
+    VmConvergeDispatchLocal {
+        frame_var: VmValueId,
+        successors: std::collections::BTreeMap<String, Vec<String>>,
+    },
+    VmConvergeCheckSatisfactionLocal {
+        frame_var: VmValueId,
+        satisfier: crate::ir::ops::SatisfierDef,
+    },
     VmConvergeStage {
         handle_dest: VmValueId,
         frame_var: VmValueId,
@@ -171,6 +179,8 @@ impl VmInstruction {
             VmInstruction::VmInternalize { dest, .. } => Some(*dest),
             VmInstruction::VmConvergeInit { frame_var, .. } => Some(*frame_var),
             VmInstruction::VmConvergeStep { dest, .. } => Some(*dest),
+            VmInstruction::VmConvergeDispatchLocal { .. } => None,
+            VmInstruction::VmConvergeCheckSatisfactionLocal { .. } => None,
             VmInstruction::VmConvergeStage { handle_dest, .. } => Some(*handle_dest),
             VmInstruction::VmConvergeEmit { .. } => None,
             VmInstruction::VmConvergeAdmitCompletion { .. } => None,
@@ -213,6 +223,8 @@ impl VmInstruction {
                 effs.extend(satisfier_effects.iter().cloned());
                 effs.into_iter().collect()
             }
+            VmInstruction::VmConvergeDispatchLocal { .. } => Vec::new(),
+            VmInstruction::VmConvergeCheckSatisfactionLocal { .. } => Vec::new(),
             VmInstruction::VmConvergeStage { .. } => Vec::new(),
             VmInstruction::VmConvergeEmit {
                 space_effects,

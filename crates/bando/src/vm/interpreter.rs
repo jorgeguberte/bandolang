@@ -1293,7 +1293,7 @@ impl<'a> VmInterpreter<'a> {
             VmInstruction::VmConvergeStep {
                 dest,
                 frame_var,
-                successors,
+                successors: _,
                 node_ops,
                 satisfier,
                 partial_map,
@@ -1341,6 +1341,7 @@ impl<'a> VmInterpreter<'a> {
                     }
                 });
 
+                // Pure scheduler selection only (scheduler selection != semantic execution)
                 let action = crate::converge::scheduler::scheduler_step(
                     &mut domain,
                     &sched_node_ops,
@@ -1378,90 +1379,112 @@ impl<'a> VmInterpreter<'a> {
                         domain.pending_action = None;
                         state.status = VmStatus::WaitingOnConverge(in_flight_h);
                         state.return_value = None;
-                        state.types.insert(dest_sym, Type::Bool.display_name());
+                        state.types.insert(dest_sym.clone(), Type::Bool.display_name());
                         state.converge_domains.insert(frame_sym, domain);
                         return;
                     }
                     crate::converge::scheduler::SchedulerAction::Expand(act) => {
-                        let succs = successors.get(&act.node_id).cloned().unwrap_or_default();
-                        if act.kind == "local" {
-                            let _ = crate::converge::engine::dispatch_local(
-                                &mut domain,
-                                &act.node_id,
-                                &act.op_id,
-                                &succs,
-                            );
-                            domain.pending_action = None;
-                            let is_still_searching = domain.frame_status
-                                == crate::converge::domain::SearchStatus::Searching;
-                            state.env.insert(dest_sym.clone(), VmValue::Bool(is_still_searching));
-                        } else {
-                            domain.pending_action = Some(crate::converge::domain::PendingAction {
-                                node_id: act.node_id.clone(),
-                                op_id: act.op_id.clone(),
-                                kind: "external".to_string(),
-                                cost: act.cost,
-                                is_expansion: true,
-                            });
-                            state.env.insert(dest_sym.clone(), VmValue::Bool(true));
-                        }
+                        domain.pending_action = Some(crate::converge::domain::PendingAction {
+                            node_id: act.node_id.clone(),
+                            op_id: act.op_id.clone(),
+                            kind: act.kind.clone(),
+                            cost: act.cost,
+                            is_expansion: true,
+                        });
+                        state.env.insert(dest_sym.clone(), VmValue::Bool(true));
                     }
                     crate::converge::scheduler::SchedulerAction::CheckSatisfaction(act) => {
-                        if act.kind == "local" {
-                            let attempt_no = domain.satisfaction_attempts + 1;
-                            let sat_json = satisfier
-                                .satisfier_map
-                                .get(&act.node_id)
-                                .unwrap_or(&serde_json::Value::Null);
-                            let (_status_tag, satisfied, sat_val_opt, err_opt) =
-                                crate::converge::engine::parse_sat_entry(sat_json, attempt_no);
-                            let res = crate::converge::engine::check_satisfaction(
-                                &mut domain,
-                                &act.node_id,
-                                &act.op_id,
-                                satisfied,
-                                sat_val_opt,
-                                err_opt,
-                                self.mutations.s4m03_ranking_promotes_satisfied,
-                                self.mutations
-                                    .s4m20_satisfaction_retry_bypasses_attempt_ceiling,
-                            );
-                            if let Ok(true) = res {
-                                crate::converge::engine::close_frame(
-                                    &mut domain,
-                                    crate::converge::domain::ClosingReason {
-                                        kind: "PendingSatisfied".to_string(),
-                                        error: None,
-                                    },
-                                );
-                                let _ = crate::converge::engine::terminalize(
-                                    &mut domain,
-                                    self.mutations.s4m16_terminalizes_with_commitment,
-                                );
-                            }
-                            if domain.frame_status
-                                == crate::converge::domain::SearchStatus::Closing
-                            {
-                                let _ = crate::converge::engine::finish_if_drained(&mut domain);
-                            }
-                            domain.pending_action = None;
-                            let is_still_searching = domain.frame_status
-                                == crate::converge::domain::SearchStatus::Searching;
-                            state.env.insert(dest_sym.clone(), VmValue::Bool(is_still_searching));
-                        } else {
-                            domain.pending_action = Some(crate::converge::domain::PendingAction {
-                                node_id: act.node_id.clone(),
-                                op_id: act.op_id.clone(),
-                                kind: "external".to_string(),
-                                cost: act.cost,
-                                is_expansion: false,
-                            });
-                            state.env.insert(dest_sym.clone(), VmValue::Bool(true));
-                        }
+                        domain.pending_action = Some(crate::converge::domain::PendingAction {
+                            node_id: act.node_id.clone(),
+                            op_id: act.op_id.clone(),
+                            kind: act.kind.clone(),
+                            cost: act.cost,
+                            is_expansion: false,
+                        });
+                        state.env.insert(dest_sym.clone(), VmValue::Bool(true));
                     }
                 }
 
                 state.types.insert(dest_sym, Type::Bool.display_name());
+                state.converge_domains.insert(frame_sym, domain);
+            }
+            VmInstruction::VmConvergeDispatchLocal {
+                frame_var,
+                successors,
+            } => {
+                let frame_sym = format!("v{}", frame_var.0);
+
+                let mut domain = state
+                    .converge_domains
+                    .remove(&frame_sym)
+                    .unwrap_or_default();
+
+                if let Some(act) = domain.pending_action.clone() {
+                    if act.kind == "local" && act.is_expansion {
+                        let succs = successors.get(&act.node_id).cloned().unwrap_or_default();
+                        let _ = crate::converge::engine::dispatch_local(
+                            &mut domain,
+                            &act.node_id,
+                            &act.op_id,
+                            &succs,
+                        );
+                        domain.pending_action = None;
+                    }
+                }
+
+                state.converge_domains.insert(frame_sym, domain);
+            }
+            VmInstruction::VmConvergeCheckSatisfactionLocal {
+                frame_var,
+                satisfier,
+            } => {
+                let frame_sym = format!("v{}", frame_var.0);
+
+                let mut domain = state
+                    .converge_domains
+                    .remove(&frame_sym)
+                    .unwrap_or_default();
+
+                if let Some(act) = domain.pending_action.clone() {
+                    if act.kind == "local" && !act.is_expansion {
+                        let attempt_no = domain.satisfaction_attempts + 1;
+                        let sat_json = satisfier
+                            .satisfier_map
+                            .get(&act.node_id)
+                            .unwrap_or(&serde_json::Value::Null);
+                        let (_status_tag, satisfied, sat_val_opt, err_opt) =
+                            crate::converge::engine::parse_sat_entry(sat_json, attempt_no);
+                        let res = crate::converge::engine::check_satisfaction(
+                            &mut domain,
+                            &act.node_id,
+                            &act.op_id,
+                            satisfied,
+                            sat_val_opt,
+                            err_opt,
+                            self.mutations.s4m03_ranking_promotes_satisfied,
+                            self.mutations
+                                .s4m20_satisfaction_retry_bypasses_attempt_ceiling,
+                        );
+                        if let Ok(true) = res {
+                            crate::converge::engine::close_frame(
+                                &mut domain,
+                                crate::converge::domain::ClosingReason {
+                                    kind: "PendingSatisfied".to_string(),
+                                    error: None,
+                                },
+                            );
+                            let _ = crate::converge::engine::terminalize(
+                                &mut domain,
+                                self.mutations.s4m16_terminalizes_with_commitment,
+                            );
+                        }
+                        if domain.frame_status == crate::converge::domain::SearchStatus::Closing {
+                            let _ = crate::converge::engine::finish_if_drained(&mut domain);
+                        }
+                        domain.pending_action = None;
+                    }
+                }
+
                 state.converge_domains.insert(frame_sym, domain);
             }
             VmInstruction::VmConvergeStage {

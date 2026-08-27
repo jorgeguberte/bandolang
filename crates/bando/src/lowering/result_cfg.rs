@@ -486,9 +486,21 @@ impl LoweringContext {
                     };
                     generated_blocks.insert(loop_header_id, loop_block);
 
-                    // 2. Transactional Body Block (Explicit Stage -> Emit -> Admit -> Settle -> Apply)
+                    // 2. Action Execution Block (Discrete Local Execution & Transactional External Lifecycle)
                     let mut tx_block = VmBlock::new(tx_body_id, VmTerminator::Unreachable);
-                    tx_block.name = Some("converge_tx_body".to_string());
+                    tx_block.name = Some("converge_action_body".to_string());
+                    tx_block
+                        .instructions
+                        .push(VmInstruction::VmConvergeDispatchLocal {
+                            frame_var,
+                            successors: successors.clone(),
+                        });
+                    tx_block
+                        .instructions
+                        .push(VmInstruction::VmConvergeCheckSatisfactionLocal {
+                            frame_var,
+                            satisfier: satisfier.clone(),
+                        });
                     tx_block.instructions.push(VmInstruction::VmConvergeStage {
                         handle_dest: handle_var,
                         frame_var,

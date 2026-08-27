@@ -806,10 +806,12 @@ fn test_slice4_lowering_emits_discrete_transactional_opcodes() {
     let vm_module = lowering.lower_module(&module);
     let vm_func = &vm_module.functions[0];
 
-    // Assert that the transactional opcodes are explicitly present in the VM CFG:
-    // Stage < Emit < Admit < Settle < Apply
+    // Assert that the local and external transactional opcodes are explicitly present in the VM CFG:
+    // DispatchLocal < CheckSatisfactionLocal < Stage < Emit < Admit < Settle < Apply
     let mut has_init = false;
     let mut has_step = false;
+    let mut dispatch_local_idx = None;
+    let mut check_sat_local_idx = None;
     let mut stage_idx = None;
     let mut emit_idx = None;
     let mut admit_idx = None;
@@ -821,6 +823,8 @@ fn test_slice4_lowering_emits_discrete_transactional_opcodes() {
             match inst {
                 bando::vm_ir::VmInstruction::VmConvergeInit { .. } => has_init = true,
                 bando::vm_ir::VmInstruction::VmConvergeStep { .. } => has_step = true,
+                bando::vm_ir::VmInstruction::VmConvergeDispatchLocal { .. } => dispatch_local_idx = Some(idx),
+                bando::vm_ir::VmInstruction::VmConvergeCheckSatisfactionLocal { .. } => check_sat_local_idx = Some(idx),
                 bando::vm_ir::VmInstruction::VmConvergeStage { .. } => stage_idx = Some(idx),
                 bando::vm_ir::VmInstruction::VmConvergeEmit { .. } => emit_idx = Some(idx),
                 bando::vm_ir::VmInstruction::VmConvergeAdmitCompletion { .. } => admit_idx = Some(idx),
@@ -833,19 +837,111 @@ fn test_slice4_lowering_emits_discrete_transactional_opcodes() {
 
     assert!(has_init, "R2: VM CFG must contain VmConvergeInit");
     assert!(has_step, "R2: VM CFG must contain VmConvergeStep");
+    assert!(dispatch_local_idx.is_some(), "R2: VM CFG must contain VmConvergeDispatchLocal");
+    assert!(check_sat_local_idx.is_some(), "R2: VM CFG must contain VmConvergeCheckSatisfactionLocal");
     assert!(stage_idx.is_some(), "R2: VM CFG must contain VmConvergeStage");
     assert!(emit_idx.is_some(), "R2: VM CFG must contain VmConvergeEmit");
     assert!(admit_idx.is_some(), "R2: VM CFG must contain VmConvergeAdmitCompletion");
     assert!(settle_idx.is_some(), "R2: VM CFG must contain VmConvergeSettle");
     assert!(apply_idx.is_some(), "R2: VM CFG must contain VmConvergeApply");
 
-    // Order assertion: Stage < Emit < Admit < Settle < Apply
+    // Order assertion: DispatchLocal < CheckSatisfactionLocal < Stage < Emit < Admit < Settle < Apply
+    assert!(dispatch_local_idx.unwrap() < check_sat_local_idx.unwrap());
+    assert!(check_sat_local_idx.unwrap() < stage_idx.unwrap());
     assert!(stage_idx.unwrap() < emit_idx.unwrap());
     assert!(emit_idx.unwrap() < admit_idx.unwrap());
     assert!(admit_idx.unwrap() < settle_idx.unwrap());
     assert!(settle_idx.unwrap() < apply_idx.unwrap());
 }
 
+#[test]
+fn test_slice4_local_boundary_stopping_between_selection_and_execution() {
+    let registry = RegistrySnapshot::default();
+
+    let expected_return_ty = Type::result(
+        Type::convergence_outcome(Type::String, Type::exhaustion_report(Type::String)),
+        Type::String,
+    );
+
+    let mut func = Function::new("main", BlockId(0), expected_return_ty);
+    let mut entry = Block::new(BlockId(0), Terminator::Return(Some(ValueId(1))));
+
+    let mut succs = std::collections::BTreeMap::new();
+    succs.insert("root".to_string(), vec!["leaf".to_string()]);
+
+    entry.instructions.push(Instruction::Converge {
+        dest: ValueId(1),
+        root_node: "root".to_string(),
+        initial_frontier: vec!["root".to_string()],
+        successors: succs,
+        node_ops: std::collections::BTreeMap::new(),
+        satisfier: bando::ir::ops::SatisfierDef::default(),
+        partial_map: std::collections::BTreeMap::new(),
+        space_faults: std::collections::BTreeMap::new(),
+        fault_spec: bando::ir::ops::ConvergeFaultSpec::default(),
+        space_ops: vec![],
+        satisfier_op: bando::registry::OperationId("local_satisfier".to_string()),
+        search_policy: bando::ir::ops::SearchPolicyDescriptor {
+            policy_id: "pure_policy".to_string(),
+            on_step_failure: "abort".to_string(),
+            on_satisfier_error: "abort".to_string(),
+            policy_effects: EffectRow::empty(),
+        },
+        budget_scope: bando::ir::ops::BudgetScopeConfig {
+            resource: "usd".to_string(),
+            limit: 100,
+        },
+        max_steps: 10,
+        max_satisfaction_attempts: 5,
+        space_effects: EffectRow::empty(),
+        satisfier_effects: EffectRow::empty(),
+        partial_type: Type::String,
+        satisfied_type: Type::String,
+    });
+
+    func.blocks.insert(BlockId(0), entry);
+
+    let mut module = Module::new("test_s4_local_boundary");
+    module.functions.push(func);
+
+    let mut lowering =
+        LoweringContext::with_registry(registry.clone(), CompilerMutations::default());
+    let vm_module = lowering.lower_module(&module);
+
+    let mut adapters = RuntimeAdapters::default();
+    let mut interp = VmInterpreter::new(&vm_module.functions[0], &mut adapters, &registry);
+
+    // 1. Execute up to step 2 (Init -> Br -> Step -> CondBr).
+    // Stops at action body block BEFORE VmConvergeDispatchLocal executes!
+    let mut state = interp.execute(
+        BTreeMap::new(),
+        WorldState::new(),
+        BTreeSet::new(),
+        None,
+        None,
+        2,
+    );
+
+    // 2. Assert that scheduler selection has occurred, but local semantic execution has NOT
+    assert_ne!(state.status, VmStatus::Terminated);
+    let domain = state.converge_domains.values().last().unwrap();
+    assert!(domain.pending_action.is_some(), "R2: PendingAction must be selected by VmConvergeStep");
+    let act = domain.pending_action.as_ref().unwrap();
+    assert_eq!(act.kind, "local", "R2: Selected action must be local");
+    assert_eq!(act.node_id, "root");
+    // Node is not yet expanded in the domain
+    assert!(domain.visited.is_empty(), "R2: VmConvergeStep must not have executed dispatch_local yet");
+
+    // 3. Resume execution to execute VmConvergeDispatchLocal
+    state.status = VmStatus::Running;
+    interp.resume(&mut state, 100);
+
+    // 4. Assert that semantic execution has now occurred
+    assert_eq!(state.status, VmStatus::Terminated);
+    let final_domain = state.converge_domains.values().last().unwrap();
+    assert!(!final_domain.visited.is_empty(), "R2: dispatch_local executed on resume");
+    assert_eq!(final_domain.visited[0].node_id, "root");
+}
 #[test]
 fn test_slice4_crash_recovery_instance_reconstruction() {
     let registry = RegistrySnapshot::default();

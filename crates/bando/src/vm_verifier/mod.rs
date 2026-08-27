@@ -342,6 +342,12 @@ impl<'a> VmVerifier<'a> {
             VmInstruction::VmConvergeStep { frame_var, .. } => {
                 self.check_visible(*frame_var, visible);
             }
+            VmInstruction::VmConvergeDispatchLocal { frame_var, .. } => {
+                self.check_visible(*frame_var, visible);
+            }
+            VmInstruction::VmConvergeCheckSatisfactionLocal { frame_var, .. } => {
+                self.check_visible(*frame_var, visible);
+            }
             VmInstruction::VmConvergeStage { frame_var, .. } => {
                 self.check_visible(*frame_var, visible);
             }
