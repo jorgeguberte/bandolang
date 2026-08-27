@@ -10,7 +10,8 @@
 | Dimension | Specification | Actual Result | Status |
 | :--- | :--- | :--- | :--- |
 | **Mandate** | Compiler Conformance v0 — Slice 3 (`delegate`, `await`, `internalize`, `ChildHandle`) | Implemented in Rust `crates/bando` | **VERIFIED IN TESTED REGIME** |
-| **Baseline SHA** | `87a2060` | Checkpoint `d01709c` | **VERIFIED** |
+| **Baseline SHA** | `87a2060` | Checkpoint `d01709c` $\to$ `c3cf87a` | **VERIFIED** |
+| **Bounded Repair Gate** | R1–R7 Bounded Repair | Full satisfaction of R1–R7 | **PASS** |
 | **Production Types** | `ChildHandle<T,E,Σ>`, `Claim<T>`, `Belief<T>` | Real Rust types in `ir/types.rs`, `ir/values.rs` | **PASS** |
 | **Trusted Registry** | `AgentDescriptor`, `IntentInvocationDescriptor`, `InternalizationPolicyDescriptor` | Implemented in `registry/` | **PASS** |
 | **Ceilings & Attenuation** | $\Sigma_{child} \subseteq \Sigma_{requested} \subseteq \Sigma_{exported} \subseteq \Sigma_{declared}$ & $C_{child\_eff} = \text{Attenuate}(C_{nat}, \Sigma_{req}) \cup \text{Attenuate}(C_{grant}, \Sigma_{req})$ | Enforced in `verifier/` & `vm/` | **PASS** |
