@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
-    ir::facts::{Fact, FactArg, LatentPostconditions},
+    ir::facts::{ActLatentPostconditions, Fact, FactArg, LatentPostconditions},
     lowering::CompilerMutations,
     vm_ir::{VmBlockId, VmFunction, VmInstruction, VmTerminator, VmValueId},
 };
@@ -32,6 +32,7 @@ impl<'a> PathFactAnalyzer<'a> {
 
     pub fn analyze(&self) -> AnalysisResult {
         let mut var_latent: BTreeMap<VmValueId, LatentPostconditions> = BTreeMap::new();
+        let mut act_latent: BTreeMap<VmValueId, ActLatentPostconditions> = BTreeMap::new();
 
         // Collect latent metadata from instructions
         for block in self.func.blocks.values() {
@@ -43,9 +44,15 @@ impl<'a> PathFactAnalyzer<'a> {
                     VmInstruction::VmInfer { dest, latent, .. } => {
                         var_latent.insert(*dest, latent.clone());
                     }
+                    VmInstruction::VmAct { dest, latent, .. } => {
+                        act_latent.insert(*dest, latent.clone());
+                    }
                     VmInstruction::VmAssign { dest, source, .. } => {
                         if let Some(lat) = var_latent.get(source) {
                             var_latent.insert(*dest, lat.clone());
+                        }
+                        if let Some(lat) = act_latent.get(source) {
+                            act_latent.insert(*dest, lat.clone());
                         }
                     }
                     _ => {}
@@ -59,7 +66,6 @@ impl<'a> PathFactAnalyzer<'a> {
 
         for block_id in self.func.blocks.keys() {
             let mut init_facts = BTreeSet::new();
-            // Mutation M05: Eagerly discharge on_ok into entry block
             if self.mutations.m05_eager_on_ok_materialization && *block_id == self.func.entry {
                 for latent in var_latent.values() {
                     for f in latent.instantiate_ok("v_eager") {
@@ -77,7 +83,6 @@ impl<'a> PathFactAnalyzer<'a> {
         worklist.push_back(self.func.entry);
 
         while let Some(curr_id) = worklist.pop_front() {
-            // Mutation M10: Single pass loop analysis (skip if already visited)
             if self.mutations.m10_single_pass_loop_analysis && visited.contains(&curr_id) {
                 continue;
             }
@@ -93,7 +98,13 @@ impl<'a> PathFactAnalyzer<'a> {
             let out_facts = in_facts.clone();
             block_out_facts.insert(curr_id, out_facts.clone());
 
-            let succ_edges = self.compute_successor_edges(curr_id, &block.terminator, &out_facts, &var_latent);
+            let succ_edges = self.compute_successor_edges(
+                curr_id,
+                &block.terminator,
+                &out_facts,
+                &var_latent,
+                &act_latent,
+            );
 
             for (succ_id, facts_on_edge) in succ_edges {
                 edge_facts.insert((curr_id, succ_id), facts_on_edge);
@@ -107,7 +118,6 @@ impl<'a> PathFactAnalyzer<'a> {
                 let new_succ_in = if incoming_facts.is_empty() {
                     BTreeSet::new()
                 } else if self.mutations.m06_merge_union_facts {
-                    // Mutation M06: Union instead of intersection at merge
                     let mut union_set = BTreeSet::new();
                     for next_set in &incoming_facts {
                         union_set.extend(next_set.iter().cloned());
@@ -162,6 +172,18 @@ impl<'a> PathFactAnalyzer<'a> {
                 err_target,
                 ..
             } => vec![*ok_target, *err_target],
+            VmTerminator::SwitchActOutcome {
+                success_target,
+                failure_target,
+                partial_target,
+                unknown_target,
+                ..
+            } => vec![
+                *success_target,
+                *failure_target,
+                *partial_target,
+                *unknown_target,
+            ],
             _ => Vec::new(),
         }
     }
@@ -172,6 +194,7 @@ impl<'a> PathFactAnalyzer<'a> {
         term: &VmTerminator,
         base_facts: &BTreeSet<Fact>,
         var_latent: &BTreeMap<VmValueId, LatentPostconditions>,
+        act_latent: &BTreeMap<VmValueId, ActLatentPostconditions>,
     ) -> Vec<(VmBlockId, BTreeSet<Fact>)> {
         let mut edges = Vec::new();
         match term {
@@ -237,6 +260,65 @@ impl<'a> PathFactAnalyzer<'a> {
                     let renaming = self.build_renaming(&[*err_arg], &err_block.params);
                     let renamed = err_facts.iter().map(|f| f.rename(&renaming)).collect();
                     edges.push((*err_target, renamed));
+                }
+            }
+            VmTerminator::SwitchActOutcome {
+                outcome_val,
+                success_target,
+                success_arg,
+                failure_target,
+                failure_arg,
+                partial_target,
+                partial_arg,
+                unknown_target,
+                unknown_arg,
+            } => {
+                let latent = act_latent.get(outcome_val).cloned().unwrap_or_default();
+
+                if let Some(succ_block) = self.func.blocks.get(success_target) {
+                    let mut succ_facts = base_facts.clone();
+                    succ_facts.insert(Fact::new("IsSuccess", vec![FactArg::Symbol(format!("v{}", outcome_val.0))]));
+                    for f in latent.instantiate_success(&format!("v{}", success_arg.0)) {
+                        succ_facts.insert(f);
+                    }
+                    let renaming = self.build_renaming(&[*success_arg], &succ_block.params);
+                    let renamed = succ_facts.iter().map(|f| f.rename(&renaming)).collect();
+                    edges.push((*success_target, renamed));
+                }
+
+                if let Some(fail_block) = self.func.blocks.get(failure_target) {
+                    let mut fail_facts = base_facts.clone();
+                    fail_facts.insert(Fact::new("IsFailure", vec![FactArg::Symbol(format!("v{}", outcome_val.0))]));
+                    for f in latent.instantiate_failure(&format!("v{}", failure_arg.0)) {
+                        fail_facts.insert(f);
+                    }
+                    let renaming = self.build_renaming(&[*failure_arg], &fail_block.params);
+                    let renamed = fail_facts.iter().map(|f| f.rename(&renaming)).collect();
+                    edges.push((*failure_target, renamed));
+                }
+
+                if let Some(part_block) = self.func.blocks.get(partial_target) {
+                    let mut part_facts = base_facts.clone();
+                    part_facts.insert(Fact::new("IsPartial", vec![FactArg::Symbol(format!("v{}", outcome_val.0))]));
+                    for f in latent.instantiate_partial(&format!("v{}", partial_arg.0)) {
+                        part_facts.insert(f);
+                    }
+                    if self.mutations.s2m12_success_fact_on_partial {
+                        for f in latent.instantiate_success(&format!("v{}", partial_arg.0)) {
+                            part_facts.insert(f);
+                        }
+                    }
+                    let renaming = self.build_renaming(&[*partial_arg], &part_block.params);
+                    let renamed = part_facts.iter().map(|f| f.rename(&renaming)).collect();
+                    edges.push((*partial_target, renamed));
+                }
+
+                if let Some(unk_block) = self.func.blocks.get(unknown_target) {
+                    let mut unk_facts = base_facts.clone();
+                    unk_facts.insert(Fact::new("IsUnknown", vec![FactArg::Symbol(format!("v{}", outcome_val.0))]));
+                    let renaming = self.build_renaming(&[*unknown_arg], &unk_block.params);
+                    let renamed = unk_facts.iter().map(|f| f.rename(&renaming)).collect();
+                    edges.push((*unknown_target, renamed));
                 }
             }
             _ => {}

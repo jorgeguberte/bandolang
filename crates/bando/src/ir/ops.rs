@@ -1,7 +1,10 @@
 use serde::{Deserialize, Serialize};
+
+use crate::registry::{OperationId, VerifierId};
+
 use super::{
     effects::Effect,
-    facts::LatentPostconditions,
+    facts::{ActLatentPostconditions, LatentPostconditions},
     types::Type,
     values::{BlockId, Value, ValueId},
 };
@@ -57,6 +60,25 @@ pub enum Instruction {
         source: ValueId,
         ty: Type,
     },
+    Verify {
+        dest: ValueId,
+        verifier_id: VerifierId,
+        subject: ValueId,
+        output_predicate: String,
+        subject_type: Type,
+        verifier_effects: Vec<Effect>,
+    },
+    Act {
+        dest: ValueId,
+        op_id: OperationId,
+        target_domain: String,
+        success_type: Type,
+        failure_type: Type,
+        args: Vec<ValueId>,
+        evidence: Vec<ValueId>,
+        gate_effects: Vec<Effect>,
+        latent: ActLatentPostconditions,
+    },
 }
 
 impl Instruction {
@@ -66,6 +88,8 @@ impl Instruction {
             Instruction::Read { dest, .. } => *dest,
             Instruction::Infer { dest, .. } => *dest,
             Instruction::Assign { dest, .. } => *dest,
+            Instruction::Verify { dest, .. } => *dest,
+            Instruction::Act { dest, .. } => *dest,
         }
     }
 
@@ -75,6 +99,14 @@ impl Instruction {
             Instruction::Read { domain, .. } => vec![Effect::Read(domain.clone())],
             Instruction::Infer { .. } => vec![Effect::Infer],
             Instruction::Assign { .. } => Vec::new(),
+            // Rule #1: verify inherits exactly the verifier's effect envelope (NO phantom Effect::Verify)
+            Instruction::Verify { verifier_effects, .. } => verifier_effects.clone(),
+            // Rule #9: Σ_act = { act[D] } ∪ Σ_gate
+            Instruction::Act { target_domain, gate_effects, .. } => {
+                let mut effs = vec![Effect::Act(target_domain.clone())];
+                effs.extend(gate_effects.iter().cloned());
+                effs
+            }
         }
     }
 }
@@ -99,6 +131,17 @@ pub enum Terminator {
         ok_body: Region,
         err_arg: ValueId,
         err_body: Region,
+    },
+    MatchActOutcome {
+        outcome_val: ValueId,
+        success_arg: ValueId,
+        success_body: Region,
+        failure_arg: ValueId,
+        failure_body: Region,
+        partial_arg: ValueId,
+        partial_body: Region,
+        unknown_arg: ValueId,
+        unknown_body: Region,
     },
     Unreachable,
 }

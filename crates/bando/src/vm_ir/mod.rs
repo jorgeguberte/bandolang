@@ -1,11 +1,14 @@
 use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
-use crate::ir::{
-    effects::{Effect, EffectRow},
-    facts::LatentPostconditions,
-    types::Type,
-    values::Value as VmValue,
+use crate::{
+    ir::{
+        effects::{Effect, EffectRow},
+        facts::{ActLatentPostconditions, LatentPostconditions},
+        types::Type,
+        values::Value as VmValue,
+    },
+    registry::{OperationId, VerifierId},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -40,6 +43,25 @@ pub enum VmInstruction {
         source: VmValueId,
         ty: Type,
     },
+    VmVerify {
+        dest: VmValueId,
+        verifier_id: VerifierId,
+        subject: VmValueId,
+        output_predicate: String,
+        subject_type: Type,
+        verifier_effects: Vec<Effect>,
+    },
+    VmAct {
+        dest: VmValueId,
+        op_id: OperationId,
+        target_domain: String,
+        success_type: Type,
+        failure_type: Type,
+        args: Vec<VmValueId>,
+        evidence: Vec<VmValueId>,
+        gate_effects: Vec<Effect>,
+        latent: ActLatentPostconditions,
+    },
 }
 
 impl VmInstruction {
@@ -49,6 +71,8 @@ impl VmInstruction {
             VmInstruction::VmRead { dest, .. } => *dest,
             VmInstruction::VmInfer { dest, .. } => *dest,
             VmInstruction::VmAssign { dest, .. } => *dest,
+            VmInstruction::VmVerify { dest, .. } => *dest,
+            VmInstruction::VmAct { dest, .. } => *dest,
         }
     }
 
@@ -58,6 +82,12 @@ impl VmInstruction {
             VmInstruction::VmRead { domain, .. } => vec![Effect::Read(domain.clone())],
             VmInstruction::VmInfer { .. } => vec![Effect::Infer],
             VmInstruction::VmAssign { .. } => Vec::new(),
+            VmInstruction::VmVerify { verifier_effects, .. } => verifier_effects.clone(),
+            VmInstruction::VmAct { target_domain, gate_effects, .. } => {
+                let mut effs = vec![Effect::Act(target_domain.clone())];
+                effs.extend(gate_effects.iter().cloned());
+                effs
+            }
         }
     }
 }
@@ -82,6 +112,17 @@ pub enum VmTerminator {
         ok_arg: VmValueId,
         err_target: VmBlockId,
         err_arg: VmValueId,
+    },
+    SwitchActOutcome {
+        outcome_val: VmValueId,
+        success_target: VmBlockId,
+        success_arg: VmValueId,
+        failure_target: VmBlockId,
+        failure_arg: VmValueId,
+        partial_target: VmBlockId,
+        partial_arg: VmValueId,
+        unknown_target: VmBlockId,
+        unknown_arg: VmValueId,
     },
     Unreachable,
 }
@@ -112,7 +153,7 @@ pub struct VmFunction {
     pub name: String,
     pub params: Vec<(VmValueId, Type)>,
     pub return_type: Type,
-    pub declared_effects: EffectRow, // R2: Preserved effect row in VM IR
+    pub declared_effects: EffectRow,
     pub entry: VmBlockId,
     pub blocks: BTreeMap<VmBlockId, VmBlock>,
 }

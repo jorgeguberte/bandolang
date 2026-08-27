@@ -1,16 +1,21 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     conformance::schema::{ConformanceObservationV0, ConformanceProgramV0},
     lowering::LoweringContext,
+    registry::RegistrySnapshot,
     verifier::HighLevelVerifier,
     vm::{
-        adapters::{DefaultTestInferAdapter, DefaultTestReadAdapter, RuntimeAdapters},
+        adapters::{
+            DefaultTestActAdapter, DefaultTestInferAdapter, DefaultTestReadAdapter,
+            DefaultTestVerifierAdapter, RuntimeAdapters,
+        },
         interpreter::VmStatus,
         VmInterpreter,
     },
-    vm_ir::VmValueId,
+    vm_ir::VmFunction,
     vm_verifier::VmVerifier,
+    world::WorldState,
 };
 
 pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 {
@@ -26,6 +31,8 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
             bindings: BTreeMap::new(),
             lineage: BTreeMap::new(),
             diagnostics: diags,
+            mutation_trace: Vec::new(),
+            final_world: None,
         };
     }
 
@@ -45,6 +52,8 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
             bindings: BTreeMap::new(),
             lineage: BTreeMap::new(),
             diagnostics: diags,
+            mutation_trace: Vec::new(),
+            final_world: None,
         };
     }
 
@@ -62,39 +71,62 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
                 bindings: BTreeMap::new(),
                 lineage: BTreeMap::new(),
                 diagnostics: Vec::new(),
+                mutation_trace: Vec::new(),
+                final_world: None,
             };
         }
     };
 
-    // 5. Build runtime adapters
+    // 5. Build runtime adapters (including Slice 2 adapters)
     let mut read_adapter = DefaultTestReadAdapter::default();
     read_adapter.errors = prog.read_errors.clone();
 
     let mut infer_adapter = DefaultTestInferAdapter::default();
     infer_adapter.errors = prog.infer_errors.clone();
 
+    let mut verifier_adapter = DefaultTestVerifierAdapter::default();
+    verifier_adapter.failures = prog.verifier_failures.clone();
+    verifier_adapter.out_of_envelope_attempts = prog.verifier_out_of_envelope.clone();
+
+    let mut act_adapter = DefaultTestActAdapter::default();
+    act_adapter.scenarios = prog.act_scenarios.clone();
+    act_adapter.custom_writes = prog.act_custom_writes.clone();
+
     let adapters = RuntimeAdapters {
         read: Box::new(read_adapter),
         infer: Box::new(infer_adapter),
+        verifier: Box::new(verifier_adapter),
+        act: Box::new(act_adapter),
     };
 
     // 6. Map inputs
     let mut vm_inputs = BTreeMap::new();
     for (k, v) in &prog.inputs {
-        if k.starts_with('v') {
-            if let Ok(id) = k[1..].parse::<u32>() {
-                vm_inputs.insert(VmValueId(id), v.clone());
-            }
-        }
+        vm_inputs.insert(k.clone(), v.clone());
     }
 
-    // 7. Interpret
-    let interpreter = VmInterpreter::with_mutations(func, &adapters, prog.mutations.clone());
-    let state = interpreter.execute(vm_inputs, 1000);
+    // 7. Interpret with WorldState and RegistrySnapshot
+    let initial_world = prog.initial_world.clone().unwrap_or_else(WorldState::new);
+    let initial_facts: BTreeSet<_> = prog
+        .initial_facts
+        .clone()
+        .unwrap_or_default()
+        .into_iter()
+        .collect();
+    let registry = prog.registry.clone().unwrap_or_else(RegistrySnapshot::new);
+
+    let interpreter = VmInterpreter::with_mutations(
+        func,
+        &adapters,
+        &registry,
+        prog.mutations.clone(),
+    );
+    let state = interpreter.execute(vm_inputs, initial_world, initial_facts, 1000);
 
     let status_str = match state.status {
         VmStatus::Running => "running".to_string(),
         VmStatus::Terminated => "ok".to_string(),
+        VmStatus::Error(msg) => format!("error: {}", msg),
         VmStatus::ProtocolViolation(msg) => format!("protocol_violation: {}", msg),
     };
 
@@ -103,7 +135,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
 
     let mut types_map = BTreeMap::new();
     for (k, t) in state.types {
-        types_map.insert(k, t.display_name());
+        types_map.insert(k, t);
     }
 
     ConformanceObservationV0 {
@@ -116,5 +148,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
         bindings: state.env,
         lineage: state.lineage,
         diagnostics: Vec::new(),
+        mutation_trace: state.world.mutation_trace,
+        final_world: Some(state.world.storage),
     }
 }

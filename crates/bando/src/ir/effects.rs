@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub enum Effect {
     Read(String),
     Infer,
+    Act(String),
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

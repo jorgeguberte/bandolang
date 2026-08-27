@@ -27,8 +27,8 @@ impl Fact {
             .iter()
             .map(|arg| match arg {
                 FactArg::Symbol(sym) => {
-                    if let Some(target) = mapping.get(sym) {
-                        FactArg::Symbol(target.clone())
+                    if let Some(new_sym) = mapping.get(sym) {
+                        FactArg::Symbol(new_sym.clone())
                     } else {
                         FactArg::Symbol(sym.clone())
                     }
@@ -89,5 +89,32 @@ impl LatentPostconditions {
         let mut binding = BTreeMap::new();
         binding.insert("$error".to_string(), bound_var.to_string());
         self.on_err.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ActLatentPostconditions {
+    pub on_success: Vec<FactTemplate>,
+    pub on_failure: Vec<FactTemplate>,
+    pub on_partial: Vec<FactTemplate>,
+}
+
+impl ActLatentPostconditions {
+    pub fn instantiate_success(&self, bound_var: &str) -> Vec<Fact> {
+        let mut binding = BTreeMap::new();
+        binding.insert("$value".to_string(), bound_var.to_string());
+        self.on_success.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
+    }
+
+    pub fn instantiate_failure(&self, bound_var: &str) -> Vec<Fact> {
+        let mut binding = BTreeMap::new();
+        binding.insert("$error".to_string(), bound_var.to_string());
+        self.on_failure.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
+    }
+
+    pub fn instantiate_partial(&self, bound_var: &str) -> Vec<Fact> {
+        let mut binding = BTreeMap::new();
+        binding.insert("$report".to_string(), bound_var.to_string());
+        self.on_partial.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
     }
 }

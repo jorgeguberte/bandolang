@@ -1,0 +1,383 @@
+"""test_differential_s2.py — Exact Shared Observable Comparator for SOMA-IR Slice 2.
+
+Compares every frozen shared observable available in ConformanceObservationV0:
+1. Status
+2. Return value / Result variant / payload
+3. Observable external effects (Σ)
+4. Exact active Ψ path facts
+5. Latent postconditions (exact dict equality)
+6. Types (exact dict equality)
+7. Environment bindings (exact dict equality)
+8. Concrete value lineage (exact dict equality)
+9. Diagnostics (exact list equality)
+"""
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).parent.parent / "compiler_conformance"))
+
+from protocol import invoke_rust_conformance
+
+PASS, FAIL = 0, 0
+
+
+def compare_exact_observables(name: str, expected_oracle: dict, rust_obs: dict) -> list[str]:
+    """Exact observable comparator across all 9 shared observables with strict equality."""
+    errors = []
+
+    # 1. Status
+    if expected_oracle.get("status") != rust_obs.get("status"):
+        errors.append(f"Status mismatch: oracle={expected_oracle.get('status')}, rust={rust_obs.get('status')}")
+
+    # 2. Return value
+    if expected_oracle.get("return_val") != rust_obs.get("return_val"):
+        errors.append(f"Return value mismatch: oracle={expected_oracle.get('return_val')}, rust={rust_obs.get('return_val')}")
+
+    # 3. Observable effects
+    expected_effects = expected_oracle.get("effects", [])
+    rust_effects = rust_obs.get("effects", [])
+    if expected_effects != rust_effects:
+        errors.append(f"Effects mismatch: oracle={expected_effects}, rust={rust_effects}")
+
+    # 4. Path facts Ψ (set of canonical tuples)
+    oracle_facts = expected_oracle.get("active_facts", set())
+    rust_raw_facts = rust_obs.get("active_facts", [])
+    rust_fact_set = set()
+    for rf in rust_raw_facts:
+        pred = rf["predicate"]
+        args = []
+        for a in rf["args"]:
+            if "Symbol" in a: args.append(f"sym({a['Symbol']})")
+            elif "Literal" in a: args.append(f"lit({a['Literal']})")
+        rust_fact_set.add((pred, tuple(args)))
+
+    if oracle_facts != rust_fact_set:
+        errors.append(f"Path facts Ψ exact mismatch:\n  oracle={oracle_facts}\n  rust={rust_fact_set}")
+
+    # 5. Latent facts
+    expected_latent = expected_oracle.get("latent_facts", {})
+    rust_latent = rust_obs.get("latent_facts", {})
+    if expected_latent != rust_latent:
+        errors.append(f"Latent facts exact mismatch: expected {expected_latent}, got {rust_latent}")
+
+    # 6. Types
+    expected_types = expected_oracle.get("types", {})
+    rust_types = rust_obs.get("types", {})
+    if expected_types != rust_types:
+        errors.append(f"Types exact mismatch: expected {expected_types}, got {rust_types}")
+
+    # 7. Bindings
+    expected_bindings = expected_oracle.get("bindings", {})
+    rust_bindings = rust_obs.get("bindings", {})
+    if expected_bindings != rust_bindings:
+        errors.append(f"Bindings exact mismatch: expected {expected_bindings}, got {rust_bindings}")
+
+    # 8. Lineage
+    expected_lineage = expected_oracle.get("lineage", {})
+    rust_lineage = rust_obs.get("lineage", {})
+    if expected_lineage != rust_lineage:
+        errors.append(f"Lineage exact mismatch: expected {expected_lineage}, got {rust_lineage}")
+
+    # 9. Diagnostics
+    expected_diags = expected_oracle.get("diagnostics", [])
+    rust_diags = rust_obs.get("diagnostics", [])
+    if expected_diags != rust_diags:
+        errors.append(f"Diagnostics exact mismatch: expected {expected_diags}, got {rust_diags}")
+
+    return errors
+
+
+def run_diff_check(name: str, fn) -> None:
+    global PASS, FAIL
+    print(f"\n--- CONFORMANCE DIFFERENTIAL (Slice 2): {name}")
+    try:
+        errors = fn()
+        if errors:
+            print(f"  \u2717 FAIL {name}:\n    " + "\n    ".join(errors))
+            FAIL += 1
+        else:
+            print(f"  \u2713 PASS {name} (exact agreement across all 9 shared observables)")
+            PASS += 1
+    except Exception as e:
+        print(f"  \u2717 FAIL {name}: crashed with exception {type(e).__name__}: {e}")
+        FAIL += 1
+
+
+# =====================================================================
+# Differential Conformance Suites (Slice 2)
+# =====================================================================
+
+def test_diff_verify_success():
+    def _run():
+        expected = {
+            "status": "ok",
+            "return_val": {"kind": "String", "payload": "sub_A"},
+            "effects": ["read[workspace]"],
+            "active_facts": {("IsOk", ("sym(v2)",))},
+            "latent_facts": {},
+            "types": {
+                "v1": "string",
+                "v2": "Result<Attestation<PassesAudit, string>, string>",
+                "v3": "Attestation<PassesAudit, string>",
+            },
+            "bindings": {
+                "v1": {"kind": "String", "payload": "sub_A"},
+                "v2": {"kind": "Ok", "payload": {
+                    "kind": "Attestation",
+                    "payload": {
+                        "predicate": "PassesAudit",
+                        "subject": {"kind": "String", "payload": "sub_A"},
+                        "issuer": "v_audit",
+                        "verifier_build": "v1.0.0",
+                        "token": "tok_valid"
+                    }
+                }},
+                "v3": {
+                    "kind": "Attestation",
+                    "payload": {
+                        "predicate": "PassesAudit",
+                        "subject": {"kind": "String", "payload": "sub_A"},
+                        "issuer": "v_audit",
+                        "verifier_build": "v1.0.0",
+                        "token": "tok_valid"
+                    }
+                }
+            },
+            "lineage": {},
+            "diagnostics": [],
+        }
+        prog = {
+            "name": "Diff_Verify_Success", "entry_func": "main", "inputs": {},
+            "registry": {
+                "verifiers": {
+                    "v_audit": {
+                        "verifier_id": "v_audit", "version": "1.0.0",
+                        "effect_envelope": {"effects": [{"Read": "workspace"}]},
+                        "output_predicate": "PassesAudit", "subject_type": {"kind": "String"}
+                    }
+                },
+                "operations": {}, "trust_policy": {"trusted_issuers": {}}
+            },
+            "module": {
+                "name": "m", "functions": [{
+                    "name": "main", "params": [], "return_type": {"kind": "String"},
+                    "declared_effects": {"effects": [{"Read": "workspace"}]}, "entry": 0,
+                    "blocks": {
+                        "0": {
+                            "id": 0, "params": [],
+                            "instructions": [
+                                {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub_A"}, "ty": {"kind": "String"}}},
+                                {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1, "output_predicate": "PassesAudit", "subject_type": {"kind": "String"}, "verifier_effects": [{"Read": "workspace"}]}}
+                            ],
+                            "terminator": {
+                                "MatchResult": {
+                                    "result_val": 2,
+                                    "ok_arg": 3, "ok_body": {"instructions": [], "terminator": {"Return": 1}},
+                                    "err_arg": 4, "err_body": {"instructions": [], "terminator": {"Return": 4}}
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+        rust_obs = invoke_rust_conformance(prog)
+        return compare_exact_observables("Diff_Verify_Success", expected, rust_obs)
+    run_diff_check("Diff_Verify_Success", _run)
+
+
+def test_diff_gated_act_success():
+    def _run():
+        expected = {
+            "status": "ok",
+            "return_val": {"kind": "String", "payload": "act_success_ok"},
+            "effects": ["read[workspace]", "read[trust_store]", "act[workspace]"],
+            "active_facts": {
+                ("IsSuccess", ("sym(v3)",)),
+                ("SuccessFact", ("sym(v4)",)),
+            },
+            "latent_facts": {},
+            "types": {
+                "v1": "string",
+                "v2": "Result<Attestation<PassesAudit, string>, string>",
+                "v3": "ActOutcome<string, string>",
+                "v4": "string",
+            },
+            "bindings": {
+                "v1": {"kind": "String", "payload": "sub_A"},
+                "v2": {"kind": "Ok", "payload": {
+                    "kind": "Attestation",
+                    "payload": {
+                        "predicate": "PassesAudit",
+                        "subject": {"kind": "String", "payload": "sub_A"},
+                        "issuer": "v_audit",
+                        "verifier_build": "v1.0.0",
+                        "token": "tok_valid"
+                    }
+                }},
+                "v3": {"kind": "ActSuccess", "payload": {"kind": "String", "payload": "act_success_ok"}},
+                "v4": {"kind": "String", "payload": "act_success_ok"}
+            },
+            "lineage": {},
+            "diagnostics": [],
+        }
+        prog = {
+            "name": "Diff_Gated_Act_Success", "entry_func": "main", "inputs": {},
+            "registry": {
+                "verifiers": {
+                    "v_audit": {
+                        "verifier_id": "v_audit", "version": "1.0.0",
+                        "effect_envelope": {"effects": [{"Read": "workspace"}]},
+                        "output_predicate": "PassesAudit", "subject_type": {"kind": "String"}
+                    }
+                },
+                "operations": {
+                    "op_write": {
+                        "op_id": "op_write", "target_domain": "workspace",
+                        "declared_envelope": {"effects": [{"Act": "workspace"}, {"Read": "workspace"}, {"Read": "trust_store"}]},
+                        "declared_footprint": {"Exact": ["workspace/doc1"]},
+                        "atomicity": "Atomic",
+                        "requirements": [{"RequiresAttestation": {"predicate": "PassesAudit", "subject_arg_idx": 0}}]
+                    }
+                },
+                "trust_policy": {"trusted_issuers": {"PassesAudit": ["v_audit"]}}
+            },
+            "module": {
+                "name": "m", "functions": [{
+                    "name": "main", "params": [], "return_type": {"kind": "String"},
+                    "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]},
+                    "entry": 0,
+                    "blocks": {
+                        "0": {
+                            "id": 0, "params": [],
+                            "instructions": [
+                                {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub_A"}, "ty": {"kind": "String"}}},
+                                {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1, "output_predicate": "PassesAudit", "subject_type": {"kind": "String"}, "verifier_effects": [{"Read": "workspace"}]}},
+                                {"Act": {
+                                    "dest": 3, "op_id": "op_write", "target_domain": "workspace",
+                                    "success_type": {"kind": "String"}, "failure_type": {"kind": "String"},
+                                    "args": [1], "evidence": [2], "gate_effects": [{"Read": "trust_store"}],
+                                    "latent": {
+                                        "on_success": [{"predicate": "SuccessFact", "args": [{"Symbol": "$value"}]}],
+                                        "on_failure": [], "on_partial": []
+                                    }
+                                }}
+                            ],
+                            "terminator": {
+                                "MatchActOutcome": {
+                                    "outcome_val": 3,
+                                    "success_arg": 4, "success_body": {"instructions": [], "terminator": {"Return": 4}},
+                                    "failure_arg": 5, "failure_body": {"instructions": [], "terminator": {"Return": 5}},
+                                    "partial_arg": 6, "partial_body": {"instructions": [], "terminator": {"Return": 1}},
+                                    "unknown_arg": 7, "unknown_body": {"instructions": [], "terminator": {"Return": 1}}
+                                }
+                            }
+                        }
+                    }
+                }]
+            }
+        }
+        rust_obs = invoke_rust_conformance(prog)
+        return compare_exact_observables("Diff_Gated_Act_Success", expected, rust_obs)
+    run_diff_check("Diff_Gated_Act_Success", _run)
+
+
+# =====================================================================
+# Negative Comparator Probes (Slice 2)
+# =====================================================================
+
+def test_probe_extra_lineage_fails():
+    def _run():
+        expected = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
+            "latent_facts": {}, "types": {}, "bindings": {}, "diagnostics": [],
+            "lineage": {"v1": ["verify(auditor)"]},
+        }
+        rust_obs = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": [],
+            "latent_facts": {}, "types": {}, "bindings": {}, "diagnostics": [],
+            "lineage": {"v1": ["verify(auditor)"], "phantom_unauthorized": ["act(evil)"]},
+        }
+        errs = compare_exact_observables("PROBE_extra_lineage", expected, rust_obs)
+        assert len(errs) > 0, "comparator falsely accepted extra spurious lineage"
+        return []
+    run_diff_check("PROBE_extra_lineage_fails", _run)
+
+
+def test_probe_extra_latent_fact_fails():
+    def _run():
+        expected = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
+            "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "latent_facts": {"v1": {"on_ok": [{"predicate": "PassesAudit", "args": []}], "on_err": []}},
+        }
+        rust_obs = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": [],
+            "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "latent_facts": {
+                "v1": {"on_ok": [{"predicate": "PassesAudit", "args": []}], "on_err": []},
+                "v_spurious": {"on_ok": [{"predicate": "PhantomFact", "args": []}], "on_err": []}
+            },
+        }
+        errs = compare_exact_observables("PROBE_extra_latent", expected, rust_obs)
+        assert len(errs) > 0, "comparator falsely accepted extra latent fact"
+        return []
+    run_diff_check("PROBE_extra_latent_fact_fails", _run)
+
+
+def test_probe_extra_binding_entry_fails():
+    def _run():
+        expected = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
+            "latent_facts": {}, "types": {}, "lineage": {}, "diagnostics": [],
+            "bindings": {"v1": {"kind": "String", "payload": "sub_A"}},
+        }
+        rust_obs = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": [],
+            "latent_facts": {}, "types": {}, "lineage": {}, "diagnostics": [],
+            "bindings": {
+                "v1": {"kind": "String", "payload": "sub_A"},
+                "v_phantom": {"kind": "I64", "payload": 999}
+            },
+        }
+        errs = compare_exact_observables("PROBE_extra_binding", expected, rust_obs)
+        assert len(errs) > 0, "comparator falsely accepted extra binding entry"
+        return []
+    run_diff_check("PROBE_extra_binding_entry_fails", _run)
+
+
+def test_probe_unexpected_diagnostic_fails():
+    def _run():
+        expected = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {},
+            "diagnostics": [],
+        }
+        rust_obs = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": [],
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {},
+            "diagnostics": [{"code": "EffectUndeclared", "message": "unexpected"}],
+        }
+        errs = compare_exact_observables("PROBE_unexpected_diag", expected, rust_obs)
+        assert len(errs) > 0, "comparator falsely accepted unexpected diagnostic"
+        return []
+    run_diff_check("PROBE_unexpected_diagnostic_fails", _run)
+
+
+if __name__ == "__main__":
+    print("=" * 70)
+    print("SOMA COMPILER CONFORMANCE v0 (SLICE 2) — Python Oracle vs Rust Differential")
+    test_diff_verify_success()
+    test_diff_gated_act_success()
+    test_probe_extra_lineage_fails()
+    test_probe_extra_latent_fact_fails()
+    test_probe_extra_binding_entry_fails()
+    test_probe_unexpected_diagnostic_fails()
+
+    print("=" * 70)
+    print(f"SLICE 2 DIFFERENTIAL RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")
+    if FAIL:
+        sys.exit(1)
+    print("Exact differential agreement confirmed between Python Oracle and Rust Toolchain for Slice 2.")

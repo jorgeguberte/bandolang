@@ -3,102 +3,159 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     analysis::PathFactAnalyzer,
+    gate::{DeferredCheck, GateEngine, RequirementResolution},
     ir::{
-        facts::{Fact, LatentPostconditions},
+        effects::EffectRow,
+        facts::{Fact, FactArg, LatentPostconditions},
         types::Type,
         values::Value as VmValue,
     },
-    vm::adapters::RuntimeAdapters,
+    lowering::CompilerMutations,
+    registry::{
+        AtomicityGuarantee, MutationFootprint, OperationDescriptor, RegistrySnapshot,
+    },
     vm_ir::{VmBlockId, VmFunction, VmInstruction, VmTerminator, VmValueId},
+    world::WorldState,
 };
+
+use super::adapters::RuntimeAdapters;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum VmStatus {
     Running,
     Terminated,
+    Error(String),
     ProtocolViolation(String),
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct VmExecutionState {
     pub current_block: VmBlockId,
     pub env: BTreeMap<String, VmValue>,
-    pub types: BTreeMap<String, Type>,
+    pub types: BTreeMap<String, String>,
     pub latent: BTreeMap<String, LatentPostconditions>,
     pub observable_effects: Vec<String>,
     pub lineage: BTreeMap<String, Vec<String>>,
     pub active_facts: BTreeSet<Fact>,
     pub status: VmStatus,
     pub return_value: Option<VmValue>,
+    pub world: WorldState,
+    pub invalidated_keys: BTreeSet<String>,
 }
 
 pub struct VmInterpreter<'a> {
-    func: &'a VmFunction,
-    adapters: &'a RuntimeAdapters,
-    mutations: crate::lowering::CompilerMutations,
+    pub func: &'a VmFunction,
+    pub adapters: &'a RuntimeAdapters,
+    pub registry: &'a RegistrySnapshot,
+    pub mutations: CompilerMutations,
 }
 
 impl<'a> VmInterpreter<'a> {
-    pub fn new(func: &'a VmFunction, adapters: &'a RuntimeAdapters) -> Self {
+    pub fn new(
+        func: &'a VmFunction,
+        adapters: &'a RuntimeAdapters,
+        registry: &'a RegistrySnapshot,
+    ) -> Self {
         Self {
             func,
             adapters,
-            mutations: crate::lowering::CompilerMutations::default(),
+            registry,
+            mutations: CompilerMutations::default(),
         }
     }
 
     pub fn with_mutations(
         func: &'a VmFunction,
         adapters: &'a RuntimeAdapters,
-        mutations: crate::lowering::CompilerMutations,
+        registry: &'a RegistrySnapshot,
+        mutations: CompilerMutations,
     ) -> Self {
-        Self { func, adapters, mutations }
+        Self {
+            func,
+            adapters,
+            registry,
+            mutations,
+        }
     }
 
-    pub fn execute(&self, inputs: BTreeMap<VmValueId, VmValue>, max_steps: usize) -> VmExecutionState {
+    pub fn execute(
+        &self,
+        inputs: BTreeMap<String, VmValue>,
+        initial_world: WorldState,
+        initial_facts: BTreeSet<Fact>,
+        max_steps: usize,
+    ) -> VmExecutionState {
         let mut state = VmExecutionState {
             current_block: self.func.entry,
-            env: BTreeMap::new(),
+            env: inputs.clone(),
             types: BTreeMap::new(),
             latent: BTreeMap::new(),
             observable_effects: Vec::new(),
             lineage: BTreeMap::new(),
-            active_facts: BTreeSet::new(),
+            active_facts: initial_facts.clone(),
             status: VmStatus::Running,
             return_value: None,
+            world: initial_world,
+            invalidated_keys: BTreeSet::new(),
         };
 
-        // Populate function parameters
-        for (param_id, param_type) in &self.func.params {
-            state.types.insert(format!("v{}", param_id.0), param_type.clone());
-            if let Some(val) = inputs.get(param_id) {
-                state.env.insert(format!("v{}", param_id.0), val.clone());
+        // Static path fact analysis
+        let analysis = PathFactAnalyzer::with_mutations(self.func, self.mutations.clone()).analyze();
+
+        // Populate parameter types into state
+        if let Some(entry_block) = self.func.blocks.get(&self.func.entry) {
+            for (val_id, ty) in &entry_block.params {
+                state.types.insert(format!("v{}", val_id.0), ty.display_name());
             }
         }
 
-        // Run static path fact analysis to compute fixed point facts for blocks
-        let analysis = PathFactAnalyzer::with_mutations(self.func, self.mutations.clone()).analyze();
-
         let mut steps = 0;
-        while state.status == VmStatus::Running && steps < max_steps {
+
+        while state.status == VmStatus::Running {
+            if steps >= max_steps {
+                state.status = VmStatus::Error("Maximum execution steps exceeded".to_string());
+                break;
+            }
             steps += 1;
 
             let block = match self.func.blocks.get(&state.current_block) {
                 Some(b) => b,
                 None => {
-                    state.status = VmStatus::ProtocolViolation(format!("Block {:?} not found", state.current_block));
+                    state.status = VmStatus::Error(format!(
+                        "Block {:?} not found during execution",
+                        state.current_block
+                    ));
                     break;
                 }
             };
 
-            // Update active facts from block entry fixed point
-            if let Some(in_facts) = analysis.block_in_facts.get(&state.current_block) {
-                state.active_facts = in_facts.clone();
-            }
+            // Active path facts for current block
+            let block_facts = analysis
+                .block_in_facts
+                .get(&state.current_block)
+                .cloned()
+                .unwrap_or_default();
+            let mut facts = initial_facts.clone();
+            facts.extend(block_facts);
 
-            // Execute instructions
+            if !self.mutations.s2m14_current_facts_not_invalidated {
+                facts.retain(|f| {
+                    if f.predicate == "CurrentState" {
+                        if let Some(FactArg::Literal(k)) = f.args.first() {
+                            return !state.invalidated_keys.contains(k);
+                        }
+                    }
+                    true
+                });
+            }
+            if self.mutations.s2m15_historical_facts_invalidated && !state.invalidated_keys.is_empty() {
+                facts.retain(|f| f.predicate != "Historical");
+            }
+            state.active_facts = facts;
+
+            // Execute instructions in block
             for inst in &block.instructions {
-                self.exec_instruction(inst, &mut state);
+                self.execute_instruction(inst, &mut state);
                 if state.status != VmStatus::Running {
                     break;
                 }
@@ -109,18 +166,18 @@ impl<'a> VmInterpreter<'a> {
             }
 
             // Execute terminator
-            self.exec_terminator(&block.terminator, &mut state);
+            self.execute_terminator(&block.terminator, &mut state);
         }
 
         state
     }
 
-    fn exec_instruction(&self, inst: &VmInstruction, state: &mut VmExecutionState) {
+    fn execute_instruction(&self, inst: &VmInstruction, state: &mut VmExecutionState) {
         match inst {
             VmInstruction::VmPure { dest, val, ty } => {
                 let sym = format!("v{}", dest.0);
                 state.env.insert(sym.clone(), val.clone());
-                state.types.insert(sym, ty.clone());
+                state.types.insert(sym, ty.display_name());
             }
             VmInstruction::VmRead {
                 dest,
@@ -130,16 +187,38 @@ impl<'a> VmInterpreter<'a> {
                 latent,
             } => {
                 let sym = format!("v{}", dest.0);
-                state.observable_effects.push(format!("read[{}]", domain));
-                state.latent.insert(sym.clone(), latent.clone());
-                state.types.insert(sym.clone(), Type::result(ok_type.clone(), err_type.clone()));
-                state.lineage.insert(sym.clone(), vec![format!("read({})", domain)]);
+                let res = self.adapters.read.read(domain);
 
-                let val = match self.adapters.read.read(domain) {
+                // Mutation M07: drop read effect
+                if !self.mutations.m07_drop_read_effect {
+                    state
+                        .observable_effects
+                        .push(format!("read[{}]", domain));
+                }
+
+                let out_val = match res {
                     Ok(v) => VmValue::ok(v),
                     Err(e) => VmValue::err(e),
                 };
-                state.env.insert(sym, val);
+
+                state.env.insert(sym.clone(), out_val);
+                state.lineage.insert(sym.clone(), vec![format!("read({})", domain)]);
+                state.types.insert(
+                    sym.clone(),
+                    Type::result(ok_type.clone(), err_type.clone()).display_name(),
+                );
+
+                // Mutation M04: drop latent postcondition
+                if !self.mutations.m04_drop_latent_metadata {
+                    state.latent.insert(sym, latent.clone());
+                }
+
+                // Mutation M05: eager instantiation of on_ok
+                if self.mutations.m05_eager_on_ok_materialization {
+                    for f in latent.instantiate_ok(&format!("v{}", dest.0)) {
+                        state.active_facts.insert(f);
+                    }
+                }
             }
             VmInstruction::VmInfer {
                 dest,
@@ -149,42 +228,291 @@ impl<'a> VmInterpreter<'a> {
                 latent,
             } => {
                 let sym = format!("v{}", dest.0);
-                state.observable_effects.push("infer".to_string());
-                state.latent.insert(sym.clone(), latent.clone());
-                state.types.insert(sym.clone(), Type::result(ok_type.clone(), err_type.clone()));
-                state.lineage.insert(sym.clone(), vec![format!("infer({})", prompt)]);
+                let res = self.adapters.infer.infer(prompt);
 
-                let val = match self.adapters.infer.infer(prompt) {
+                // Mutation M08: drop infer effect
+                if !self.mutations.m08_drop_infer_effect {
+                    state.observable_effects.push("infer".to_string());
+                }
+
+                let out_val = match res {
                     Ok(v) => VmValue::ok(v),
                     Err(e) => VmValue::err(e),
                 };
-                state.env.insert(sym, val);
+
+                state.env.insert(sym.clone(), out_val);
+                state.lineage.insert(sym.clone(), vec![format!("infer({})", prompt)]);
+                state.types.insert(
+                    sym.clone(),
+                    Type::result(ok_type.clone(), err_type.clone()).display_name(),
+                );
+
+                if !self.mutations.m04_drop_latent_metadata {
+                    state.latent.insert(sym, latent.clone());
+                }
             }
             VmInstruction::VmAssign { dest, source, ty } => {
+                let src_sym = if self.mutations.m09_stale_source_value_id {
+                    format!("v{}", dest.0) // Corrupted source
+                } else {
+                    format!("v{}", source.0)
+                };
+                let val = state.env.get(&src_sym).cloned().unwrap_or(VmValue::Unit);
                 let dest_sym = format!("v{}", dest.0);
-                let src_sym = format!("v{}", source.0);
+                state.env.insert(dest_sym.clone(), val);
+                state.types.insert(dest_sym, ty.display_name());
+            }
+            VmInstruction::VmVerify {
+                dest,
+                verifier_id,
+                subject,
+                output_predicate,
+                subject_type,
+                verifier_effects,
+            } => {
+                let dest_sym = format!("v{}", dest.0);
+                let sub_sym = format!("v{}", subject.0);
+                let subject_val = state.env.get(&sub_sym).cloned().unwrap_or(VmValue::Unit);
 
-                if let Some(val) = state.env.get(&src_sym).cloned() {
-                    state.env.insert(dest_sym.clone(), val);
+                let mut env_row = EffectRow::empty();
+                for eff in verifier_effects {
+                    env_row = env_row.with(eff.clone());
                 }
-                if let Some(lat) = state.latent.get(&src_sym).cloned() {
-                    state.latent.insert(dest_sym.clone(), lat);
+
+                // S2M02: drop verifier effect from execution
+                if !self.mutations.s2m02_drop_verifier_effect {
+                    for eff in verifier_effects {
+                        match eff {
+                            crate::ir::effects::Effect::Read(d) => {
+                                state.observable_effects.push(format!("read[{}]", d))
+                            }
+                            crate::ir::effects::Effect::Infer => {
+                                state.observable_effects.push("infer".to_string())
+                            }
+                            crate::ir::effects::Effect::Act(d) => {
+                                state.observable_effects.push(format!("act[{}]", d))
+                            }
+                        }
+                    }
                 }
-                if let Some(lin) = state.lineage.get(&src_sym).cloned() {
-                    state.lineage.insert(dest_sym.clone(), lin);
+
+                let verify_res = self
+                    .adapters
+                    .verifier
+                    .verify(verifier_id, &subject_val, &env_row);
+                let out_val = match verify_res {
+                    Ok(att) => VmValue::ok(att),
+                    Err(e) => VmValue::err(VmValue::String(e)),
+                };
+
+                let ret_ty = Type::result(
+                    Type::attestation(output_predicate.clone(), subject_type.clone()),
+                    Type::String,
+                );
+
+                state.env.insert(dest_sym.clone(), out_val);
+                state.types.insert(dest_sym, ret_ty.display_name());
+            }
+            VmInstruction::VmAct {
+                dest,
+                op_id,
+                target_domain,
+                success_type,
+                failure_type,
+                args,
+                evidence,
+                gate_effects,
+                latent: _,
+            } => {
+                let dest_sym = format!("v{}", dest.0);
+                let ret_ty = Type::act_outcome(success_type.clone(), failure_type.clone());
+                state.types.insert(dest_sym.clone(), ret_ty.display_name());
+
+                // Look up operation descriptor
+                let op_desc = self
+                    .registry
+                    .operations
+                    .get(op_id)
+                    .cloned()
+                    .unwrap_or_else(|| {
+                        OperationDescriptor::new(
+                            op_id.clone(),
+                            target_domain.clone(),
+                            EffectRow::empty()
+                                .with(crate::ir::effects::Effect::Act(target_domain.clone())),
+                            MutationFootprint::DomainWide(target_domain.clone()),
+                            AtomicityGuarantee::Atomic,
+                            Vec::new(),
+                        )
+                    });
+
+                // 1. Resolve requirements against args and evidence
+                let mut arg_values = Vec::new();
+                for arg_id in args {
+                    let arg_sym = format!("v{}", arg_id.0);
+                    if let Some(v) = state.env.get(&arg_sym) {
+                        arg_values.push(v.clone());
+                    }
                 }
-                state.types.insert(dest_sym, ty.clone());
+
+                let mut ev_values = Vec::new();
+                for ev_id in evidence {
+                    let ev_sym = format!("v{}", ev_id.0);
+                    if let Some(v) = state.env.get(&ev_sym) {
+                        ev_values.push(v.clone());
+                    }
+                }
+
+                let resolution = if self.mutations.s2m04_deferred_treated_as_proved {
+                    RequirementResolution::Proved
+                } else {
+                    GateEngine::resolve_requirements(&op_desc.requirements, &arg_values, &ev_values)
+                };
+
+                // 2. Evaluate gate checks
+                let mut gate_passed = true;
+                let mut witness_version = None;
+                let mut gate_eff_strings = Vec::new();
+
+                for eff in gate_effects {
+                    match eff {
+                        crate::ir::effects::Effect::Read(d) => {
+                            gate_eff_strings.push(format!("read[{}]", d))
+                        }
+                        crate::ir::effects::Effect::Infer => {
+                            gate_eff_strings.push("infer".to_string())
+                        }
+                        crate::ir::effects::Effect::Act(d) => {
+                            gate_eff_strings.push(format!("act[{}]", d))
+                        }
+                    }
+                }
+
+                match &resolution {
+                    RequirementResolution::Proved => {
+                        // No dynamic checks required
+                    }
+                    RequirementResolution::Deferred(checks) => {
+                        // Record gate check effects in observable trace (Rule #15)
+                        if !self.mutations.s2m06_gate_effect_omitted_from_act {
+                            state.observable_effects.extend(gate_eff_strings.clone());
+                        }
+
+                        let mut trust_policy = self.registry.trust_policy.clone();
+                        if self.mutations.s2m03_trust_arbitrary_issuer
+                            || self.mutations.s2m16_untrusted_attestation_accepted
+                        {
+                            // Flawed trust policy accepting all issuers
+                            trust_policy.trusted_issuers.clear();
+                            for check in checks {
+                                if let DeferredCheck::CheckTrustPolicy { predicate, issuer } = check
+                                {
+                                    trust_policy.trust_verifier(predicate.clone(), issuer.clone());
+                                }
+                            }
+                        }
+
+                        let gate_eval = GateEngine::evaluate_deferred(
+                            checks,
+                            &state.world,
+                            &trust_policy,
+                            &gate_eff_strings,
+                        );
+
+                        match gate_eval {
+                            Ok(w) => {
+                                witness_version =
+                                    if self.mutations.s2m08_toctou_revalidation_omitted {
+                                        None
+                                    } else {
+                                        w.observed_state_version
+                                    };
+                            }
+                            Err(_) => {
+                                gate_passed = false;
+                            }
+                        }
+                    }
+                    RequirementResolution::Refuted | RequirementResolution::Uncovered => {
+                        gate_passed = false;
+                    }
+                }
+
+                if !gate_passed && !self.mutations.s2m05_gate_rejection_still_invokes_target {
+                    // Rule #15: Gate rejected -> zero target mutation, gate effects remain observable
+                    state.env.insert(
+                        dest_sym,
+                        VmValue::act_failure(VmValue::String("GateRejected".to_string())),
+                    );
+                    return;
+                }
+
+                // 3. Execute target act
+                state
+                    .observable_effects
+                    .push(format!("act[{}]", target_domain));
+
+                let prior_trace_len = state.world.mutation_trace.len();
+
+                let mut arg_id_values = Vec::new();
+                for arg_id in args {
+                    let arg_sym = format!("v{}", arg_id.0);
+                    let val = state.env.get(&arg_sym).cloned().unwrap_or(VmValue::Unit);
+                    arg_id_values.push(val);
+                }
+
+                let footprint = if self.mutations.s2m09_footprint_enforcement_disabled {
+                    MutationFootprint::Unknown(target_domain.clone())
+                } else {
+                    op_desc.declared_footprint.clone()
+                };
+
+                let mut raw_outcome = self.adapters.act.execute_act(
+                    op_id,
+                    &arg_id_values,
+                    &footprint,
+                    &mut state.world,
+                    op_desc.atomicity,
+                    witness_version,
+                );
+
+                if self.mutations.s2m10_partial_collapsed_to_failure {
+                    if let VmValue::ActPartial(rep) = raw_outcome {
+                        raw_outcome = VmValue::act_failure(VmValue::String(format!(
+                            "CoercedPartial({})",
+                            rep.op_id
+                        )));
+                    }
+                }
+                if self.mutations.s2m11_unknown_collapsed_to_failure {
+                    if let VmValue::DeliveryUnknown(r) | VmValue::SettlementUnknown(r) = raw_outcome
+                    {
+                        raw_outcome =
+                            VmValue::act_failure(VmValue::String(format!("CoercedUnknown({})", r)));
+                    }
+                }
+
+                // 4. Invalidate facts intersecting mutation footprint (Rule #20)
+                if state.world.mutation_trace.len() > prior_trace_len {
+                    for (k, _, _) in &state.world.mutation_trace[prior_trace_len..] {
+                        state.invalidated_keys.insert(k.clone());
+                    }
+                }
+
+                state.env.insert(dest_sym, raw_outcome);
             }
         }
     }
 
-    fn exec_terminator(&self, term: &VmTerminator, state: &mut VmExecutionState) {
+    fn execute_terminator(&self, term: &VmTerminator, state: &mut VmExecutionState) {
         match term {
             VmTerminator::Return(val_opt) => {
                 state.status = VmStatus::Terminated;
                 if let Some(val_id) = val_opt {
                     let sym = format!("v{}", val_id.0);
                     state.return_value = state.env.get(&sym).cloned();
+                } else {
+                    state.return_value = Some(VmValue::Unit);
                 }
             }
             VmTerminator::Br { target, args } => {
@@ -198,16 +526,19 @@ impl<'a> VmInterpreter<'a> {
                 false_args,
             } => {
                 let cond_sym = format!("v{}", cond.0);
-                let cond_val = state.env.get(&cond_sym);
+                let cond_val = state.env.get(&cond_sym).cloned().unwrap_or(VmValue::Bool(false));
                 match cond_val {
-                    Some(VmValue::Bool(true)) => {
+                    VmValue::Bool(true) => {
                         self.transfer_control(*true_target, true_args, state);
                     }
-                    Some(VmValue::Bool(false)) => {
+                    VmValue::Bool(false) => {
                         self.transfer_control(*false_target, false_args, state);
                     }
                     _ => {
-                        state.status = VmStatus::ProtocolViolation(format!("Non-boolean CondBr condition {:?}", cond_val));
+                        state.status = VmStatus::Error(format!(
+                            "CondBr on non-boolean value {:?}",
+                            cond_val
+                        ));
                     }
                 }
             }
@@ -219,57 +550,149 @@ impl<'a> VmInterpreter<'a> {
                 err_arg,
             } => {
                 let res_sym = format!("v{}", result_val.0);
-                let res_val = state.env.get(&res_sym).cloned();
+                let res_val = state.env.get(&res_sym).cloned().unwrap_or(VmValue::Unit);
 
-                match res_val {
-                    Some(VmValue::Ok(inner)) => {
-                        let arg_sym = format!("v{}", ok_arg.0);
-                        state.env.insert(arg_sym, *inner);
-                        self.transfer_control(*ok_target, &[*ok_arg], state);
+                let (target_block, target_arg, payload_val) = match res_val {
+                    VmValue::Ok(inner) => {
+                        // Mutation M02: swap ok and err targets
+                        if self.mutations.m02_swap_ok_err_targets {
+                            (*err_target, *err_arg, *inner)
+                        } else {
+                            (*ok_target, *ok_arg, *inner)
+                        }
                     }
-                    Some(VmValue::Err(inner)) => {
-                        let arg_sym = format!("v{}", err_arg.0);
-                        state.env.insert(arg_sym, *inner);
-                        self.transfer_control(*err_target, &[*err_arg], state);
+                    VmValue::Err(inner) => {
+                        // Mutation M01: drop err edge -> protocol violation / error
+                        if self.mutations.m01_drop_err_edge {
+                            state.status = VmStatus::ProtocolViolation(
+                                "M01: Error branch unreachable".to_string(),
+                            );
+                            return;
+                        }
+                        if self.mutations.m02_swap_ok_err_targets {
+                            (*ok_target, *ok_arg, *inner)
+                        } else {
+                            (*err_target, *err_arg, *inner)
+                        }
                     }
                     _ => {
-                        state.status = VmStatus::ProtocolViolation(format!("SwitchResult on non-Result value {:?}", res_val));
+                        state.status = VmStatus::Error(format!(
+                            "SwitchResult on non-result value {:?}",
+                            res_val
+                        ));
+                        return;
+                    }
+                };
+
+                let target_sym = format!("v{}", target_arg.0);
+                state.env.insert(target_sym, payload_val);
+                if let Some(tb) = self.func.blocks.get(&target_block) {
+                    for (p, ty) in &tb.params {
+                        state.types.insert(format!("v{}", p.0), ty.display_name());
+                    }
+                }
+                state.current_block = target_block;
+            }
+            VmTerminator::SwitchActOutcome {
+                outcome_val,
+                success_target,
+                success_arg,
+                failure_target,
+                failure_arg,
+                partial_target,
+                partial_arg,
+                unknown_target,
+                unknown_arg,
+            } => {
+                let out_sym = format!("v{}", outcome_val.0);
+                let out_val = state.env.get(&out_sym).cloned().unwrap_or(VmValue::Unit);
+
+                match out_val {
+                    VmValue::ActSuccess(inner) => {
+                        let sym = format!("v{}", success_arg.0);
+                        state.env.insert(sym, *inner);
+                        if let Some(tb) = self.func.blocks.get(success_target) {
+                            for (p, ty) in &tb.params {
+                                state.types.insert(format!("v{}", p.0), ty.display_name());
+                            }
+                        }
+                        state.current_block = *success_target;
+                    }
+                    VmValue::ActFailure(inner) => {
+                        let sym = format!("v{}", failure_arg.0);
+                        state.env.insert(sym, *inner);
+                        if let Some(tb) = self.func.blocks.get(failure_target) {
+                            for (p, ty) in &tb.params {
+                                state.types.insert(format!("v{}", p.0), ty.display_name());
+                            }
+                        }
+                        state.current_block = *failure_target;
+                    }
+                    VmValue::ActPartial(report) => {
+                        let sym = format!("v{}", partial_arg.0);
+                        state.env.insert(sym, VmValue::ActPartial(report));
+                        if let Some(tb) = self.func.blocks.get(partial_target) {
+                            for (p, ty) in &tb.params {
+                                state.types.insert(format!("v{}", p.0), ty.display_name());
+                            }
+                        }
+                        state.current_block = *partial_target;
+                    }
+                    VmValue::DeliveryUnknown(reason) => {
+                        let sym = format!("v{}", unknown_arg.0);
+                        state.env.insert(sym, VmValue::String(reason));
+                        if let Some(tb) = self.func.blocks.get(unknown_target) {
+                            for (p, ty) in &tb.params {
+                                state.types.insert(format!("v{}", p.0), ty.display_name());
+                            }
+                        }
+                        state.current_block = *unknown_target;
+                    }
+                    VmValue::SettlementUnknown(reason) => {
+                        let sym = format!("v{}", unknown_arg.0);
+                        state.env.insert(sym, VmValue::String(reason));
+                        if let Some(tb) = self.func.blocks.get(unknown_target) {
+                            for (p, ty) in &tb.params {
+                                state.types.insert(format!("v{}", p.0), ty.display_name());
+                            }
+                        }
+                        state.current_block = *unknown_target;
+                    }
+                    VmValue::String(ref s) if s == "PROTOCOL_VIOLATION_ATOMIC_PARTIAL" => {
+                        state.status = VmStatus::ProtocolViolation(
+                            "Atomic adapter returned partial outcome".to_string(),
+                        );
+                    }
+                    _ => {
+                        state.status = VmStatus::Error(format!(
+                            "SwitchActOutcome on non-outcome value {:?}",
+                            out_val
+                        ));
                     }
                 }
             }
             VmTerminator::Unreachable => {
-                state.status = VmStatus::ProtocolViolation("Executed Unreachable terminator".to_string());
+                state.status = VmStatus::Error("Reached Unreachable terminator".to_string());
             }
         }
     }
 
-    fn transfer_control(&self, target: VmBlockId, args: &[VmValueId], state: &mut VmExecutionState) {
-        let target_block = match self.func.blocks.get(&target) {
-            Some(b) => b,
-            None => {
-                state.status = VmStatus::ProtocolViolation(format!("Target block {:?} not found", target));
-                return;
-            }
-        };
-
-        // Bind block arguments to target parameters
-        for (i, (param_id, param_ty)) in target_block.params.iter().enumerate() {
-            let param_sym = format!("v{}", param_id.0);
-            state.types.insert(param_sym.clone(), param_ty.clone());
-            if i < args.len() {
-                let arg_sym = format!("v{}", args[i].0);
-                if let Some(val) = state.env.get(&arg_sym).cloned() {
-                    state.env.insert(param_sym.clone(), val);
-                }
-                if let Some(lat) = state.latent.get(&arg_sym).cloned() {
-                    state.latent.insert(param_sym.clone(), lat);
-                }
-                if let Some(lin) = state.lineage.get(&arg_sym).cloned() {
-                    state.lineage.insert(param_sym.clone(), lin);
+    fn transfer_control(
+        &self,
+        target: VmBlockId,
+        args: &[VmValueId],
+        state: &mut VmExecutionState,
+    ) {
+        if let Some(target_block) = self.func.blocks.get(&target) {
+            for (i, (param_id, _)) in target_block.params.iter().enumerate() {
+                if let Some(arg_id) = args.get(i) {
+                    let arg_sym = format!("v{}", arg_id.0);
+                    let val = state.env.get(&arg_sym).cloned().unwrap_or(VmValue::Unit);
+                    let param_sym = format!("v{}", param_id.0);
+                    state.env.insert(param_sym, val);
                 }
             }
         }
-
         state.current_block = target;
     }
 }

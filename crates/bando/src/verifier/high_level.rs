@@ -57,9 +57,7 @@ impl<'a> HighLevelVerifier<'a> {
             ));
         }
 
-        // 3. First pass: Collect all definitions across blocks and regions with exact types (S1)
-        // Note: Region-local definitions are registered globally for uniqueness and type tracking,
-        // but are NOT added to block_definitions[parent_block], preserving lexical region isolation.
+        // 3. First pass: Collect all definitions across blocks and regions with exact types (S1 & Slice 2)
         for (block_id, block) in &self.func.blocks {
             let mut block_defs = Vec::new();
             for (param_id, param_type) in &block.params {
@@ -74,33 +72,78 @@ impl<'a> HighLevelVerifier<'a> {
                 block_defs.push(dest);
             }
 
-            if let Terminator::MatchResult {
-                result_val,
-                ok_arg,
-                ok_body,
-                err_arg,
-                err_body,
-            } = &block.terminator
-            {
-                let (ok_ty, err_ty) = match self.all_defined_values.get(result_val) {
-                    Some(Type::Result { ok, err }) => (*ok.clone(), *err.clone()),
-                    _ => (Type::String, Type::String),
-                };
+            match &block.terminator {
+                Terminator::MatchResult {
+                    result_val,
+                    ok_arg,
+                    ok_body,
+                    err_arg,
+                    err_body,
+                } => {
+                    let (ok_ty, err_ty) = match self.all_defined_values.get(result_val) {
+                        Some(Type::Result { ok, err }) => (*ok.clone(), *err.clone()),
+                        _ => (Type::String, Type::String),
+                    };
 
-                // Register region arguments with their actual types (S1)
-                self.register_def(*ok_arg, ok_ty);
-                for inst in &ok_body.instructions {
-                    let dest = inst.dest();
-                    let ty = self.infer_instruction_type(inst);
-                    self.register_def(dest, ty);
-                }
+                    self.register_def(*ok_arg, ok_ty);
+                    for inst in &ok_body.instructions {
+                        let dest = inst.dest();
+                        let ty = self.infer_instruction_type(inst);
+                        self.register_def(dest, ty);
+                    }
 
-                self.register_def(*err_arg, err_ty);
-                for inst in &err_body.instructions {
-                    let dest = inst.dest();
-                    let ty = self.infer_instruction_type(inst);
-                    self.register_def(dest, ty);
+                    self.register_def(*err_arg, err_ty);
+                    for inst in &err_body.instructions {
+                        let dest = inst.dest();
+                        let ty = self.infer_instruction_type(inst);
+                        self.register_def(dest, ty);
+                    }
                 }
+                Terminator::MatchActOutcome {
+                    outcome_val,
+                    success_arg,
+                    success_body,
+                    failure_arg,
+                    failure_body,
+                    partial_arg,
+                    partial_body,
+                    unknown_arg,
+                    unknown_body,
+                } => {
+                    let (succ_ty, fail_ty) = match self.all_defined_values.get(outcome_val) {
+                        Some(Type::ActOutcome { success, failure }) => (*success.clone(), *failure.clone()),
+                        _ => (Type::String, Type::String),
+                    };
+
+                    self.register_def(*success_arg, succ_ty);
+                    for inst in &success_body.instructions {
+                        let dest = inst.dest();
+                        let ty = self.infer_instruction_type(inst);
+                        self.register_def(dest, ty);
+                    }
+
+                    self.register_def(*failure_arg, fail_ty);
+                    for inst in &failure_body.instructions {
+                        let dest = inst.dest();
+                        let ty = self.infer_instruction_type(inst);
+                        self.register_def(dest, ty);
+                    }
+
+                    self.register_def(*partial_arg, Type::PartialReport);
+                    for inst in &partial_body.instructions {
+                        let dest = inst.dest();
+                        let ty = self.infer_instruction_type(inst);
+                        self.register_def(dest, ty);
+                    }
+
+                    self.register_def(*unknown_arg, Type::String);
+                    for inst in &unknown_body.instructions {
+                        let dest = inst.dest();
+                        let ty = self.infer_instruction_type(inst);
+                        self.register_def(dest, ty);
+                    }
+                }
+                _ => {}
             }
 
             self.block_definitions.insert(*block_id, block_defs);
@@ -110,16 +153,14 @@ impl<'a> HighLevelVerifier<'a> {
         let block_ids: Vec<BlockId> = self.func.blocks.keys().copied().collect();
         let dom_tree = DominanceTree::compute(self.func.entry, &block_ids, |b| self.find_predecessors(b));
 
-        // 5. Verify instructions & terminators with SSA dominance / lexical visibility (S1 & R3)
+        // 5. Verify instructions & terminators with SSA dominance / lexical visibility (S1 & Slice 2)
         for (block_id, block) in &self.func.blocks {
             let mut visible_values = BTreeSet::new();
 
-            // Function params are visible
             for (p_id, _) in &self.func.params {
                 visible_values.insert(*p_id);
             }
 
-            // Definitions from strictly dominating blocks are visible
             if let Some(doms) = dom_tree.dominators.get(block_id) {
                 for &dom_block in doms {
                     if dom_block != *block_id {
@@ -132,18 +173,15 @@ impl<'a> HighLevelVerifier<'a> {
                 }
             }
 
-            // Block params are visible
             for (p_id, _) in &block.params {
                 visible_values.insert(*p_id);
             }
 
-            // Verify instructions in block
             for inst in &block.instructions {
                 self.verify_instruction(inst, &visible_values);
                 visible_values.insert(inst.dest());
             }
 
-            // Verify terminator
             self.verify_terminator(&block.terminator, *block_id, &mut visible_values);
         }
 
@@ -160,6 +198,13 @@ impl<'a> HighLevelVerifier<'a> {
             Instruction::Read { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
             Instruction::Infer { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
             Instruction::Assign { ty, .. } => ty.clone(),
+            Instruction::Verify { output_predicate, subject_type, .. } => {
+                let att_ty = Type::attestation(output_predicate.clone(), subject_type.clone());
+                Type::result(att_ty, Type::String)
+            }
+            Instruction::Act { success_type, failure_type, .. } => {
+                Type::act_outcome(success_type.clone(), failure_type.clone())
+            }
         }
     }
 
@@ -214,7 +259,7 @@ impl<'a> HighLevelVerifier<'a> {
             if !self.func.declared_effects.contains(&eff) {
                 self.diagnostics.push(Diagnostic::error(
                     DiagnosticCode::EffectUndeclared,
-                    format!("Instruction requires effect {:?} not declared in function effects", eff),
+                    format!("Instruction requires effect {:?} not declared in function effects {:?}", eff, self.func.declared_effects),
                 ));
             }
         }
@@ -229,6 +274,24 @@ impl<'a> HighLevelVerifier<'a> {
                             format!("Assign type mismatch: source is {:?}, dest is {:?}", src_ty, ty),
                         ));
                     }
+                }
+            }
+            Instruction::Verify { subject, subject_type, .. } => {
+                if let Some(sub_ty) = self.check_visible(*subject, visible) {
+                    if &sub_ty != subject_type {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::TypeMismatch,
+                            format!("Verify subject type mismatch: expected {:?}, got {:?}", subject_type, sub_ty),
+                        ));
+                    }
+                }
+            }
+            Instruction::Act { args, evidence, .. } => {
+                for arg in args {
+                    self.check_visible(*arg, visible);
+                }
+                for ev in evidence {
+                    self.check_visible(*ev, visible);
                 }
             }
         }
@@ -296,6 +359,34 @@ impl<'a> HighLevelVerifier<'a> {
                     }
                 }
             }
+            Terminator::MatchActOutcome {
+                outcome_val,
+                success_arg,
+                success_body,
+                failure_arg,
+                failure_body,
+                partial_arg,
+                partial_body,
+                unknown_arg,
+                unknown_body,
+            } => {
+                if let Some(res_ty) = self.check_visible(*outcome_val, visible) {
+                    match res_ty {
+                        Type::ActOutcome { success, failure } => {
+                            self.verify_region(success_body, *success_arg, &success, current_block, visible);
+                            self.verify_region(failure_body, *failure_arg, &failure, current_block, visible);
+                            self.verify_region(partial_body, *partial_arg, &Type::PartialReport, current_block, visible);
+                            self.verify_region(unknown_body, *unknown_arg, &Type::String, current_block, visible);
+                        }
+                        other => {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::TypeMismatch,
+                                format!("MatchActOutcome expects ActOutcome<T,E>, got {:?}", other),
+                            ));
+                        }
+                    }
+                }
+            }
             Terminator::Unreachable => {}
         }
     }
@@ -308,7 +399,6 @@ impl<'a> HighLevelVerifier<'a> {
         _parent_block: BlockId,
         parent_visible: &BTreeSet<ValueId>,
     ) {
-        // S1: Region-local scope starts with parent visible values + region argument
         let mut region_visible = parent_visible.clone();
         region_visible.insert(arg_id);
 

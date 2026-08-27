@@ -4,10 +4,13 @@ use serde::{Deserialize, Serialize};
 use crate::{
     diagnostics::Diagnostic,
     ir::{
+        effects::EffectRow,
         facts::{Fact, LatentPostconditions},
         values::Value,
         Module,
     },
+    registry::RegistrySnapshot,
+    world::WorldState,
 };
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -20,6 +23,20 @@ pub struct ConformanceProgramV0 {
     pub read_errors: BTreeMap<String, String>,
     #[serde(default)]
     pub infer_errors: BTreeMap<String, String>,
+    #[serde(default)]
+    pub verifier_failures: BTreeMap<String, String>,
+    #[serde(default)]
+    pub verifier_out_of_envelope: BTreeMap<String, EffectRow>,
+    #[serde(default)]
+    pub act_scenarios: BTreeMap<String, String>,
+    #[serde(default)]
+    pub act_custom_writes: BTreeMap<String, Vec<(String, Value)>>,
+    #[serde(default)]
+    pub initial_world: Option<WorldState>,
+    #[serde(default)]
+    pub initial_facts: Option<Vec<Fact>>,
+    #[serde(default)]
+    pub registry: Option<RegistrySnapshot>,
     #[serde(default)]
     pub mutations: crate::lowering::CompilerMutations,
 }
@@ -35,4 +52,8 @@ pub struct ConformanceObservationV0 {
     pub bindings: BTreeMap<String, Value>,
     pub lineage: BTreeMap<String, Vec<String>>,
     pub diagnostics: Vec<Diagnostic>,
+    #[serde(default)]
+    pub mutation_trace: Vec<(String, Value, u64)>,
+    #[serde(default)]
+    pub final_world: Option<BTreeMap<String, (Value, u64)>>,
 }

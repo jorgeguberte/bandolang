@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ir::{
+        effects::Effect,
         ops::{Instruction, RegionTerminator, Terminator},
         types::Type,
         Function, Module,
@@ -14,26 +15,35 @@ use crate::{
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct CompilerMutations {
-    #[serde(default)]
-    pub m01_drop_err_edge: bool,
-    #[serde(default)]
-    pub m02_swap_ok_err_targets: bool,
-    #[serde(default)]
-    pub m03_corrupt_block_arg_type: bool,
-    #[serde(default)]
-    pub m04_drop_latent_metadata: bool,
-    #[serde(default)]
-    pub m05_eager_on_ok_materialization: bool,
-    #[serde(default)]
-    pub m06_merge_union_facts: bool,
-    #[serde(default)]
-    pub m07_drop_read_effect: bool,
-    #[serde(default)]
-    pub m08_drop_infer_effect: bool,
-    #[serde(default)]
-    pub m09_stale_source_value_id: bool,
-    #[serde(default)]
-    pub m10_single_pass_loop_analysis: bool,
+    // Slice 1 mutations
+    #[serde(default)] pub m01_drop_err_edge: bool,
+    #[serde(default)] pub m02_swap_ok_err_targets: bool,
+    #[serde(default)] pub m03_corrupt_block_arg_type: bool,
+    #[serde(default)] pub m04_drop_latent_metadata: bool,
+    #[serde(default)] pub m05_eager_on_ok_materialization: bool,
+    #[serde(default)] pub m06_merge_union_facts: bool,
+    #[serde(default)] pub m07_drop_read_effect: bool,
+    #[serde(default)] pub m08_drop_infer_effect: bool,
+    #[serde(default)] pub m09_stale_source_value_id: bool,
+    #[serde(default)] pub m10_single_pass_loop_analysis: bool,
+
+    // Slice 2 mutations (S2M01–S2M16)
+    #[serde(default)] pub s2m01_verifier_out_of_envelope: bool,
+    #[serde(default)] pub s2m02_drop_verifier_effect: bool,
+    #[serde(default)] pub s2m03_trust_arbitrary_issuer: bool,
+    #[serde(default)] pub s2m04_deferred_treated_as_proved: bool,
+    #[serde(default)] pub s2m05_gate_rejection_still_invokes_target: bool,
+    #[serde(default)] pub s2m06_gate_effect_omitted_from_act: bool,
+    #[serde(default)] pub s2m07_trusted_gate_requires_caller_authority: bool,
+    #[serde(default)] pub s2m08_toctou_revalidation_omitted: bool,
+    #[serde(default)] pub s2m09_footprint_enforcement_disabled: bool,
+    #[serde(default)] pub s2m10_partial_collapsed_to_failure: bool,
+    #[serde(default)] pub s2m11_unknown_collapsed_to_failure: bool,
+    #[serde(default)] pub s2m12_success_fact_on_partial: bool,
+    #[serde(default)] pub s2m13_atomic_adapter_partial_accepted: bool,
+    #[serde(default)] pub s2m14_current_facts_not_invalidated: bool,
+    #[serde(default)] pub s2m15_historical_facts_invalidated: bool,
+    #[serde(default)] pub s2m16_untrusted_attestation_accepted: bool,
 }
 
 pub struct LoweringContext {
@@ -110,6 +120,13 @@ impl LoweringContext {
                     Instruction::Assign { dest, ty, .. } => {
                         self.value_types.insert(*dest, ty.clone());
                     }
+                    Instruction::Verify { dest, output_predicate, subject_type, .. } => {
+                        let att_ty = Type::attestation(output_predicate.clone(), subject_type.clone());
+                        self.value_types.insert(*dest, Type::result(att_ty, Type::String));
+                    }
+                    Instruction::Act { dest, success_type, failure_type, .. } => {
+                        self.value_types.insert(*dest, Type::act_outcome(success_type.clone(), failure_type.clone()));
+                    }
                 }
             }
         }
@@ -117,13 +134,13 @@ impl LoweringContext {
         let entry_id = self.map_block(func.entry);
         let mut vm_func = VmFunction::new(func.name.clone(), entry_id, func.return_type.clone());
 
-        // R2: Preserve effect row in VM IR (unless mutated by M07 / M08)
+        // R2: Preserve effect row in VM IR (unless mutated)
         let mut effects = func.declared_effects.clone();
         if self.mutations.m07_drop_read_effect {
-            effects.effects.retain(|e| !matches!(e, crate::ir::effects::Effect::Read(_)));
+            effects.effects.retain(|e| !matches!(e, Effect::Read(_)));
         }
         if self.mutations.m08_drop_infer_effect {
-            effects.effects.retain(|e| !matches!(e, crate::ir::effects::Effect::Infer));
+            effects.effects.retain(|e| !matches!(e, Effect::Infer));
         }
         vm_func.declared_effects = effects;
 
@@ -162,7 +179,6 @@ impl LoweringContext {
                     err_arg,
                     err_body,
                 } => {
-                    // R1: Lower structured MatchResult into flat CFG blocks and SwitchResult
                     let ok_block_id = self.alloc_block();
                     let err_block_id = self.alloc_block();
 
@@ -179,7 +195,7 @@ impl LoweringContext {
                     let (ok_target, err_target) = if self.mutations.m02_swap_ok_err_targets {
                         (err_block_id, ok_block_id)
                     } else if self.mutations.m01_drop_err_edge {
-                        (ok_block_id, VmBlockId(99999)) // Invalid/dropped Err target
+                        (ok_block_id, VmBlockId(99999))
                     } else {
                         (ok_block_id, err_block_id)
                     };
@@ -211,6 +227,87 @@ impl LoweringContext {
                     }
                     err_vm_block.terminator = self.lower_region_terminator(&err_body.terminator);
                     generated_blocks.insert(err_block_id, err_vm_block);
+                }
+                Terminator::MatchActOutcome {
+                    outcome_val,
+                    success_arg,
+                    success_body,
+                    failure_arg,
+                    failure_body,
+                    partial_arg,
+                    partial_body,
+                    unknown_arg,
+                    unknown_body,
+                } => {
+                    // Lower structured MatchActOutcome to 4 flat blocks and VmTerminator::SwitchActOutcome
+                    let succ_block_id = self.alloc_block();
+                    let fail_block_id = self.alloc_block();
+                    let part_block_id = self.alloc_block();
+                    let unk_block_id = self.alloc_block();
+
+                    let outcome_ty = self.value_types.get(outcome_val).cloned();
+                    let (succ_ty, fail_ty) = match outcome_ty {
+                        Some(Type::ActOutcome { success, failure }) => (*success, *failure),
+                        _ => (Type::String, Type::String),
+                    };
+
+                    let vm_outcome_val = self.map_value(*outcome_val);
+                    let vm_succ_arg = self.map_value(*success_arg);
+                    let vm_fail_arg = self.map_value(*failure_arg);
+                    let vm_part_arg = self.map_value(*partial_arg);
+                    let vm_unk_arg = self.map_value(*unknown_arg);
+
+                    vm_block.terminator = VmTerminator::SwitchActOutcome {
+                        outcome_val: vm_outcome_val,
+                        success_target: succ_block_id,
+                        success_arg: vm_succ_arg,
+                        failure_target: fail_block_id,
+                        failure_arg: vm_fail_arg,
+                        partial_target: part_block_id,
+                        partial_arg: vm_part_arg,
+                        unknown_target: unk_block_id,
+                        unknown_arg: vm_unk_arg,
+                    };
+
+                    // Populate success block
+                    let mut succ_vm = VmBlock::new(succ_block_id, VmTerminator::Unreachable);
+                    succ_vm.name = Some("act_success".to_string());
+                    succ_vm.params.push((vm_succ_arg, succ_ty));
+                    for inst in &success_body.instructions {
+                        succ_vm.instructions.push(self.lower_instruction(inst));
+                    }
+                    succ_vm.terminator = self.lower_region_terminator(&success_body.terminator);
+                    generated_blocks.insert(succ_block_id, succ_vm);
+
+                    // Populate failure block
+                    let mut fail_vm = VmBlock::new(fail_block_id, VmTerminator::Unreachable);
+                    fail_vm.name = Some("act_failure".to_string());
+                    fail_vm.params.push((vm_fail_arg, fail_ty));
+                    for inst in &failure_body.instructions {
+                        fail_vm.instructions.push(self.lower_instruction(inst));
+                    }
+                    fail_vm.terminator = self.lower_region_terminator(&failure_body.terminator);
+                    generated_blocks.insert(fail_block_id, fail_vm);
+
+                    // Populate partial block
+                    let mut part_vm = VmBlock::new(part_block_id, VmTerminator::Unreachable);
+                    part_vm.name = Some("act_partial".to_string());
+                    part_vm.params.push((vm_part_arg, Type::PartialReport));
+                    for inst in &partial_body.instructions {
+                        part_vm.instructions.push(self.lower_instruction(inst));
+                    }
+                    part_vm.terminator = self.lower_region_terminator(&partial_body.terminator);
+                    generated_blocks.insert(part_block_id, part_vm);
+
+                    // Populate unknown block
+                    let mut unk_vm = VmBlock::new(unk_block_id, VmTerminator::Unreachable);
+                    unk_vm.name = Some("act_unknown".to_string());
+                    unk_vm.params.push((vm_unk_arg, Type::String));
+                    for inst in &unknown_body.instructions {
+                        unk_vm.instructions.push(self.lower_instruction(inst));
+                    }
+                    unk_vm.terminator = self.lower_region_terminator(&unknown_body.terminator);
+                    generated_blocks.insert(unk_block_id, unk_vm);
                 }
                 other => {
                     vm_block.terminator = self.lower_terminator(other);
@@ -273,7 +370,7 @@ impl LoweringContext {
             }
             Instruction::Assign { dest, source, ty } => {
                 let src = if self.mutations.m09_stale_source_value_id {
-                    VmValueId(8888) // Stale unbound ValueId
+                    VmValueId(8888)
                 } else {
                     self.map_value(*source)
                 };
@@ -281,6 +378,55 @@ impl LoweringContext {
                     dest: self.map_value(*dest),
                     source: src,
                     ty: ty.clone(),
+                }
+            }
+            Instruction::Verify {
+                dest,
+                verifier_id,
+                subject,
+                output_predicate,
+                subject_type,
+                verifier_effects,
+            } => {
+                let mut effs = verifier_effects.clone();
+                if self.mutations.s2m02_drop_verifier_effect && !effs.is_empty() {
+                    effs.pop();
+                }
+                VmInstruction::VmVerify {
+                    dest: self.map_value(*dest),
+                    verifier_id: verifier_id.clone(),
+                    subject: self.map_value(*subject),
+                    output_predicate: output_predicate.clone(),
+                    subject_type: subject_type.clone(),
+                    verifier_effects: effs,
+                }
+            }
+            Instruction::Act {
+                dest,
+                op_id,
+                target_domain,
+                success_type,
+                failure_type,
+                args,
+                evidence,
+                gate_effects,
+                latent,
+            } => {
+                let gate_effs = if self.mutations.s2m06_gate_effect_omitted_from_act {
+                    Vec::new()
+                } else {
+                    gate_effects.clone()
+                };
+                VmInstruction::VmAct {
+                    dest: self.map_value(*dest),
+                    op_id: op_id.clone(),
+                    target_domain: target_domain.clone(),
+                    success_type: success_type.clone(),
+                    failure_type: failure_type.clone(),
+                    args: args.iter().map(|a| self.map_value(*a)).collect(),
+                    evidence: evidence.iter().map(|e| self.map_value(*e)).collect(),
+                    gate_effects: gate_effs,
+                    latent: latent.clone(),
                 }
             }
         }
@@ -307,6 +453,7 @@ impl LoweringContext {
                 false_args: false_args.iter().map(|a| self.map_value(*a)).collect(),
             },
             Terminator::MatchResult { .. } => unreachable!("MatchResult handled in block lowering"),
+            Terminator::MatchActOutcome { .. } => unreachable!("MatchActOutcome handled in block lowering"),
             Terminator::Unreachable => VmTerminator::Unreachable,
         }
     }

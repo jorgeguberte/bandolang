@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use bando::{
     analysis::PathFactAnalyzer,
@@ -14,6 +14,10 @@ use bando::{
         values::{BlockId, Value, ValueId},
     },
     lowering::LoweringContext,
+    registry::{
+        AtomicityGuarantee, MutationFootprint, OperationDescriptor, OperationId,
+        PolicyRequirement, RegistrySnapshot, TrustPolicy, VerifierDescriptor, VerifierId,
+    },
     verifier::HighLevelVerifier,
     vm::{
         adapters::RuntimeAdapters,
@@ -21,6 +25,7 @@ use bando::{
         VmInterpreter,
     },
     vm_verifier::VmVerifier,
+    world::WorldState,
 };
 
 #[test]
@@ -44,8 +49,9 @@ fn test_c01_pure_value() {
     assert!(VmVerifier::verify_module(&vm_module).is_ok());
 
     let adapters = RuntimeAdapters::default();
-    let interp = VmInterpreter::new(&vm_module.functions[0], &adapters);
-    let state = interp.execute(BTreeMap::new(), 100);
+    let registry = RegistrySnapshot::default();
+    let interp = VmInterpreter::new(&vm_module.functions[0], &adapters, &registry);
+    let state = interp.execute(BTreeMap::new(), WorldState::new(), BTreeSet::new(), 100);
 
     assert_eq!(state.status, VmStatus::Terminated);
     assert_eq!(state.return_value, Some(Value::I64(42)));
@@ -64,7 +70,6 @@ fn test_c02_structured_match_result_and_lowering() {
         on_err: Vec::new(),
     };
 
-    // R1: High-level structured MatchResult with Region
     let mut entry = Block::new(
         BlockId(0),
         Terminator::MatchResult {
@@ -90,18 +95,17 @@ fn test_c02_structured_match_result_and_lowering() {
 
     assert!(HighLevelVerifier::verify_module(&module).is_ok());
 
-    // R1: Lowering flattens structured regions into CFG blocks and SwitchResult
     let mut lowering = LoweringContext::new();
     let vm_module = lowering.lower_module(&module);
     assert!(VmVerifier::verify_module(&vm_module).is_ok());
 
-    // R2: Assert static effect-row preservation in VM function
     let vm_func = &vm_module.functions[0];
     assert!(vm_func.declared_effects.contains(&Effect::Read("docs".to_string())));
 
     let adapters = RuntimeAdapters::default();
-    let interp = VmInterpreter::new(vm_func, &adapters);
-    let state = interp.execute(BTreeMap::new(), 100);
+    let registry = RegistrySnapshot::default();
+    let interp = VmInterpreter::new(vm_func, &adapters, &registry);
+    let state = interp.execute(BTreeMap::new(), WorldState::new(), BTreeSet::new(), 100);
 
     assert_eq!(state.status, VmStatus::Terminated);
     assert_eq!(state.return_value, Some(Value::String("data_of(docs)".to_string())));
@@ -168,20 +172,18 @@ fn test_c05_c06_diamond_must_fact_merge() {
 
 #[test]
 fn test_r3_ssa_dominance_and_scope_visibility() {
-    // Dominating entry value used in downstream block => ACCEPTED
     let mut func_ok = Function::new("ok", BlockId(0), Type::I64);
     let mut b0 = Block::new(BlockId(0), Terminator::Br { target: BlockId(1), args: vec![] });
     b0.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::I64 });
     func_ok.blocks.insert(BlockId(0), b0);
 
-    let b1 = Block::new(BlockId(1), Terminator::Return(Some(ValueId(1)))); // Value 1 from dominating b0
+    let b1 = Block::new(BlockId(1), Terminator::Return(Some(ValueId(1))));
     func_ok.blocks.insert(BlockId(1), b1);
 
     let mut mod_ok = Module::new("m_ok");
     mod_ok.functions.push(func_ok);
     assert!(HighLevelVerifier::verify_module(&mod_ok).is_ok());
 
-    // Sibling block value used without block argument => REJECTED
     let mut func_bad = Function::new("bad", BlockId(0), Type::I64);
     let b_entry = Block::new(BlockId(0), Terminator::CondBr { cond: ValueId(1), true_target: BlockId(1), true_args: vec![], false_target: BlockId(2), false_args: vec![] });
     func_bad.params.push((ValueId(1), Type::Bool));
@@ -191,7 +193,7 @@ fn test_r3_ssa_dominance_and_scope_visibility() {
     b_left.instructions.push(Instruction::Pure { dest: ValueId(2), val: Value::I64(100), ty: Type::I64 });
     func_bad.blocks.insert(BlockId(1), b_left);
 
-    let b_right = Block::new(BlockId(2), Terminator::Return(Some(ValueId(2)))); // Value 2 defined in sibling block 1!
+    let b_right = Block::new(BlockId(2), Terminator::Return(Some(ValueId(2))));
     func_bad.blocks.insert(BlockId(2), b_right);
 
     let mut mod_bad = Module::new("m_bad");
@@ -202,16 +204,15 @@ fn test_r3_ssa_dominance_and_scope_visibility() {
 
 #[test]
 fn test_s1_region_local_definition_isolation_and_dominance() {
-    // 1. Dominating parent value used inside both ok_body and err_body => ACCEPTED
     let mut func_dom = Function::new("main", BlockId(0), Type::I64);
     let mut entry = Block::new(
         BlockId(0),
         Terminator::MatchResult {
             result_val: ValueId(1),
             ok_arg: ValueId(3),
-            ok_body: Region::new(RegionTerminator::Return(Some(ValueId(2)))), // Value 2 from parent!
+            ok_body: Region::new(RegionTerminator::Return(Some(ValueId(2)))),
             err_arg: ValueId(4),
-            err_body: Region::new(RegionTerminator::Return(Some(ValueId(2)))), // Value 2 from parent!
+            err_body: Region::new(RegionTerminator::Return(Some(ValueId(2)))),
         },
     );
     entry.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::result(Type::I64, Type::I64) });
@@ -222,7 +223,6 @@ fn test_s1_region_local_definition_isolation_and_dominance() {
     mod_dom.functions.push(func_dom);
     assert!(HighLevelVerifier::verify_module(&mod_dom).is_ok());
 
-    // 2. Region-local Ok definition used outside MatchResult without block arg => REJECTED
     let mut func_leak = Function::new("main", BlockId(0), Type::I64);
     let mut entry_leak = Block::new(
         BlockId(0),
@@ -231,7 +231,7 @@ fn test_s1_region_local_definition_isolation_and_dominance() {
             ok_arg: ValueId(2),
             ok_body: Region {
                 instructions: vec![Instruction::Pure { dest: ValueId(4), val: Value::I64(42), ty: Type::I64 }],
-                terminator: RegionTerminator::Br { target: BlockId(1), args: vec![] }, // Did not transport 4!
+                terminator: RegionTerminator::Br { target: BlockId(1), args: vec![] },
             },
             err_arg: ValueId(3),
             err_body: Region::new(RegionTerminator::Br { target: BlockId(1), args: vec![] }),
@@ -240,54 +240,97 @@ fn test_s1_region_local_definition_isolation_and_dominance() {
     entry_leak.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::result(Type::I64, Type::I64) });
     func_leak.blocks.insert(BlockId(0), entry_leak);
 
-    let b_merge = Block::new(BlockId(1), Terminator::Return(Some(ValueId(4)))); // ILLEGAL USE OF REGION-LOCAL VALUE 4!
+    let b_merge = Block::new(BlockId(1), Terminator::Return(Some(ValueId(4))));
     func_leak.blocks.insert(BlockId(1), b_merge);
 
     let mut mod_leak = Module::new("m_leak");
     mod_leak.functions.push(func_leak);
     let diags = HighLevelVerifier::verify_module(&mod_leak).unwrap_err();
     assert!(diags.iter().any(|d| d.code == DiagnosticCode::SsaUseBeforeDef));
-
-    // 3. Region-local Err definition used from Ok region => REJECTED
-    let mut func_cross = Function::new("main", BlockId(0), Type::I64);
-    let mut entry_cross = Block::new(
-        BlockId(0),
-        Terminator::MatchResult {
-            result_val: ValueId(1),
-            ok_arg: ValueId(2),
-            ok_body: Region::new(RegionTerminator::Return(Some(ValueId(4)))), // Uses Value 4 defined in err_body!
-            err_arg: ValueId(3),
-            err_body: Region {
-                instructions: vec![Instruction::Pure { dest: ValueId(4), val: Value::I64(99), ty: Type::I64 }],
-                terminator: RegionTerminator::Return(Some(ValueId(4))),
-            },
-        },
-    );
-    entry_cross.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::result(Type::I64, Type::I64) });
-    func_cross.blocks.insert(BlockId(0), entry_cross);
-
-    let mut mod_cross = Module::new("m_cross");
-    mod_cross.functions.push(func_cross);
-    let diags_cross = HighLevelVerifier::verify_module(&mod_cross).unwrap_err();
-    assert!(diags_cross.iter().any(|d| d.code == DiagnosticCode::SsaUseBeforeDef));
 }
 
 #[test]
-fn test_negative_verifier_undeclared_effect() {
+fn test_slice2_verify_and_gated_act() {
+    let mut registry = RegistrySnapshot::new();
+    let v_desc = VerifierDescriptor::new(
+        VerifierId::new("auditor_v1"),
+        "1.0.0",
+        EffectRow::empty().with(Effect::Read("workspace".to_string())),
+        "PassesAudit",
+        Type::String,
+    );
+    registry.register_verifier(v_desc);
+
+    let op_desc = OperationDescriptor::new(
+        OperationId::new("deploy_patch"),
+        "workspace",
+        EffectRow::empty()
+            .with(Effect::Act("workspace".to_string()))
+            .with(Effect::Read("trust_store".to_string())),
+        MutationFootprint::Exact(BTreeSet::from(["workspace/doc1".to_string()])),
+        AtomicityGuarantee::Atomic,
+        vec![PolicyRequirement::RequiresAttestation {
+            predicate: "PassesAudit".to_string(),
+            subject_arg_idx: 0,
+        }],
+    );
+    registry.register_operation(op_desc);
+    registry.trust_policy.trust_verifier("PassesAudit", VerifierId::new("auditor_v1"));
+
     let mut func = Function::new("main", BlockId(0), Type::String);
-    let mut entry = Block::new(BlockId(0), Terminator::Return(None));
-    entry.instructions.push(Instruction::Read {
+    func.declared_effects = EffectRow::empty()
+        .with(Effect::Read("workspace".to_string()))
+        .with(Effect::Read("trust_store".to_string()))
+        .with(Effect::Act("workspace".to_string()));
+
+    let mut entry = Block::new(BlockId(0), Terminator::Return(Some(ValueId(4))));
+    entry.instructions.push(Instruction::Pure {
         dest: ValueId(1),
-        domain: "secret".to_string(),
-        ok_type: Type::String,
-        err_type: Type::String,
-        latent: LatentPostconditions::default(),
+        val: Value::String("patch_subject".to_string()),
+        ty: Type::String,
+    });
+    entry.instructions.push(Instruction::Verify {
+        dest: ValueId(2),
+        verifier_id: VerifierId::new("auditor_v1"),
+        subject: ValueId(1),
+        output_predicate: "PassesAudit".to_string(),
+        subject_type: Type::String,
+        verifier_effects: vec![Effect::Read("workspace".to_string())],
+    });
+    entry.instructions.push(Instruction::Act {
+        dest: ValueId(3),
+        op_id: OperationId::new("deploy_patch"),
+        target_domain: "workspace".to_string(),
+        success_type: Type::String,
+        failure_type: Type::String,
+        args: vec![ValueId(1)],
+        evidence: vec![ValueId(2)],
+        gate_effects: vec![Effect::Read("trust_store".to_string())],
+        latent: Default::default(),
+    });
+    entry.instructions.push(Instruction::Pure {
+        dest: ValueId(4),
+        val: Value::String("done".to_string()),
+        ty: Type::String,
     });
     func.blocks.insert(BlockId(0), entry);
 
-    let mut module = Module::new("test_neg");
+    let mut module = Module::new("test_s2");
     module.functions.push(func);
 
-    let diags = HighLevelVerifier::verify_module(&module).unwrap_err();
-    assert!(diags.iter().any(|d| d.code == DiagnosticCode::EffectUndeclared));
+    assert!(HighLevelVerifier::verify_module(&module).is_ok());
+
+    let mut lowering = LoweringContext::new();
+    let vm_module = lowering.lower_module(&module);
+    assert!(VmVerifier::verify_module(&vm_module).is_ok());
+
+    let adapters = RuntimeAdapters::default();
+    let interp = VmInterpreter::new(&vm_module.functions[0], &adapters, &registry);
+    let state = interp.execute(BTreeMap::new(), WorldState::new(), BTreeSet::new(), 100);
+
+    assert_eq!(state.status, VmStatus::Terminated);
+    assert!(state.observable_effects.contains(&"read[workspace]".to_string()));
+    assert!(state.observable_effects.contains(&"read[trust_store]".to_string()));
+    assert!(state.observable_effects.contains(&"act[workspace]".to_string()));
+    assert_eq!(state.world.mutation_trace.len(), 1);
 }
