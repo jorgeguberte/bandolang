@@ -9,47 +9,43 @@
 
 | Dimension | Specification | Actual Result | Status |
 | :--- | :--- | :--- | :--- |
-| **Mandate** | Compiler Conformance v0 — Slice 2 (Bounded Repair Gate) | Implemented in Rust `crates/bando` | **VERIFIED IN TESTED REGIME** |
-| **P1: Trusted Descriptors** | `VerifierDescriptor`, `OperationDescriptor` as sole source of truth (fail-closed, no synthetic fallbacks) | Enforced in `crates/bando/src/verifier/` and `crates/bando/src/vm/` | **PASS** |
-| **P2: Real Authority Model** | `CallerAuthority`, `TrustedRuntimeAuthority`, `AuthoritySource` with strict separation from effect rows | Implemented in `crates/bando/src/registry/` and `crates/bando/src/gate/` | **PASS** |
-| **P3: Requirement Resolution** | 4 distinct reachable states (`Proved`, `Deferred`, `Refuted`, `Uncovered`) + declared envelope checks | Enforced in `HighLevelVerifier` and `GateEngine` | **PASS** |
-| **P4: Complete Outcome / World / TOCTOU** | Deterministic TOCTOU inter-check-and-commit race falsification; complete golden matrix | Verified in `test_golden_s2.py` and `test_mutations_s2.py` | **PASS** |
-| **P5: Slice 2 Differential** | Exact comparator covering 11 observables including `mutation_trace` and `final_world` + 5 negative probes | Verified in `test_differential_s2.py` | **PASS** |
+| **Mandate** | Compiler Conformance v0 — Slice 2 (Final Bounded Repair Q1–Q4) | Implemented in Rust `crates/bando` | **VERIFIED IN TESTED REGIME** |
+| **Q1: Registry-bound Lowering & VM** | Descriptors as sole authority for Lowering & VM verification; program-supplied metadata has 0 authority | Enforced in `crates/bando/src/lowering/` and `crates/bando/src/vm_verifier/` | **PASS** |
+| **Q2: Fail-Closed Authority Separation** | `CallerAuthority` and `TrustedRuntimeAuthority` decoupled from complete semantic may-effect rows | Enforced in `HighLevelVerifier`, `VmVerifier`, and `VmInterpreter` | **PASS** |
+| **Q3: Real Static Subject/Policy Resolution** | Strict SSA identity / artifact resolution (not mere type matching); diagnostic-specific assertions | Enforced in `HighLevelVerifier` and `GateEngine` | **PASS** |
+| **Q4: Complete P5 Observable Trace** | Observation and differential comparator covering `gate_resolutions` and `gate_trace` + negative probes | Verified in `test_differential_s2.py` | **PASS** |
 | **Golden Conformance** | S2C01–S2C21 (Complete 21-case matrix) | 21/21 PASS | **PASS** |
 | **Negative Verifier** | S2V01–S2V07 (Structured DiagnosticCodes) | 7/7 PASS | **PASS** |
 | **Mutation Kills** | S2M01–S2M16 (Complete 16 real compiler mutation kills) | 16/16 PASS | **PASS** |
-| **Exact Differential** | 11 shared observables + 5 negative probes | 7/7 PASS | **PASS** |
+| **Exact Differential** | 13 shared observables + 7 negative probes | 9/9 PASS | **PASS** |
 | **Slice 1 Regressions** | Slice 1 Rust + Python tests | 49/49 PASS | **PASS** |
 | **Item 3 Regressions** | Item 3 Golden, Kills, Differential | 53/53 PASS | **PASS** |
 | **Phase D Regressions** | Phase D Campaigns 1 & 2 | 81/81 PASS | **PASS** |
-| **Total Test Suite** | All suites combined | **234/234 PASS** | **100% GREEN** |
+| **Total Test Suite** | All suites combined | **236/236 PASS** | **100% GREEN** |
 
 ---
 
-## 2. Core Architectural & Semantic Guarantees (P1–P5)
+## 2. Core Architectural & Semantic Guarantees (Q1–Q4)
 
-1. **P1 — Trusted Descriptors as Source of Truth**:
-   - `Instruction::Verify` references `VerifierId`; its effective $\Sigma_V$, output predicate, subject type, and version binding come strictly from the authenticated `VerifierDescriptor`. Unknown verifiers fail closed (`DiagnosticCode::UnknownVerifier`).
-   - `Instruction::Act` references `OperationId`; its effective target domain, requirements, declared envelope, footprint, and atomicity come strictly from `OperationDescriptor`. Unknown operations fail closed (`DiagnosticCode::UnknownOperation`).
-2. **P2 — Explicit Authority Model**:
-   - `CallerAuthority` and `TrustedRuntimeAuthority` decouple authority attribution from semantic effect rows.
-   - `Verify`: caller authority must cover $\Sigma_V$ (S2C04).
-   - `Act`: caller authority must cover target `act[D]` (S2C11).
-   - Trusted gate check: executed with `TrustedRuntimeAuthority` without requiring caller authority (S2C12, S2M07 killed).
-   - Semantic $\Sigma_{act} = \{\text{act}[D]\} \cup \Sigma_{gate}$ includes all observable effects.
-3. **P3 — Decidable Requirement Resolution & Envelope**:
-   - Four distinct reachable states: `Proved` (statically discharged with matching static evidence, S2C06), `Deferred` (dynamic state/trust checks needed, S2C07/S2C08), `Refuted` (statically refuted, S2C09), `Uncovered` (missing evidence, S2C10).
-   - Envelope enforcement: $\Sigma_{act} \subseteq \text{OperationDescriptor.declared\_envelope}$ (S2C13).
-4. **P4 — Complete Outcome / World / TOCTOU Falsification**:
-   - Deterministic hook mutates state version between gate check and commit: baseline atomic revalidation rejects commit with 0 writes, while mutant `s2m08_toctou_revalidation_omitted` incorrectly commits.
-   - Disjoint algebra of outcomes: `Success`, `CleanFailure`, `PartialCompletion`, `DeliveryUnknown`, `SettlementUnknown`. Atomic operations returning partial yield `ProtocolViolation` (S2C16, S2M13 killed).
-   - Invalidation of `CurrentState` facts upon writes with preservation of `Historical` provenance facts (S2C20, S2C21, S2M14/S2M15 killed).
-5. **P5 — Exact Shared Observable Comparator**:
-   - Exact differential verification over all 11 shared observables (status, return_val, effects, active_facts, latent_facts, types, bindings, lineage, diagnostics, mutation_trace, final_world) + 5 negative probes.
+1. **Q1 — Registry-Bound Lowering and VM Verification**:
+   - High-level IR instructions `Instruction::Verify` and `Instruction::Act` reference exclusively `VerifierId` and `OperationId`.
+   - `LoweringContext` takes `RegistrySnapshot`: lowering generates `VmInstruction::VmVerify` and `VmInstruction::VmAct` deriving effective $\Sigma_V$, predicate, subject type, target domain, and gate effects directly from authenticated descriptors. Program-supplied metadata in high-level IR has zero authority over lowered VM IR.
+2. **Q2 — Fail-Closed Authority Model Fully Separated from Effect Rows**:
+   - `func.declared_effects` specifies the complete semantic may-effect row (including gate check effects, e.g. `read[workspace]`, `read[trust_store]`, `act[workspace]`).
+   - `CallerAuthority` specifies what the caller owns (e.g. `read[workspace]`, `act[workspace]`).
+   - `TrustedRuntimeAuthority` specifies what the runtime gate engine owns (e.g. `read[trust_store]`).
+   - S2C04, S2C11, and S2C12 verify that authority insufficiency is caught fail-closed at compile time with `DiagnosticCode::AuthorityInsufficient`, while permitted trusted gate checks succeed without requiring caller authority.
+3. **Q3 — Real Static Policy/Subject Resolution & Specific Diagnostics**:
+   - `RequiresStaticProof`: resolution inspects exact SSA ValueId identity and constant artifact binding rather than coarse type matching. Conflicting subjects are statically refuted (`DiagnosticCode::RefutedRequirement`, S2C09).
+   - Missing required evidence yields `DiagnosticCode::UncoveredRequirement` (S2C10).
+   - Envelope omissions yield `DiagnosticCode::EnvelopeExceeded` (S2C13).
+4. **Q4 — Complete Gate Resolution & Gate Trace Observables**:
+   - `ConformanceObservationV0` and the exact differential comparator track `gate_resolutions` (`Proved`, `Deferred`, `Refuted`, `Uncovered`) and `gate_trace` (`CheckTrustPolicy`, `CheckSubjectBinding`, `CheckStateBaseVersion` with `authority_source`, `effects`, and `result`).
+   - Negative probes verify detection of forged resolutions, forged authority sources, extra mutations, corrupted worlds, and stale current facts.
 
 ---
 
-## 3. Test Suite Summary (234/234 PASS)
+## 3. Test Suite Summary (236/236 PASS)
 
 ```text
 Rust Native Tests (crates/bando/tests/):
@@ -65,7 +61,7 @@ Slice 2 Mutation Campaign (tests/compiler_conformance_slice2/test_mutations_s2.p
     16/16 PASS (Complete S2M01–S2M16 real compiler mutations demonstrably killed)
 
 Slice 2 Exact Differential Suite (tests/compiler_conformance_slice2/test_differential_s2.py):
-    7/7 PASS (exact agreement across all 11 shared observables + 5 negative probes)
+    9/9 PASS (exact agreement across all 13 shared observables + 7 negative probes)
 
 Slice 1 Golden Conformance (tests/compiler_conformance/test_golden.py):
     11/11 PASS (C01–C12)
@@ -86,7 +82,7 @@ Phase D Lowering Battery (tests/lowering/converge/):
     81/81 PASS (27 adversarial + 21 invariant kills + 27 basic + 6 fault)
 
 TOTAL:
-    234/234 PASS (100% GREEN)
+    236/236 PASS (100% GREEN)
 ```
 
 ---

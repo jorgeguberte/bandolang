@@ -79,6 +79,10 @@ pub struct LatentPostconditions {
 }
 
 impl LatentPostconditions {
+    pub fn empty() -> Self {
+        Self::default()
+    }
+
     pub fn instantiate_ok(&self, bound_var: &str) -> Vec<Fact> {
         let mut binding = BTreeMap::new();
         binding.insert("$value".to_string(), bound_var.to_string());

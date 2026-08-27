@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     analysis::PathFactAnalyzer,
+    conformance::schema::{GateCheckObservation, GateResolutionObservation},
     gate::{DeferredCheck, GateEngine, RequirementResolution},
     ir::{
         effects::Effect,
@@ -39,6 +40,8 @@ pub struct VmExecutionState {
     pub return_value: Option<VmValue>,
     pub world: WorldState,
     pub invalidated_keys: BTreeSet<String>,
+    pub gate_resolutions: Vec<GateResolutionObservation>,
+    pub gate_trace: Vec<GateCheckObservation>,
 }
 
 pub struct VmInterpreter<'a> {
@@ -95,6 +98,8 @@ impl<'a> VmInterpreter<'a> {
             return_value: None,
             world: initial_world,
             invalidated_keys: BTreeSet::new(),
+            gate_resolutions: Vec::new(),
+            gate_trace: Vec::new(),
         };
 
         // Static path fact analysis
@@ -392,6 +397,17 @@ impl<'a> VmInterpreter<'a> {
                     GateEngine::resolve_requirements(&op_desc.requirements, &arg_values, &ev_values)
                 };
 
+                let res_name = match &resolution {
+                    RequirementResolution::Proved => "Proved",
+                    RequirementResolution::Deferred(_) => "Deferred",
+                    RequirementResolution::Refuted => "Refuted",
+                    RequirementResolution::Uncovered => "Uncovered",
+                };
+                state.gate_resolutions.push(GateResolutionObservation {
+                    op_id: op_id.0.clone(),
+                    resolution: res_name.to_string(),
+                });
+
                 // 2. Evaluate gate checks
                 let mut gate_passed = true;
                 let mut witness_version = None;
@@ -403,6 +419,17 @@ impl<'a> VmInterpreter<'a> {
                     }
                     RequirementResolution::Deferred(checks) => {
                         for check in checks {
+                            let check_name = match check {
+                                DeferredCheck::CheckSubjectBinding { .. } => "CheckSubjectBinding",
+                                DeferredCheck::CheckTrustPolicy { .. } => "CheckTrustPolicy",
+                                DeferredCheck::CheckStateBaseVersion { .. } => "CheckStateBaseVersion",
+                            };
+                            let auth_name = match check.authority_source() {
+                                crate::registry::AuthoritySource::Caller => "Caller",
+                                crate::registry::AuthoritySource::TrustedRuntime => "TrustedRuntime",
+                            };
+                            let check_effs: Vec<String> = check.required_effects().iter().map(|e| e.to_string()).collect();
+
                             for eff in check.required_effects() {
                                 match eff {
                                     crate::ir::effects::Effect::Read(d) => {
@@ -416,6 +443,13 @@ impl<'a> VmInterpreter<'a> {
                                     }
                                 }
                             }
+
+                            state.gate_trace.push(GateCheckObservation {
+                                check_kind: check_name.to_string(),
+                                authority_source: auth_name.to_string(),
+                                effects: check_effs,
+                                result: "Pass".to_string(),
+                            });
                         }
 
                         // Record gate check effects in observable trace (Rule #15)

@@ -12,6 +12,8 @@ Compares every frozen shared observable available in ConformanceObservationV0:
 9. Diagnostics (exact list equality)
 10. Mutation trace (exact list of writes)
 11. Final world state (exact storage key-value map)
+12. Gate resolutions (exact list of operation resolution outcomes)
+13. Gate check trace (exact list of dynamic gate checks executed with authority source)
 """
 from __future__ import annotations
 
@@ -100,6 +102,18 @@ def compare_exact_observables(name: str, expected_oracle: dict, rust_obs: dict) 
     if expected_world != rust_world:
         errors.append(f"Final world exact mismatch: expected {expected_world}, got {rust_world}")
 
+    # 12. Gate resolutions
+    expected_res = expected_oracle.get("gate_resolutions", [])
+    rust_res = rust_obs.get("gate_resolutions", [])
+    if expected_res != rust_res:
+        errors.append(f"Gate resolutions exact mismatch: expected {expected_res}, got {rust_res}")
+
+    # 13. Gate check trace
+    expected_gate_trace = expected_oracle.get("gate_trace", [])
+    rust_gate_trace = rust_obs.get("gate_trace", [])
+    if expected_gate_trace != rust_gate_trace:
+        errors.append(f"Gate trace exact mismatch: expected {expected_gate_trace}, got {rust_gate_trace}")
+
     return errors
 
 
@@ -163,10 +177,14 @@ def test_diff_verify_success():
             "diagnostics": [],
             "mutation_trace": [],
             "final_world": {},
+            "gate_resolutions": [],
+            "gate_trace": [],
         }
         prog = {
             "name": "Diff_Verify_Success", "entry_func": "main", "inputs": {},
             "registry": {
+                "caller_authority": {"effects": [{"Read": "workspace"}]},
+                "runtime_authority": {"effects": []},
                 "verifiers": {
                     "v_audit": {
                         "verifier_id": "v_audit", "version": "1.0.0",
@@ -185,7 +203,7 @@ def test_diff_verify_success():
                             "id": 0, "params": [],
                             "instructions": [
                                 {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub_A"}, "ty": {"kind": "String"}}},
-                                {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1, "output_predicate": "PassesAudit", "subject_type": {"kind": "String"}, "verifier_effects": [{"Read": "workspace"}]}}
+                                {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1}}
                             ],
                             "terminator": {
                                 "MatchResult": {
@@ -244,10 +262,23 @@ def test_diff_gated_act_success():
             "final_world": {
                 "workspace/doc1": [{"kind": "String", "payload": "updated_data"}, 1]
             },
+            "gate_resolutions": [
+                {"op_id": "op_write", "resolution": "Deferred"}
+            ],
+            "gate_trace": [
+                {
+                    "check_kind": "CheckTrustPolicy",
+                    "authority_source": "TrustedRuntime",
+                    "effects": ["read[trust_store]"],
+                    "result": "Pass"
+                }
+            ],
         }
         prog = {
             "name": "Diff_Gated_Act_Success", "entry_func": "main", "inputs": {},
             "registry": {
+                "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+                "runtime_authority": {"effects": [{"Read": "trust_store"}]},
                 "verifiers": {
                     "v_audit": {
                         "verifier_id": "v_audit", "version": "1.0.0",
@@ -269,18 +300,18 @@ def test_diff_gated_act_success():
             "module": {
                 "name": "m", "functions": [{
                     "name": "main", "params": [], "return_type": {"kind": "String"},
-                    "declared_effects": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+                    "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]},
                     "entry": 0,
                     "blocks": {
                         "0": {
                             "id": 0, "params": [],
                             "instructions": [
                                 {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub_A"}, "ty": {"kind": "String"}}},
-                                {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1, "output_predicate": "PassesAudit", "subject_type": {"kind": "String"}, "verifier_effects": [{"Read": "workspace"}]}},
+                                {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1}},
                                 {"Act": {
-                                    "dest": 3, "op_id": "op_write", "target_domain": "workspace",
+                                    "dest": 3, "op_id": "op_write",
                                     "success_type": {"kind": "String"}, "failure_type": {"kind": "String"},
-                                    "args": [1], "evidence": [2], "gate_effects": [],
+                                    "args": [1], "evidence": [2],
                                     "latent": {
                                         "on_success": [{"predicate": "SuccessFact", "args": [{"Symbol": "$value"}]}],
                                         "on_failure": [], "on_partial": []
@@ -315,13 +346,14 @@ def test_probe_extra_lineage_fails():
         expected = {
             "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
             "latent_facts": {}, "types": {}, "bindings": {}, "diagnostics": [],
-            "lineage": {"v1": ["verify(auditor)"]}, "mutation_trace": [], "final_world": {}
+            "lineage": {"v1": ["verify(auditor)"]}, "mutation_trace": [], "final_world": {},
+            "gate_resolutions": [], "gate_trace": []
         }
         rust_obs = {
             "status": "ok", "return_val": None, "effects": [], "active_facts": [],
             "latent_facts": {}, "types": {}, "bindings": {}, "diagnostics": [],
             "lineage": {"v1": ["verify(auditor)"], "phantom_unauthorized": ["act(evil)"]},
-            "mutation_trace": [], "final_world": {}
+            "mutation_trace": [], "final_world": {}, "gate_resolutions": [], "gate_trace": []
         }
         errs = compare_exact_observables("PROBE_extra_lineage", expected, rust_obs)
         assert len(errs) > 0, "comparator falsely accepted extra spurious lineage"
@@ -334,13 +366,13 @@ def test_probe_extra_target_mutation_fails():
         expected = {
             "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
             "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
-            "mutation_trace": [], "final_world": {}
+            "mutation_trace": [], "final_world": {}, "gate_resolutions": [], "gate_trace": []
         }
         rust_obs = {
             "status": "ok", "return_val": None, "effects": [], "active_facts": [],
             "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
             "mutation_trace": [["workspace/doc1", {"kind": "String", "payload": "unauthorized"}, 1]],
-            "final_world": {}
+            "final_world": {}, "gate_resolutions": [], "gate_trace": []
         }
         errs = compare_exact_observables("PROBE_extra_mutation", expected, rust_obs)
         assert len(errs) > 0, "comparator falsely accepted unauthorized target mutation"
@@ -353,12 +385,14 @@ def test_probe_wrong_final_world_fails():
         expected = {
             "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
             "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
-            "mutation_trace": [], "final_world": {"workspace/doc1": [{"kind": "String", "payload": "correct"}, 1]}
+            "mutation_trace": [], "final_world": {"workspace/doc1": [{"kind": "String", "payload": "correct"}, 1]},
+            "gate_resolutions": [], "gate_trace": []
         }
         rust_obs = {
             "status": "ok", "return_val": None, "effects": [], "active_facts": [],
             "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
-            "mutation_trace": [], "final_world": {"workspace/doc1": [{"kind": "String", "payload": "corrupted"}, 1]}
+            "mutation_trace": [], "final_world": {"workspace/doc1": [{"kind": "String", "payload": "corrupted"}, 1]},
+            "gate_resolutions": [], "gate_trace": []
         }
         errs = compare_exact_observables("PROBE_wrong_world", expected, rust_obs)
         assert len(errs) > 0, "comparator falsely accepted corrupted final world state"
@@ -371,12 +405,14 @@ def test_probe_omitted_gate_effect_fails():
         expected = {
             "status": "ok", "return_val": None, "effects": ["read[trust_store]", "act[workspace]"],
             "active_facts": set(), "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {},
-            "diagnostics": [], "mutation_trace": [], "final_world": {}
+            "diagnostics": [], "mutation_trace": [], "final_world": {},
+            "gate_resolutions": [], "gate_trace": []
         }
         rust_obs = {
             "status": "ok", "return_val": None, "effects": ["act[workspace]"],
             "active_facts": [], "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {},
-            "diagnostics": [], "mutation_trace": [], "final_world": {}
+            "diagnostics": [], "mutation_trace": [], "final_world": {},
+            "gate_resolutions": [], "gate_trace": []
         }
         errs = compare_exact_observables("PROBE_omitted_gate_effect", expected, rust_obs)
         assert len(errs) > 0, "comparator falsely accepted omitted gate effect"
@@ -390,7 +426,8 @@ def test_probe_stale_current_fact_fails():
             "status": "ok", "return_val": None, "effects": [],
             "active_facts": {("Historical", ("lit(provenance)",))},
             "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {},
-            "diagnostics": [], "mutation_trace": [], "final_world": {}
+            "diagnostics": [], "mutation_trace": [], "final_world": {},
+            "gate_resolutions": [], "gate_trace": []
         }
         rust_obs = {
             "status": "ok", "return_val": None, "effects": [],
@@ -399,12 +436,65 @@ def test_probe_stale_current_fact_fails():
                 {"predicate": "CurrentState", "args": [{"Literal": "workspace/doc1"}, {"Literal": "stale"}]}
             ],
             "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {},
-            "diagnostics": [], "mutation_trace": [], "final_world": {}
+            "diagnostics": [], "mutation_trace": [], "final_world": {},
+            "gate_resolutions": [], "gate_trace": []
         }
         errs = compare_exact_observables("PROBE_stale_current_fact", expected, rust_obs)
         assert len(errs) > 0, "comparator falsely accepted stale CurrentState fact after mutation"
         return []
     run_diff_check("PROBE_stale_current_fact_fails", _run)
+
+
+def test_probe_wrong_gate_resolution_fails():
+    def _run():
+        expected = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "mutation_trace": [], "final_world": {},
+            "gate_resolutions": [{"op_id": "op_write", "resolution": "Deferred"}],
+            "gate_trace": []
+        }
+        rust_obs = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": [],
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "mutation_trace": [], "final_world": {},
+            "gate_resolutions": [{"op_id": "op_write", "resolution": "Proved"}],  # WRONG!
+            "gate_trace": []
+        }
+        errs = compare_exact_observables("PROBE_wrong_gate_resolution", expected, rust_obs)
+        assert len(errs) > 0, "comparator falsely accepted wrong gate resolution outcome"
+        return []
+    run_diff_check("PROBE_wrong_gate_resolution_fails", _run)
+
+
+def test_probe_wrong_authority_source_fails():
+    def _run():
+        expected = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": set(),
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "mutation_trace": [], "final_world": {}, "gate_resolutions": [],
+            "gate_trace": [{
+                "check_kind": "CheckTrustPolicy",
+                "authority_source": "TrustedRuntime",
+                "effects": ["read[trust_store]"],
+                "result": "Pass"
+            }]
+        }
+        rust_obs = {
+            "status": "ok", "return_val": None, "effects": [], "active_facts": [],
+            "latent_facts": {}, "types": {}, "bindings": {}, "lineage": {}, "diagnostics": [],
+            "mutation_trace": [], "final_world": {}, "gate_resolutions": [],
+            "gate_trace": [{
+                "check_kind": "CheckTrustPolicy",
+                "authority_source": "Caller",  # WRONG AUTHORITY SOURCE!
+                "effects": ["read[trust_store]"],
+                "result": "Pass"
+            }]
+        }
+        errs = compare_exact_observables("PROBE_wrong_authority_source", expected, rust_obs)
+        assert len(errs) > 0, "comparator falsely accepted forged/wrong authority source in gate trace"
+        return []
+    run_diff_check("PROBE_wrong_authority_source_fails", _run)
 
 
 if __name__ == "__main__":
@@ -417,6 +507,8 @@ if __name__ == "__main__":
     test_probe_wrong_final_world_fails()
     test_probe_omitted_gate_effect_fails()
     test_probe_stale_current_fact_fails()
+    test_probe_wrong_gate_resolution_fails()
+    test_probe_wrong_authority_source_fails()
 
     print("=" * 70)
     print(f"SLICE 2 DIFFERENTIAL RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")

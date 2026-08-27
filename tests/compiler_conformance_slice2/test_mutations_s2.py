@@ -62,7 +62,7 @@ def base_verify_act_program():
             "name": "mod_m",
             "functions": [{
                 "name": "main", "params": [], "return_type": {"kind": "String"},
-                "declared_effects": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]},
                 "entry": 0,
                 "blocks": {
                     "0": {
@@ -172,6 +172,7 @@ def s2m08_toctou_revalidation_omitted():
     # Baseline: atomic revalidation sees 6 != 5 -> reject commit, zero write.
     # Mutant (s2m08_toctou_revalidation_omitted): omits witness version check -> commits blindly!
     prog = base_verify_act_program()
+    prog["module"]["functions"][0]["declared_effects"]["effects"].append({"Read": "state_base"})
     prog["registry"]["operations"]["op_write"]["declared_envelope"]["effects"].append({"Read": "state_base"})
     prog["registry"]["runtime_authority"]["effects"].append({"Read": "state_base"})
     prog["registry"]["operations"]["op_write"]["requirements"].append(

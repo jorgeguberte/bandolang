@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::fmt;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -6,6 +7,16 @@ pub enum Effect {
     Read(String),
     Infer,
     Act(String),
+}
+
+impl fmt::Display for Effect {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Effect::Read(d) => write!(f, "read[{}]", d),
+            Effect::Infer => write!(f, "infer"),
+            Effect::Act(d) => write!(f, "act[{}]", d),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]

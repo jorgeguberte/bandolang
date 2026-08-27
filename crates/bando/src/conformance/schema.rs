@@ -13,6 +13,20 @@ use crate::{
     world::WorldState,
 };
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateResolutionObservation {
+    pub op_id: String,
+    pub resolution: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GateCheckObservation {
+    pub check_kind: String,
+    pub authority_source: String,
+    pub effects: Vec<String>,
+    pub result: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConformanceProgramV0 {
     pub name: String,
@@ -58,4 +72,8 @@ pub struct ConformanceObservationV0 {
     pub mutation_trace: Vec<(String, Value, u64)>,
     #[serde(default)]
     pub final_world: Option<BTreeMap<String, (Value, u64)>>,
+    #[serde(default)]
+    pub gate_resolutions: Vec<GateResolutionObservation>,
+    #[serde(default)]
+    pub gate_trace: Vec<GateCheckObservation>,
 }

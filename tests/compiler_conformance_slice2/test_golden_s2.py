@@ -1,7 +1,7 @@
 """test_golden_s2.py — Golden Conformance Programs S2C01–S2C21 for Compiler Conformance v0 (Slice 2).
 
 Executes end-to-end against the real Rust toolchain (crates/bando).
-Covers the complete frozen golden matrix S2C01–S2C21.
+Covers the complete frozen golden matrix S2C01–S2C21 with exact DiagnosticCode verification.
 """
 from __future__ import annotations
 
@@ -15,15 +15,33 @@ from protocol import invoke_rust_conformance
 PASS, FAIL = 0, 0
 
 
-def run_golden(name: str, program: dict, expected_status: str = "ok") -> None:
+def run_golden(name: str, program: dict, expected_status: str = "ok", expected_diag: str = None) -> None:
     global PASS, FAIL
     print(f"\n--- GOLDEN PROGRAM (Slice 2): {name}")
     try:
         obs = invoke_rust_conformance(program)
-        if obs["status"] != expected_status and not (expected_status == "verifier_error" and "verifier_error" in obs["status"]):
-            print(f"  \u2717 FAIL {name}: expected status '{expected_status}', got '{obs['status']}' with diagnostics {obs.get('diagnostics')}")
-            FAIL += 1
-            return
+        if expected_status == "ok":
+            if obs["status"] != "ok":
+                print(f"  \u2717 FAIL {name}: expected status 'ok', got '{obs['status']}' with diagnostics {obs.get('diagnostics')}")
+                FAIL += 1
+                return
+        elif expected_status == "verifier_error":
+            if obs["status"] not in ("verifier_error", "vm_verifier_error"):
+                print(f"  \u2717 FAIL {name}: expected verifier error, got status '{obs['status']}'")
+                FAIL += 1
+                return
+            if expected_diag is not None:
+                diags = obs.get("diagnostics", [])
+                if not any(d.get("code") == expected_diag for d in diags):
+                    print(f"  \u2717 FAIL {name}: expected diagnostic code '{expected_diag}', got {diags}")
+                    FAIL += 1
+                    return
+        else:
+            if expected_status not in obs["status"]:
+                print(f"  \u2717 FAIL {name}: expected status containing '{expected_status}', got '{obs['status']}'")
+                FAIL += 1
+                return
+
         print(f"  \u2713 PASS {name} (status={obs['status']}, return={obs.get('return_val')}, effects={obs.get('effects')})")
         PASS += 1
     except Exception as e:
@@ -47,6 +65,8 @@ def s2c01_verify_success():
     prog = {
         "name": "S2C01_verify_success", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {
                 "auditor_v1": {
                     "verifier_id": "auditor_v1", "version": "1.0.0",
@@ -65,7 +85,7 @@ def s2c01_verify_success():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "artifact_x"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "auditor_v1", "subject": 1, "output_predicate": "PassesAudit", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}}
+                            {"Verify": {"dest": 2, "verifier_id": "auditor_v1", "subject": 1}}
                         ],
                         "terminator": {
                             "MatchResult": {
@@ -87,6 +107,8 @@ def s2c02_verify_semantic_failure():
         "name": "S2C02_verify_failure", "entry_func": "main", "inputs": {},
         "verifier_failures": {"auditor_v1": "AuditFailed(MissingSignature)"},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {
                 "auditor_v1": {
                     "verifier_id": "auditor_v1", "version": "1.0.0",
@@ -105,7 +127,7 @@ def s2c02_verify_semantic_failure():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "bad_artifact"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "auditor_v1", "subject": 1, "output_predicate": "PassesAudit", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}}
+                            {"Verify": {"dest": 2, "verifier_id": "auditor_v1", "subject": 1}}
                         ],
                         "terminator": {
                             "MatchResult": {
@@ -127,6 +149,8 @@ def s2c03_verifier_runtime_confinement():
         "name": "S2C03_verifier_confinement", "entry_func": "main", "inputs": {},
         "verifier_out_of_envelope": {"confined_v1": {"effects": [{"Read": "workspace"}, {"Act": "sandbox"}]}},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {
                 "confined_v1": {
                     "verifier_id": "confined_v1", "version": "1.0.0",
@@ -145,7 +169,7 @@ def s2c03_verifier_runtime_confinement():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "art"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "confined_v1", "subject": 1, "output_predicate": "SafeAudit", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}}
+                            {"Verify": {"dest": 2, "verifier_id": "confined_v1", "subject": 1}}
                         ],
                         "terminator": {
                             "MatchResult": {
@@ -163,10 +187,12 @@ def s2c03_verifier_runtime_confinement():
 
 
 def s2c04_verify_capability_tunnel_blocked():
-    # Descriptor requires {read[workspace], act[sandbox]}. Caller only declares {read[workspace]}.
+    # Descriptor requires {read[workspace], act[sandbox]}. Function declared_effects includes both, but CallerAuthority lacks act[sandbox].
     prog = {
         "name": "S2C04_verify_tunnel_blocked", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}]},  # LACKS act[sandbox]
+            "runtime_authority": {"effects": []},
             "verifiers": {
                 "heavy_v": {
                     "verifier_id": "heavy_v", "version": "1.0.0",
@@ -179,27 +205,29 @@ def s2c04_verify_capability_tunnel_blocked():
         "module": {
             "name": "mod_s2c04", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "workspace"}]}, "entry": 0,  # LACKS act[sandbox]
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Act": "sandbox"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "art"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "heavy_v", "subject": 1, "output_predicate": "HeavyAudit", "subject_type": make_type_string(), "verifier_effects": []}}
+                            {"Verify": {"dest": 2, "verifier_id": "heavy_v", "subject": 1}}
                         ],
-                        "terminator": {"Return": None}
+                        "terminator": {"Return": 1}
                     }
                 }
             }]
         }
     }
-    run_golden("S2C04_verify_capability_tunnel_blocked", prog, expected_status="verifier_error")
+    run_golden("S2C04_verify_capability_tunnel_blocked", prog, expected_status="verifier_error", expected_diag="AuthorityInsufficient")
 
 
 def s2c05_registered_but_untrusted_verifier_rejected_at_gate():
     prog = {
         "name": "S2C05_untrusted_at_gate", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+            "runtime_authority": {"effects": [{"Read": "trust_store"}]},
             "verifiers": {
                 "untrusted_v": {
                     "verifier_id": "untrusted_v", "version": "1.0.0",
@@ -221,18 +249,17 @@ def s2c05_registered_but_untrusted_verifier_rejected_at_gate():
         "module": {
             "name": "mod_s2c05", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]}, "entry": 0,
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "my_payload"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "untrusted_v", "subject": 1, "output_predicate": "AuditPass", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}},
+                            {"Verify": {"dest": 2, "verifier_id": "untrusted_v", "subject": 1}},
                             {"Act": {
-                                "dest": 3, "op_id": "protected_op", "target_domain": "workspace",
+                                "dest": 3, "op_id": "protected_op",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [2], "gate_effects": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": [2]
                             }}
                         ],
                         "terminator": {
@@ -257,10 +284,11 @@ def s2c05_registered_but_untrusted_verifier_rejected_at_gate():
 # =====================================================================
 
 def s2c06_proved_requirement_target_executes():
-    # Statically Proved requirement with matching evidence -> no deferred checks needed, executes directly
     prog = {
         "name": "S2C06_proved_requirement", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {
                 "v_audit": {
                     "verifier_id": "v_audit", "version": "1.0.0",
@@ -288,12 +316,11 @@ def s2c06_proved_requirement_target_executes():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "data"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1, "output_predicate": "StaticProof", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}},
+                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1}},
                             {"Act": {
-                                "dest": 3, "op_id": "simple_act", "target_domain": "workspace",
+                                "dest": 3, "op_id": "simple_act",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [2], "gate_effects": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": [2]
                             }}
                         ],
                         "terminator": {
@@ -317,6 +344,8 @@ def s2c07_deferred_subject_binding_passes():
     prog = {
         "name": "S2C07_deferred_passes", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+            "runtime_authority": {"effects": [{"Read": "trust_store"}]},
             "verifiers": {
                 "v_audit": {
                     "verifier_id": "v_audit", "version": "1.0.0",
@@ -338,18 +367,17 @@ def s2c07_deferred_subject_binding_passes():
         "module": {
             "name": "mod_s2c07", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]}, "entry": 0,
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "correct_subject"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1, "output_predicate": "AuditPass", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}},
+                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1}},
                             {"Act": {
-                                "dest": 3, "op_id": "op_write", "target_domain": "workspace",
+                                "dest": 3, "op_id": "op_write",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [2], "gate_effects": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": [2]
                             }}
                         ],
                         "terminator": {
@@ -373,6 +401,8 @@ def s2c08_deferred_subject_binding_fails_zero_mutation():
     prog = {
         "name": "S2C08_deferred_fails", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+            "runtime_authority": {"effects": [{"Read": "trust_store"}]},
             "verifiers": {
                 "v_audit": {
                     "verifier_id": "v_audit", "version": "1.0.0",
@@ -394,19 +424,18 @@ def s2c08_deferred_subject_binding_fails_zero_mutation():
         "module": {
             "name": "mod_s2c08", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]}, "entry": 0,
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub_A"}, "ty": make_type_string()}},
                             {"Pure": {"dest": 2, "val": {"kind": "String", "payload": "sub_B"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 3, "verifier_id": "v_audit", "subject": 1, "output_predicate": "AuditPass", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}},
+                            {"Verify": {"dest": 3, "verifier_id": "v_audit", "subject": 1}},
                             {"Act": {
-                                "dest": 4, "op_id": "op_write", "target_domain": "workspace",
+                                "dest": 4, "op_id": "op_write",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [2], "evidence": [3], "gate_effects": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [2], "evidence": [3]
                             }}
                         ],
                         "terminator": {
@@ -427,9 +456,12 @@ def s2c08_deferred_subject_binding_fails_zero_mutation():
 
 
 def s2c09_static_refuted():
+    # RequiresStaticProof with mismatched subject -> RefutedRequirement!
     prog = {
         "name": "S2C09_static_refuted", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {
                 "v_audit": {
                     "verifier_id": "v_audit", "version": "1.0.0",
@@ -457,28 +489,30 @@ def s2c09_static_refuted():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "expected_val"}, "ty": make_type_string()}},
-                            {"Pure": {"dest": 2, "val": {"kind": "String", "payload": "conflict_val"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 3, "verifier_id": "v_audit", "subject": 2, "output_predicate": "StaticProof", "subject_type": make_type_string(), "verifier_effects": []}},
+                            {"Pure": {"dest": 2, "val": {"kind": "I64", "payload": 999}, "ty": make_type_i64()}},
+                            {"Verify": {"dest": 3, "verifier_id": "v_audit", "subject": 1}},
                             {"Act": {
-                                "dest": 4, "op_id": "simple_act", "target_domain": "workspace",
+                                "dest": 4, "op_id": "simple_act",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [3], "gate_effects": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [2], "evidence": [3]  # arg 2 has type I64, evidence has subject String -> Refuted!
                             }}
                         ],
-                        "terminator": {"Return": None}
+                        "terminator": {"Return": 1}
                     }
                 }
             }]
         }
     }
-    run_golden("S2C09_static_refuted", prog, expected_status="verifier_error")
+    run_golden("S2C09_static_refuted", prog, expected_status="verifier_error", expected_diag="RefutedRequirement")
 
 
 def s2c10_static_uncovered():
+    # Protected operation requires MandatoryAudit, but evidence is empty -> UncoveredRequirement!
     prog = {
         "name": "S2C10_static_uncovered", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Act": "workspace"}]},
+            "runtime_authority": {"effects": [{"Read": "trust_store"}]},
             "verifiers": {},
             "operations": {
                 "protected_act": {
@@ -494,32 +528,34 @@ def s2c10_static_uncovered():
         "module": {
             "name": "mod_s2c10", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Act": "workspace"}]}, "entry": 0,
+                "declared_effects": {"effects": [{"Act": "workspace"}, {"Read": "trust_store"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "data"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "protected_act", "target_domain": "workspace",
+                                "dest": 2, "op_id": "protected_act",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],  # MISSING EVIDENCE!
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []  # MISSING EVIDENCE!
                             }}
                         ],
-                        "terminator": {"Return": None}
+                        "terminator": {"Return": 1}
                     }
                 }
             }]
         }
     }
-    run_golden("S2C10_static_uncovered", prog, expected_status="verifier_error")
+    run_golden("S2C10_static_uncovered", prog, expected_status="verifier_error", expected_diag="UncoveredRequirement")
 
 
 def s2c11_caller_lacks_target_capability():
+    # Caller authority has only read[workspace], lacks act[workspace] -> AuthorityInsufficient!
     prog = {
         "name": "S2C11_lacks_target_cap", "entry_func": "main", "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}]},  # LACKS act[workspace]
+            "runtime_authority": {"effects": []},
             "verifiers": {},
             "operations": {
                 "write_act": {
@@ -534,31 +570,29 @@ def s2c11_caller_lacks_target_capability():
         "module": {
             "name": "mod_s2c11", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "workspace"}]}, "entry": 0,  # LACKS act[workspace]
+                "declared_effects": {"effects": [{"Act": "workspace"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "data"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "write_act", "target_domain": "workspace",
+                                "dest": 2, "op_id": "write_act",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []
                             }}
                         ],
-                        "terminator": {"Return": None}
+                        "terminator": {"Return": 1}
                     }
                 }
             }]
         }
     }
-    run_golden("S2C11_caller_lacks_target_capability", prog, expected_status="verifier_error")
+    run_golden("S2C11_caller_lacks_target_capability", prog, expected_status="verifier_error", expected_diag="AuthorityInsufficient")
 
 
 def s2c12_separate_gate_authority():
-    # Caller authority: act[workspace]. Runtime authority: read[trust_store].
-    # Gate check executes with runtime authority, target executes with caller authority.
+    # Full semantic effect row declared, CallerAuthority has only act/read, RuntimeAuthority has read[trust_store] -> PASS!
     prog = {
         "name": "S2C12_separate_gate_authority", "entry_func": "main", "inputs": {},
         "registry": {
@@ -585,18 +619,17 @@ def s2c12_separate_gate_authority():
         "module": {
             "name": "mod_s2c12", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Act": "workspace"}, {"Read": "workspace"}]}, "entry": 0,
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "data"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1, "output_predicate": "AuditPass", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}},
+                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1}},
                             {"Act": {
-                                "dest": 3, "op_id": "op_gated", "target_domain": "workspace",
+                                "dest": 3, "op_id": "op_gated",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [2], "gate_effects": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": [2]
                             }}
                         ],
                         "terminator": {
@@ -621,7 +654,15 @@ def s2c13_envelope_omission():
     prog = {
         "name": "S2C13_envelope_omission", "entry_func": "main", "inputs": {},
         "registry": {
-            "verifiers": {},
+            "caller_authority": {"effects": [{"Act": "workspace"}, {"Read": "workspace"}]},
+            "runtime_authority": {"effects": [{"Read": "trust_store"}]},
+            "verifiers": {
+                "v_audit": {
+                    "verifier_id": "v_audit", "version": "1.0.0",
+                    "effect_envelope": {"effects": [{"Read": "workspace"}]},
+                    "output_predicate": "AuditPass", "subject_type": make_type_string()
+                }
+            },
             "operations": {
                 "op_bad_envelope": {
                     "op_id": "op_bad_envelope", "target_domain": "workspace",
@@ -636,26 +677,26 @@ def s2c13_envelope_omission():
         "module": {
             "name": "mod_s2c13", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Act": "workspace"}]}, "entry": 0,
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "data"}, "ty": make_type_string()}},
+                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1}},
                             {"Act": {
-                                "dest": 2, "op_id": "op_bad_envelope", "target_domain": "workspace",
+                                "dest": 3, "op_id": "op_bad_envelope",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": [2]
                             }}
                         ],
-                        "terminator": {"Return": None}
+                        "terminator": {"Return": 1}
                     }
                 }
             }]
         }
     }
-    run_golden("S2C13_envelope_omission", prog, expected_status="verifier_error")
+    run_golden("S2C13_envelope_omission", prog, expected_status="verifier_error", expected_diag="EnvelopeExceeded")
 
 
 # =====================================================================
@@ -667,6 +708,8 @@ def s2c14_clean_failure():
         "name": "S2C14_clean_failure", "entry_func": "main", "inputs": {},
         "act_scenarios": {"op_fail": "clean_failure"},
         "registry": {
+            "caller_authority": {"effects": [{"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {},
             "operations": {
                 "op_fail": {
@@ -688,10 +731,9 @@ def s2c14_clean_failure():
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "arg"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "op_fail", "target_domain": "workspace",
+                                "dest": 2, "op_id": "op_fail",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []
                             }}
                         ],
                         "terminator": {
@@ -716,6 +758,8 @@ def s2c15_legitimate_partial():
         "name": "S2C15_partial", "entry_func": "main", "inputs": {},
         "act_scenarios": {"op_part": "partial_legitimate"},
         "registry": {
+            "caller_authority": {"effects": [{"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {},
             "operations": {
                 "op_part": {
@@ -737,10 +781,9 @@ def s2c15_legitimate_partial():
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "arg"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "op_part", "target_domain": "workspace",
+                                "dest": 2, "op_id": "op_part",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []
                             }}
                         ],
                         "terminator": {
@@ -765,6 +808,8 @@ def s2c16_atomic_adapter_yields_partial_protocol_violation():
         "name": "S2C16_atomic_partial", "entry_func": "main", "inputs": {},
         "act_scenarios": {"op_atomic": "atomic_yielding_partial"},
         "registry": {
+            "caller_authority": {"effects": [{"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {},
             "operations": {
                 "op_atomic": {
@@ -786,10 +831,9 @@ def s2c16_atomic_adapter_yields_partial_protocol_violation():
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "arg"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "op_atomic", "target_domain": "workspace",
+                                "dest": 2, "op_id": "op_atomic",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []
                             }}
                         ],
                         "terminator": {
@@ -814,6 +858,8 @@ def s2c17_delivery_unknown():
         "name": "S2C17_delivery_unknown", "entry_func": "main", "inputs": {},
         "act_scenarios": {"op_unk": "delivery_unknown"},
         "registry": {
+            "caller_authority": {"effects": [{"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {},
             "operations": {
                 "op_unk": {
@@ -835,10 +881,9 @@ def s2c17_delivery_unknown():
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "arg"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "op_unk", "target_domain": "workspace",
+                                "dest": 2, "op_id": "op_unk",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []
                             }}
                         ],
                         "terminator": {
@@ -863,6 +908,8 @@ def s2c18_settlement_unknown():
         "name": "S2C18_settlement_unknown", "entry_func": "main", "inputs": {},
         "act_scenarios": {"op_settle": "settlement_unknown"},
         "registry": {
+            "caller_authority": {"effects": [{"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {},
             "operations": {
                 "op_settle": {
@@ -884,10 +931,9 @@ def s2c18_settlement_unknown():
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "arg"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "op_settle", "target_domain": "workspace",
+                                "dest": 2, "op_id": "op_settle",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []
                             }}
                         ],
                         "terminator": {
@@ -907,15 +953,13 @@ def s2c18_settlement_unknown():
     run_golden("S2C18_settlement_unknown", prog)
 
 
-# =====================================================================
-# S2C19–S2C21: Footprint & Current Fact Invalidation Golden Programs
-# =====================================================================
-
 def s2c19_footprint_violation():
     prog = {
         "name": "S2C19_footprint_violation", "entry_func": "main", "inputs": {},
         "act_scenarios": {"op_violator": "out_of_footprint_attempt"},
         "registry": {
+            "caller_authority": {"effects": [{"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {},
             "operations": {
                 "op_violator": {
@@ -937,10 +981,9 @@ def s2c19_footprint_violation():
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "val"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "op_violator", "target_domain": "workspace",
+                                "dest": 2, "op_id": "op_violator",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []
                             }}
                         ],
                         "terminator": {
@@ -968,6 +1011,8 @@ def s2c20_mutation_invalidates_current_fact():
             {"predicate": "Historical", "args": [{"Literal": "init_provenance"}]}
         ],
         "registry": {
+            "caller_authority": {"effects": [{"Act": "workspace"}]},
+            "runtime_authority": {"effects": []},
             "verifiers": {},
             "operations": {
                 "op_write": {
@@ -989,10 +1034,9 @@ def s2c20_mutation_invalidates_current_fact():
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "val"}, "ty": make_type_string()}},
                             {"Act": {
-                                "dest": 2, "op_id": "op_write", "target_domain": "workspace",
+                                "dest": 2, "op_id": "op_write",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": []
                             }}
                         ],
                         "terminator": {
@@ -1023,6 +1067,8 @@ def s2c21_gate_rejection_preserves_target_state():
             {"predicate": "CurrentState", "args": [{"Literal": "workspace/doc1"}, {"Literal": "pristine_data"}]}
         ],
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+            "runtime_authority": {"effects": [{"Read": "trust_store"}]},
             "verifiers": {
                 "v_audit": {
                     "verifier_id": "v_audit", "version": "1.0.0",
@@ -1044,18 +1090,17 @@ def s2c21_gate_rejection_preserves_target_state():
         "module": {
             "name": "mod_s2c21", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]}, "entry": 0,
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub_A"}, "ty": make_type_string()}},
-                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1, "output_predicate": "AuditPass", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}},
+                            {"Verify": {"dest": 2, "verifier_id": "v_audit", "subject": 1}},
                             {"Act": {
-                                "dest": 3, "op_id": "op_protected", "target_domain": "workspace",
+                                "dest": 3, "op_id": "op_protected",
                                 "success_type": make_type_string(), "failure_type": make_type_string(),
-                                "args": [1], "evidence": [2],
-                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                                "args": [1], "evidence": [2]
                             }}
                         ],
                         "terminator": {

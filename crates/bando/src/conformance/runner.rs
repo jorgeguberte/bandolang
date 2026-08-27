@@ -34,11 +34,13 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
             diagnostics: diags,
             mutation_trace: Vec::new(),
             final_world: None,
+            gate_resolutions: Vec::new(),
+            gate_trace: Vec::new(),
         };
     }
 
-    // 2. Lowering (with mutation configuration if any)
-    let mut lowering = LoweringContext::with_mutations(prog.mutations.clone());
+    // 2. Lowering (with trusted registry binding, Q1)
+    let mut lowering = LoweringContext::with_registry(registry.clone(), prog.mutations.clone());
     let vm_module = lowering.lower_module(&prog.module);
 
     // 3. VM Verifier
@@ -55,6 +57,8 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
             diagnostics: diags,
             mutation_trace: Vec::new(),
             final_world: None,
+            gate_resolutions: Vec::new(),
+            gate_trace: Vec::new(),
         };
     }
 
@@ -74,6 +78,8 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
                 diagnostics: Vec::new(),
                 mutation_trace: Vec::new(),
                 final_world: None,
+                gate_resolutions: Vec::new(),
+                gate_trace: Vec::new(),
             };
         }
     };
@@ -152,5 +158,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
         diagnostics: Vec::new(),
         mutation_trace: state.world.mutation_trace,
         final_world: Some(state.world.storage),
+        gate_resolutions: state.gate_resolutions,
+        gate_trace: state.gate_trace,
     }
 }

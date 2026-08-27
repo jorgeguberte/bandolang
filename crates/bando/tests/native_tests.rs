@@ -16,7 +16,7 @@ use bando::{
     lowering::LoweringContext,
     registry::{
         AtomicityGuarantee, MutationFootprint, OperationDescriptor, OperationId,
-        PolicyRequirement, RegistrySnapshot, TrustPolicy, VerifierDescriptor, VerifierId,
+        PolicyRequirement, RegistrySnapshot, VerifierDescriptor, VerifierId,
     },
     verifier::HighLevelVerifier,
     vm::{

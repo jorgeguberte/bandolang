@@ -258,12 +258,21 @@ impl<'a> HighLevelVerifier<'a> {
     }
 
     fn verify_instruction(&mut self, inst: &Instruction, visible: &BTreeSet<ValueId>) {
-        // Rule #1 & #9: check required effects
+        // Rule #1 & #9: check required effects and caller authority
         let required_effects = match inst {
             Instruction::Verify { verifier_id, verifier_effects, .. } => {
                 if let Some(reg) = self.registry {
                     if let Some(desc) = reg.verifiers.get(verifier_id) {
-                        desc.effect_envelope.effects.iter().cloned().collect()
+                        let effs: Vec<_> = desc.effect_envelope.effects.iter().cloned().collect();
+                        if let Some(ca) = &reg.caller_authority {
+                            if !ca.covers(&effs) {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::AuthorityInsufficient,
+                                    format!("Caller authority insufficient for verifier {:?}", verifier_id),
+                                ));
+                            }
+                        }
+                        effs
                     } else {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::UnknownVerifier,
@@ -278,9 +287,16 @@ impl<'a> HighLevelVerifier<'a> {
             Instruction::Act { op_id, target_domain, gate_effects, args, evidence, .. } => {
                 if let Some(reg) = self.registry {
                     if let Some(op_desc) = reg.operations.get(op_id) {
-                        // 1. Caller authority must contain act[target_domain]
+                        // 1. Caller authority must contain act[target_domain] (Q2, S2C11)
                         let act_eff = Effect::Act(op_desc.target_domain.clone());
-                        if !self.func.declared_effects.contains(&act_eff) {
+                        if let Some(ca) = &reg.caller_authority {
+                            if !ca.contains(&act_eff) {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::AuthorityInsufficient,
+                                    format!("Caller authority lacks target capability {:?}", act_eff),
+                                ));
+                            }
+                        } else if !self.func.declared_effects.contains(&act_eff) {
                             self.diagnostics.push(Diagnostic::error(
                                 DiagnosticCode::EffectUndeclared,
                                 format!("Caller lacks target capability {:?}", act_eff),
