@@ -1,3 +1,3 @@
 pub mod result_cfg;
 
-pub use result_cfg::LoweringContext;
+pub use result_cfg::{CompilerMutations, LoweringContext};

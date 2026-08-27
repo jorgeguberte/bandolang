@@ -7,6 +7,31 @@ use super::{
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Region {
+    pub instructions: Vec<Instruction>,
+    pub terminator: RegionTerminator,
+}
+
+impl Region {
+    pub fn new(terminator: RegionTerminator) -> Self {
+        Self {
+            instructions: Vec::new(),
+            terminator,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum RegionTerminator {
+    Return(Option<ValueId>),
+    Br {
+        target: BlockId,
+        args: Vec<ValueId>,
+    },
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Instruction {
     Pure {
         dest: ValueId,
@@ -70,10 +95,10 @@ pub enum Terminator {
     },
     MatchResult {
         result_val: ValueId,
-        ok_target: BlockId,
         ok_arg: ValueId,
-        err_target: BlockId,
+        ok_body: Region,
         err_arg: ValueId,
+        err_body: Region,
     },
     Unreachable,
 }

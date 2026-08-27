@@ -1,7 +1,7 @@
 """test_golden.py — Golden Conformance Programs C01–C12 for Compiler Conformance v0 (Slice 1).
 
 Executes end-to-end:
-Rust High-Level IR -> Rust High-Level Verifier -> Rust Lowering -> Rust VM Verifier -> Rust VM Interpreter.
+Rust High-Level Structured IR -> Rust High-Level Verifier -> Rust Lowering -> Rust VM Verifier -> Rust VM Interpreter.
 """
 from __future__ import annotations
 
@@ -24,7 +24,6 @@ def run_golden(name: str, program: dict) -> None:
             print(f"  \u2717 FAIL {name}: expected status 'ok', got '{obs['status']}' with diagnostics {obs.get('diagnostics')}")
             FAIL += 1
             return
-        # Validation passed
         print(f"  \u2713 PASS {name} (status=ok, return={obs.get('return_val')}, effects={obs.get('effects')})")
         PASS += 1
     except Exception as e:
@@ -32,11 +31,6 @@ def run_golden(name: str, program: dict) -> None:
         FAIL += 1
 
 
-# =====================================================================
-# C01–C12 Golden Programs Definitions
-# =====================================================================
-
-def make_type_unit(): return {"kind": "Unit"}
 def make_type_bool(): return {"kind": "Bool"}
 def make_type_i64(): return {"kind": "I64"}
 def make_type_string(): return {"kind": "String"}
@@ -78,6 +72,7 @@ def c01_pure_value():
 
 
 def c02_read_ok():
+    # R1: Structured MatchResult with Regions
     prog = {
         "name": "C02_read_ok",
         "entry_func": "main",
@@ -113,26 +108,12 @@ def c02_read_ok():
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 2,
-                                "err_arg": 3
+                                "ok_body": {"instructions": [], "terminator": {"Return": 2}},
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Return": 3}}
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "ok_branch",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 2}
-                    },
-                    "2": {
-                        "id": 2,
-                        "name": "err_branch",
-                        "params": [[3, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 3}
                     }
                 }
             }]
@@ -175,26 +156,12 @@ def c03_read_err():
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 2,
-                                "err_arg": 3
+                                "ok_body": {"instructions": [], "terminator": {"Return": 2}},
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Return": 3}}
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "ok_branch",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 2}
-                    },
-                    "2": {
-                        "id": 2,
-                        "name": "err_branch",
-                        "params": [[3, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 3}
                     }
                 }
             }]
@@ -236,28 +203,15 @@ def c04_result_payload_ssa_rename():
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 2,
-                                "err_arg": 3
+                                "ok_body": {
+                                    "instructions": [{"Assign": {"dest": 4, "source": 2, "ty": make_type_string()}}],
+                                    "terminator": {"Return": 4}
+                                },
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Return": 3}}
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "ok_branch",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [{
-                            "Assign": {"dest": 4, "source": 2, "ty": make_type_string()}
-                        }],
-                        "terminator": {"Return": 4}
-                    },
-                    "2": {
-                        "id": 2,
-                        "name": "err_branch",
-                        "params": [[3, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 3}
                     }
                 }
             }]
@@ -267,7 +221,6 @@ def c04_result_payload_ssa_rename():
 
 
 def c05_c06_diamond_facts():
-    # Tests merge discarding branch-only fact and preserving common fact
     prog = {
         "name": "C05_C06_diamond_facts",
         "entry_func": "main",
@@ -293,7 +246,7 @@ def c05_c06_diamond_facts():
                                 "err_type": make_type_string(),
                                 "latent": {
                                     "on_ok": [
-                                        {"predicate": "BranchOnlyFact", "args": [{"Symbol": "$value"}]},
+                                        {"predicate": "ExclusiveOk", "args": [{"Symbol": "$value"}]},
                                         {"predicate": "CommonFact", "args": [{"Literal": "doc"}]}
                                     ],
                                     "on_err": [
@@ -305,29 +258,15 @@ def c05_c06_diamond_facts():
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 2,
-                                "err_arg": 3
+                                "ok_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": [2]}}},
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": [3]}}}
                             }
                         }
                     },
                     "1": {
                         "id": 1,
-                        "name": "ok_branch",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Br": {"target": 3, "args": [2]}}
-                    },
-                    "2": {
-                        "id": 2,
-                        "name": "err_branch",
-                        "params": [[3, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Br": {"target": 3, "args": [3]}}
-                    },
-                    "3": {
-                        "id": 3,
                         "name": "merge",
                         "params": [[4, make_type_string()]],
                         "instructions": [],
@@ -478,26 +417,12 @@ def c09_infer_ok():
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 2,
-                                "err_arg": 3
+                                "ok_body": {"instructions": [], "terminator": {"Return": 2}},
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Return": 3}}
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "ok_branch",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 2}
-                    },
-                    "2": {
-                        "id": 2,
-                        "name": "err_branch",
-                        "params": [[3, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 3}
                     }
                 }
             }]
@@ -540,26 +465,12 @@ def c10_infer_err():
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 2,
-                                "err_arg": 3
+                                "ok_body": {"instructions": [], "terminator": {"Return": 2}},
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Return": 3}}
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "ok_branch",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 2}
-                    },
-                    "2": {
-                        "id": 2,
-                        "name": "err_branch",
-                        "params": [[3, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 3}
                     }
                 }
             }]
@@ -569,6 +480,7 @@ def c10_infer_err():
 
 
 def c11_read_effect_preservation():
+    # R2: Asserts effect-row static preservation
     prog = {
         "name": "C11_read_effect",
         "entry_func": "main",
@@ -592,25 +504,18 @@ def c11_read_effect_preservation():
                                 "domain": "config",
                                 "ok_type": make_type_string(),
                                 "err_type": make_type_string(),
-                                "latent": LatentPostconditions()
+                                "latent": {"on_ok": [], "on_err": []}
                             }
                         }],
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 1,
-                                "err_arg": 2
+                                "ok_body": {"instructions": [], "terminator": {"Return": 2}},
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Return": 3}}
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "exit",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 2}
                     }
                 }
             }]
@@ -620,6 +525,7 @@ def c11_read_effect_preservation():
 
 
 def c12_infer_effect_preservation():
+    # R2: Asserts effect-row static preservation
     prog = {
         "name": "C12_infer_effect",
         "entry_func": "main",
@@ -643,25 +549,18 @@ def c12_infer_effect_preservation():
                                 "prompt": "generate_code",
                                 "ok_type": make_type_string(),
                                 "err_type": make_type_string(),
-                                "latent": LatentPostconditions()
+                                "latent": {"on_ok": [], "on_err": []}
                             }
                         }],
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 1,
-                                "err_arg": 2
+                                "ok_body": {"instructions": [], "terminator": {"Return": 2}},
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Return": 3}}
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "exit",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 2}
                     }
                 }
             }]
@@ -670,13 +569,9 @@ def c12_infer_effect_preservation():
     run_golden("C12_infer_effect_preservation", prog)
 
 
-def LatentPostconditions():
-    return {"on_ok": [], "on_err": []}
-
-
 if __name__ == "__main__":
     print("=" * 70)
-    print("SOMA COMPILER CONFORMANCE v0 (SLICE 1) — Golden Programs C01–C12")
+    print("SOMA COMPILER CONFORMANCE v0 (SLICE 1) — Golden Programs C01–C12 (R1 & R2)")
     c01_pure_value()
     c02_read_ok()
     c03_read_err()

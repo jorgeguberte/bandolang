@@ -1,9 +1,10 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    analysis::DominanceTree,
     diagnostics::{Diagnostic, DiagnosticCode},
     ir::{
-        ops::{Instruction, Terminator},
+        ops::{Instruction, Region, RegionTerminator, Terminator},
         types::Type,
         values::{BlockId, ValueId},
         Function, Module,
@@ -13,7 +14,8 @@ use crate::{
 pub struct HighLevelVerifier<'a> {
     func: &'a Function,
     diagnostics: Vec<Diagnostic>,
-    defined_values: BTreeMap<ValueId, Type>,
+    all_defined_values: BTreeMap<ValueId, Type>,
+    block_definitions: BTreeMap<BlockId, Vec<ValueId>>,
 }
 
 impl<'a> HighLevelVerifier<'a> {
@@ -21,7 +23,8 @@ impl<'a> HighLevelVerifier<'a> {
         Self {
             func,
             diagnostics: Vec::new(),
-            defined_values: BTreeMap::new(),
+            all_defined_values: BTreeMap::new(),
+            block_definitions: BTreeMap::new(),
         }
     }
 
@@ -41,9 +44,9 @@ impl<'a> HighLevelVerifier<'a> {
     }
 
     pub fn verify(&mut self) -> Result<(), Vec<Diagnostic>> {
-        // 1. Register function parameters
+        // 1. Check duplicate definitions for function params
         for (param_id, param_type) in &self.func.params {
-            self.define_value(*param_id, param_type.clone());
+            self.register_def(*param_id, param_type.clone());
         }
 
         // 2. Validate entry block existence
@@ -54,19 +57,83 @@ impl<'a> HighLevelVerifier<'a> {
             ));
         }
 
-        // 3. Register block parameters across all blocks first
+        // 3. Collect and check duplicate definitions for block params and instructions
         for (block_id, block) in &self.func.blocks {
+            let mut block_defs = Vec::new();
             for (param_id, param_type) in &block.params {
-                self.define_value(*param_id, param_type.clone());
+                self.register_def(*param_id, param_type.clone());
+                block_defs.push(*param_id);
             }
 
-            // Verify instructions
             for inst in &block.instructions {
-                self.verify_instruction(inst);
+                let dest = inst.dest();
+                let ty = match inst {
+                    Instruction::Pure { ty, .. } => ty.clone(),
+                    Instruction::Read { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
+                    Instruction::Infer { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
+                    Instruction::Assign { ty, .. } => ty.clone(),
+                };
+                self.register_def(dest, ty);
+                block_defs.push(dest);
+            }
+
+            if let Terminator::MatchResult { ok_arg, ok_body, err_arg, err_body, .. } = &block.terminator {
+                self.register_def(*ok_arg, Type::String); // Checked properly during type check
+                block_defs.push(*ok_arg);
+                for inst in &ok_body.instructions {
+                    self.register_def(inst.dest(), Type::String);
+                    block_defs.push(inst.dest());
+                }
+                self.register_def(*err_arg, Type::String);
+                block_defs.push(*err_arg);
+                for inst in &err_body.instructions {
+                    self.register_def(inst.dest(), Type::String);
+                    block_defs.push(inst.dest());
+                }
+            }
+
+            self.block_definitions.insert(*block_id, block_defs);
+        }
+
+        // 4. Compute dominance tree over blocks (R3)
+        let block_ids: Vec<BlockId> = self.func.blocks.keys().copied().collect();
+        let dom_tree = DominanceTree::compute(self.func.entry, &block_ids, |b| self.find_predecessors(b));
+
+        // 5. Verify instructions & terminators with SSA dominance / visibility
+        for (block_id, block) in &self.func.blocks {
+            let mut visible_values = BTreeSet::new();
+
+            // Function params are visible
+            for (p_id, _) in &self.func.params {
+                visible_values.insert(*p_id);
+            }
+
+            // Definitions from strictly dominating blocks are visible
+            if let Some(doms) = dom_tree.dominators.get(block_id) {
+                for &dom_block in doms {
+                    if dom_block != *block_id {
+                        if let Some(defs) = self.block_definitions.get(&dom_block) {
+                            for d in defs {
+                                visible_values.insert(*d);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Block params are visible
+            for (p_id, _) in &block.params {
+                visible_values.insert(*p_id);
+            }
+
+            // Verify instructions in block
+            for inst in &block.instructions {
+                self.verify_instruction(inst, &visible_values);
+                visible_values.insert(inst.dest());
             }
 
             // Verify terminator
-            self.verify_terminator(&block.terminator, *block_id);
+            self.verify_terminator(&block.terminator, *block_id, &mut visible_values);
         }
 
         if self.diagnostics.is_empty() {
@@ -76,35 +143,49 @@ impl<'a> HighLevelVerifier<'a> {
         }
     }
 
-    fn define_value(&mut self, val_id: ValueId, ty: Type) {
-        if self.defined_values.contains_key(&val_id) {
+    fn find_predecessors(&self, target: BlockId) -> Vec<BlockId> {
+        let mut preds = Vec::new();
+        for (b_id, b) in &self.func.blocks {
+            match &b.terminator {
+                Terminator::Br { target: t, .. } => {
+                    if t == &target {
+                        preds.push(*b_id);
+                    }
+                }
+                Terminator::CondBr { true_target, false_target, .. } => {
+                    if true_target == &target || false_target == &target {
+                        preds.push(*b_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        preds
+    }
+
+    fn register_def(&mut self, val_id: ValueId, ty: Type) {
+        if self.all_defined_values.contains_key(&val_id) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::SsaDuplicateDef,
                 format!("Duplicate SSA definition of value {:?}", val_id),
             ));
         } else {
-            self.defined_values.insert(val_id, ty);
+            self.all_defined_values.insert(val_id, ty);
         }
     }
 
-    fn get_type(&self, val_id: ValueId) -> Option<Type> {
-        self.defined_values.get(&val_id).cloned()
-    }
-
-    fn require_defined(&mut self, val_id: ValueId) -> Option<Type> {
-        if let Some(ty) = self.get_type(val_id) {
-            Some(ty)
-        } else {
+    fn check_visible(&mut self, val_id: ValueId, visible: &BTreeSet<ValueId>) -> Option<Type> {
+        if !visible.contains(&val_id) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::SsaUseBeforeDef,
-                format!("Use of undefined or uninitialized SSA value {:?}", val_id),
+                format!("Use of SSA value {:?} outside its dominating scope", val_id),
             ));
-            None
+            return None;
         }
+        self.all_defined_values.get(&val_id).cloned()
     }
 
-    fn verify_instruction(&mut self, inst: &Instruction) {
-        // Check effect declarations
+    fn verify_instruction(&mut self, inst: &Instruction, visible: &BTreeSet<ValueId>) {
         for eff in inst.required_effects() {
             if !self.func.declared_effects.contains(&eff) {
                 self.diagnostics.push(Diagnostic::error(
@@ -115,30 +196,9 @@ impl<'a> HighLevelVerifier<'a> {
         }
 
         match inst {
-            Instruction::Pure { dest, ty, .. } => {
-                self.define_value(*dest, ty.clone());
-            }
-            Instruction::Read {
-                dest,
-                ok_type,
-                err_type,
-                ..
-            } => {
-                let res_ty = Type::result(ok_type.clone(), err_type.clone());
-                self.define_value(*dest, res_ty);
-            }
-            Instruction::Infer {
-                dest,
-                prompt: _,
-                ok_type,
-                err_type,
-                latent: _,
-            } => {
-                let res_ty = Type::result(ok_type.clone(), err_type.clone());
-                self.define_value(*dest, res_ty);
-            }
-            Instruction::Assign { dest, source, ty } => {
-                if let Some(src_ty) = self.require_defined(*source) {
+            Instruction::Pure { .. } | Instruction::Read { .. } | Instruction::Infer { .. } => {}
+            Instruction::Assign { source, ty, .. } => {
+                if let Some(src_ty) = self.check_visible(*source, visible) {
                     if &src_ty != ty {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::TypeMismatch,
@@ -146,16 +206,15 @@ impl<'a> HighLevelVerifier<'a> {
                         ));
                     }
                 }
-                self.define_value(*dest, ty.clone());
             }
         }
     }
 
-    fn verify_terminator(&mut self, term: &Terminator, _current_block: BlockId) {
+    fn verify_terminator(&mut self, term: &Terminator, current_block: BlockId, visible: &mut BTreeSet<ValueId>) {
         match term {
             Terminator::Return(val_opt) => {
                 if let Some(val_id) = val_opt {
-                    if let Some(val_ty) = self.require_defined(*val_id) {
+                    if let Some(val_ty) = self.check_visible(*val_id, visible) {
                         if val_ty != self.func.return_type {
                             self.diagnostics.push(Diagnostic::error(
                                 DiagnosticCode::TypeMismatch,
@@ -171,7 +230,7 @@ impl<'a> HighLevelVerifier<'a> {
                 }
             }
             Terminator::Br { target, args } => {
-                self.verify_branch_target(*target, args);
+                self.verify_branch_target(*target, args, visible);
             }
             Terminator::CondBr {
                 cond,
@@ -180,7 +239,7 @@ impl<'a> HighLevelVerifier<'a> {
                 false_target,
                 false_args,
             } => {
-                if let Some(cond_ty) = self.require_defined(*cond) {
+                if let Some(cond_ty) = self.check_visible(*cond, visible) {
                     if cond_ty != Type::Bool {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::TypeMismatch,
@@ -188,23 +247,21 @@ impl<'a> HighLevelVerifier<'a> {
                         ));
                     }
                 }
-                self.verify_branch_target(*true_target, true_args);
-                self.verify_branch_target(*false_target, false_args);
+                self.verify_branch_target(*true_target, true_args, visible);
+                self.verify_branch_target(*false_target, false_args, visible);
             }
             Terminator::MatchResult {
                 result_val,
-                ok_target,
                 ok_arg,
-                err_target,
+                ok_body,
                 err_arg,
+                err_body,
             } => {
-                if let Some(res_ty) = self.require_defined(*result_val) {
+                if let Some(res_ty) = self.check_visible(*result_val, visible) {
                     match res_ty {
                         Type::Result { ok, err } => {
-                            let ok_t = *ok;
-                            let err_t = *err;
-                            self.verify_match_branch(*ok_target, *ok_arg, &ok_t, DiagnosticCode::ResultPayloadType);
-                            self.verify_match_branch(*err_target, *err_arg, &err_t, DiagnosticCode::ResultPayloadType);
+                            self.verify_region(ok_body, *ok_arg, &ok, current_block, visible);
+                            self.verify_region(err_body, *err_arg, &err, current_block, visible);
                         }
                         other => {
                             self.diagnostics.push(Diagnostic::error(
@@ -219,7 +276,44 @@ impl<'a> HighLevelVerifier<'a> {
         }
     }
 
-    fn verify_branch_target(&mut self, target: BlockId, args: &[ValueId]) {
+    fn verify_region(
+        &mut self,
+        region: &Region,
+        arg_id: ValueId,
+        expected_arg_ty: &Type,
+        _parent_block: BlockId,
+        parent_visible: &BTreeSet<ValueId>,
+    ) {
+        let mut region_visible = parent_visible.clone();
+        region_visible.insert(arg_id);
+        self.all_defined_values.insert(arg_id, expected_arg_ty.clone());
+
+        for inst in &region.instructions {
+            self.verify_instruction(inst, &region_visible);
+            region_visible.insert(inst.dest());
+        }
+
+        match &region.terminator {
+            RegionTerminator::Return(val_opt) => {
+                if let Some(val_id) = val_opt {
+                    if let Some(val_ty) = self.check_visible(*val_id, &region_visible) {
+                        if val_ty != self.func.return_type {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::TypeMismatch,
+                                format!("Region Return type mismatch: expected {:?}, got {:?}", self.func.return_type, val_ty),
+                            ));
+                        }
+                    }
+                }
+            }
+            RegionTerminator::Br { target, args } => {
+                self.verify_branch_target(*target, args, &region_visible);
+            }
+            RegionTerminator::Unreachable => {}
+        }
+    }
+
+    fn verify_branch_target(&mut self, target: BlockId, args: &[ValueId], visible: &BTreeSet<ValueId>) {
         let block = if let Some(b) = self.func.blocks.get(&target) {
             b
         } else {
@@ -240,7 +334,7 @@ impl<'a> HighLevelVerifier<'a> {
 
         let expected_types: Vec<_> = block.params.iter().map(|(_, t)| t.clone()).collect();
         for (i, (arg_id, expected_ty)) in args.iter().zip(expected_types.iter()).enumerate() {
-            if let Some(arg_ty) = self.require_defined(*arg_id) {
+            if let Some(arg_ty) = self.check_visible(*arg_id, visible) {
                 if &arg_ty != expected_ty {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::BlockArgType,
@@ -248,40 +342,6 @@ impl<'a> HighLevelVerifier<'a> {
                     ));
                 }
             }
-        }
-    }
-
-    fn verify_match_branch(&mut self, target: BlockId, arg_id: ValueId, expected_ty: &Type, diag_code: DiagnosticCode) {
-        let block = if let Some(b) = self.func.blocks.get(&target) {
-            b
-        } else {
-            self.diagnostics.push(Diagnostic::error(
-                DiagnosticCode::CfgBadTarget,
-                format!("MatchResult target block {:?} not found", target),
-            ));
-            return;
-        };
-
-        if block.params.len() != 1 {
-            self.diagnostics.push(Diagnostic::error(
-                DiagnosticCode::BlockArgArity,
-                format!("Match target block {:?} must take exactly 1 argument, takes {}", target, block.params.len()),
-            ));
-            return;
-        }
-
-        let (param_id, param_ty) = &block.params[0];
-        if param_id != &arg_id {
-            self.diagnostics.push(Diagnostic::error(
-                DiagnosticCode::SsaUseBeforeDef,
-                format!("Match target block {:?} parameter {:?} does not match branch arg {:?}", target, param_id, arg_id),
-            ));
-        }
-        if param_ty != expected_ty {
-            self.diagnostics.push(Diagnostic::error(
-                diag_code,
-                format!("Match target block {:?} payload type mismatch: expected {:?}, got {:?}", target, expected_ty, param_ty),
-            ));
         }
     }
 }

@@ -1,7 +1,7 @@
 """test_negative.py — Negative Verifier Cases V01–V12 for Compiler Conformance v0 (Slice 1).
 
 Validates that the Rust High-Level Verifier and VM Verifier correctly reject invalid programs
-with structured DiagnosticCode.
+with structured DiagnosticCode, including real SSA dominance and visibility rules (R3).
 """
 from __future__ import annotations
 
@@ -128,32 +128,21 @@ def v03_wrong_ok_payload_type():
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 2,
-                                "err_arg": 3
+                                "ok_body": {
+                                    "instructions": [{"Assign": {"dest": 4, "source": 2, "ty": make_type_i64()}}],  # TREATS STRING AS I64
+                                    "terminator": {"Return": 4}
+                                },
+                                "err_arg": 3,
+                                "err_body": {"instructions": [], "terminator": {"Return": 3}}
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "ok_branch",
-                        "params": [[2, make_type_i64()]],  # WRONG PAYLOAD TYPE I64 INSTEAD OF STRING
-                        "instructions": [],
-                        "terminator": {"Return": 2}
-                    },
-                    "2": {
-                        "id": 2,
-                        "name": "err_branch",
-                        "params": [[3, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 3}
                     }
                 }
             }]
         }
     }
-    expect_verifier_error("V03_wrong_ok_payload_type", prog, "ResultPayloadType")
+    expect_verifier_error("V03_wrong_ok_payload_type", prog, "TypeMismatch")
 
 
 def v04_wrong_err_payload_type():
@@ -180,32 +169,21 @@ def v04_wrong_err_payload_type():
                         "terminator": {
                             "MatchResult": {
                                 "result_val": 1,
-                                "ok_target": 1,
                                 "ok_arg": 2,
-                                "err_target": 2,
-                                "err_arg": 3
+                                "ok_body": {"instructions": [], "terminator": {"Return": 2}},
+                                "err_arg": 3,
+                                "err_body": {
+                                    "instructions": [{"Assign": {"dest": 5, "source": 3, "ty": make_type_bool()}}],  # TREATS STRING AS BOOL
+                                    "terminator": {"Return": 5}
+                                }
                             }
                         }
-                    },
-                    "1": {
-                        "id": 1,
-                        "name": "ok_branch",
-                        "params": [[2, make_type_string()]],
-                        "instructions": [],
-                        "terminator": {"Return": 2}
-                    },
-                    "2": {
-                        "id": 2,
-                        "name": "err_branch",
-                        "params": [[3, make_type_bool()]],  # WRONG ERR PAYLOAD BOOL INSTEAD OF STRING
-                        "instructions": [],
-                        "terminator": {"Return": 3}
                     }
                 }
             }]
         }
     }
-    expect_verifier_error("V04_wrong_err_payload_type", prog, "ResultPayloadType")
+    expect_verifier_error("V04_wrong_err_payload_type", prog, "TypeMismatch")
 
 
 def v05_block_arg_arity():
@@ -427,54 +405,44 @@ def v11_return_type_mismatch():
     expect_verifier_error("V11_return_type_mismatch", prog, "TypeMismatch")
 
 
-def v12_cond_br_non_bool():
+def v12_sibling_block_ssa_use_without_block_arg():
+    # R3: Sibling block value used without block argument transport => REJECTED
     prog = {
-        "name": "V12_cond_br_non_bool",
+        "name": "V12_sibling_block_use",
         "entry_func": "main",
         "inputs": {},
         "module": {
             "name": "mod_v12",
             "functions": [{
                 "name": "main",
-                "params": [],
+                "params": [[1, make_type_bool()]],
                 "return_type": make_type_i64(),
                 "declared_effects": {"effects": []},
                 "entry": 0,
                 "blocks": {
                     "0": {
-                        "id": 0,
-                        "name": "entry",
-                        "params": [],
-                        "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "I64", "payload": 42}, "ty": make_type_i64()}}
-                        ],
-                        "terminator": {
-                            "CondBr": {
-                                "cond": 1,  # NON-BOOL CONDITION
-                                "true_target": 1,
-                                "true_args": [],
-                                "false_target": 1,
-                                "false_args": []
-                            }
-                        }
+                        "id": 0, "name": "entry", "params": [], "instructions": [],
+                        "terminator": {"CondBr": {"cond": 1, "true_target": 1, "true_args": [], "false_target": 2, "false_args": []}}
                     },
                     "1": {
-                        "id": 1,
-                        "name": "target",
-                        "params": [],
-                        "instructions": [],
-                        "terminator": {"Return": None}
+                        "id": 1, "name": "left", "params": [],
+                        "instructions": [{"Pure": {"dest": 2, "val": {"kind": "I64", "payload": 100}, "ty": make_type_i64()}}],
+                        "terminator": {"Return": 2}
+                    },
+                    "2": {
+                        "id": 2, "name": "right", "params": [], "instructions": [],
+                        "terminator": {"Return": 2}  # ILLEGAL USE OF VALUE 2 FROM SIBLING BLOCK 1!
                     }
                 }
             }]
         }
     }
-    expect_verifier_error("V12_cond_br_non_bool", prog, "TypeMismatch")
+    expect_verifier_error("V12_sibling_block_ssa_use_without_block_arg", prog, "SsaUseBeforeDef")
 
 
 if __name__ == "__main__":
     print("=" * 70)
-    print("SOMA COMPILER CONFORMANCE v0 (SLICE 1) — Negative Verifier Tests V01–V12")
+    print("SOMA COMPILER CONFORMANCE v0 (SLICE 1) — Negative Verifier Tests V01–V12 (R3)")
     v01_duplicate_ssa()
     v02_use_before_definition()
     v03_wrong_ok_payload_type()
@@ -486,7 +454,7 @@ if __name__ == "__main__":
     v09_missing_infer_effect()
     v10_type_mismatch_assign()
     v11_return_type_mismatch()
-    v12_cond_br_non_bool()
+    v12_sibling_block_ssa_use_without_block_arg()
 
     print("=" * 70)
     print(f"NEGATIVE VERIFIER RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")

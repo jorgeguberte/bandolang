@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use bando::{
     analysis::PathFactAnalyzer,
@@ -9,7 +9,7 @@ use bando::{
         facts::{Fact, FactArg, FactTemplate, LatentPostconditions},
         function::Function,
         module::Module,
-        ops::{Instruction, Terminator},
+        ops::{Instruction, Region, RegionTerminator, Terminator},
         types::Type,
         values::{BlockId, Value, ValueId},
     },
@@ -20,7 +20,6 @@ use bando::{
         interpreter::VmStatus,
         VmInterpreter,
     },
-    vm_ir::VmValueId,
     vm_verifier::VmVerifier,
 };
 
@@ -53,20 +52,9 @@ fn test_c01_pure_value() {
 }
 
 #[test]
-fn test_c02_read_ok_and_latent_facts() {
+fn test_c02_structured_match_result_and_lowering() {
     let mut func = Function::new("main", BlockId(0), Type::String);
     func.declared_effects = EffectRow::empty().with(Effect::Read("docs".to_string()));
-
-    let mut entry = Block::new(
-        BlockId(0),
-        Terminator::MatchResult {
-            result_val: ValueId(1),
-            ok_target: BlockId(1),
-            ok_arg: ValueId(2),
-            err_target: BlockId(2),
-            err_arg: ValueId(3),
-        },
-    );
 
     let latent = LatentPostconditions {
         on_ok: vec![FactTemplate {
@@ -75,6 +63,18 @@ fn test_c02_read_ok_and_latent_facts() {
         }],
         on_err: Vec::new(),
     };
+
+    // R1: High-level structured MatchResult with Region
+    let mut entry = Block::new(
+        BlockId(0),
+        Terminator::MatchResult {
+            result_val: ValueId(1),
+            ok_arg: ValueId(2),
+            ok_body: Region::new(RegionTerminator::Return(Some(ValueId(2)))),
+            err_arg: ValueId(3),
+            err_body: Region::new(RegionTerminator::Return(Some(ValueId(3)))),
+        },
+    );
 
     entry.instructions.push(Instruction::Read {
         dest: ValueId(1),
@@ -85,32 +85,28 @@ fn test_c02_read_ok_and_latent_facts() {
     });
     func.blocks.insert(BlockId(0), entry);
 
-    let mut b_ok = Block::new(BlockId(1), Terminator::Return(Some(ValueId(2))));
-    b_ok.params.push((ValueId(2), Type::String));
-    func.blocks.insert(BlockId(1), b_ok);
-
-    let mut b_err = Block::new(BlockId(2), Terminator::Return(Some(ValueId(3))));
-    b_err.params.push((ValueId(3), Type::String));
-    func.blocks.insert(BlockId(2), b_err);
-
     let mut module = Module::new("test_c02");
     module.functions.push(func);
 
     assert!(HighLevelVerifier::verify_module(&module).is_ok());
 
+    // R1: Lowering flattens structured regions into CFG blocks and SwitchResult
     let mut lowering = LoweringContext::new();
     let vm_module = lowering.lower_module(&module);
     assert!(VmVerifier::verify_module(&vm_module).is_ok());
 
+    // R2: Assert static effect-row preservation in VM function
+    let vm_func = &vm_module.functions[0];
+    assert!(vm_func.declared_effects.contains(&Effect::Read("docs".to_string())));
+
     let adapters = RuntimeAdapters::default();
-    let interp = VmInterpreter::new(&vm_module.functions[0], &adapters);
+    let interp = VmInterpreter::new(vm_func, &adapters);
     let state = interp.execute(BTreeMap::new(), 100);
 
     assert_eq!(state.status, VmStatus::Terminated);
     assert_eq!(state.return_value, Some(Value::String("data_of(docs)".to_string())));
     assert_eq!(state.observable_effects, vec!["read[docs]"]);
 
-    // Check that on_ok fact is active in state
     let expected_fact = Fact::new("ObservedAt", vec![FactArg::Symbol("v2".to_string()), FactArg::Literal("docs".to_string())]);
     assert!(state.active_facts.contains(&expected_fact));
 }
@@ -134,10 +130,10 @@ fn test_c05_c06_diamond_must_fact_merge() {
         BlockId(0),
         Terminator::MatchResult {
             result_val: ValueId(1),
-            ok_target: BlockId(1),
             ok_arg: ValueId(2),
-            err_target: BlockId(2),
+            ok_body: Region::new(RegionTerminator::Br { target: BlockId(3), args: vec![ValueId(2)] }),
             err_arg: ValueId(3),
+            err_body: Region::new(RegionTerminator::Br { target: BlockId(3), args: vec![ValueId(3)] }),
         },
     );
     entry.instructions.push(Instruction::Read {
@@ -148,14 +144,6 @@ fn test_c05_c06_diamond_must_fact_merge() {
         latent,
     });
     func.blocks.insert(BlockId(0), entry);
-
-    let mut b_ok = Block::new(BlockId(1), Terminator::Br { target: BlockId(3), args: vec![ValueId(2)] });
-    b_ok.params.push((ValueId(2), Type::String));
-    func.blocks.insert(BlockId(1), b_ok);
-
-    let mut b_err = Block::new(BlockId(2), Terminator::Br { target: BlockId(3), args: vec![ValueId(3)] });
-    b_err.params.push((ValueId(3), Type::String));
-    func.blocks.insert(BlockId(2), b_err);
 
     let mut b_merge = Block::new(BlockId(3), Terminator::Return(Some(ValueId(4))));
     b_merge.params.push((ValueId(4), Type::String));
@@ -173,18 +161,48 @@ fn test_c05_c06_diamond_must_fact_merge() {
     let analysis = PathFactAnalyzer::new(&vm_module.functions[0]).analyze();
     let merge_facts = analysis.block_in_facts.get(&bando::vm_ir::VmBlockId(3)).unwrap();
 
-    // CommonFact MUST survive merge
     let common_fact = Fact::new("CommonFact", vec![FactArg::Literal("doc".to_string())]);
     assert!(merge_facts.contains(&common_fact));
-
-    // ExclusiveOk MUST be discarded on merge
     assert!(!merge_facts.iter().any(|f| f.predicate == "ExclusiveOk"));
+}
+
+#[test]
+fn test_r3_ssa_dominance_and_scope_visibility() {
+    // Dominating entry value used in downstream block => ACCEPTED
+    let mut func_ok = Function::new("ok", BlockId(0), Type::I64);
+    let mut b0 = Block::new(BlockId(0), Terminator::Br { target: BlockId(1), args: vec![] });
+    b0.instructions.push(Instruction::Pure { dest: ValueId(1), val: Value::I64(10), ty: Type::I64 });
+    func_ok.blocks.insert(BlockId(0), b0);
+
+    let mut b1 = Block::new(BlockId(1), Terminator::Return(Some(ValueId(1)))); // Value 1 from dominating b0
+    func_ok.blocks.insert(BlockId(1), b1);
+
+    let mut mod_ok = Module::new("m_ok");
+    mod_ok.functions.push(func_ok);
+    assert!(HighLevelVerifier::verify_module(&mod_ok).is_ok());
+
+    // Sibling block value used without block argument => REJECTED
+    let mut func_bad = Function::new("bad", BlockId(0), Type::I64);
+    let b_entry = Block::new(BlockId(0), Terminator::CondBr { cond: ValueId(1), true_target: BlockId(1), true_args: vec![], false_target: BlockId(2), false_args: vec![] });
+    func_bad.params.push((ValueId(1), Type::Bool));
+    func_bad.blocks.insert(BlockId(0), b_entry);
+
+    let mut b_left = Block::new(BlockId(1), Terminator::Return(Some(ValueId(2))));
+    b_left.instructions.push(Instruction::Pure { dest: ValueId(2), val: Value::I64(100), ty: Type::I64 });
+    func_bad.blocks.insert(BlockId(1), b_left);
+
+    let mut b_right = Block::new(BlockId(2), Terminator::Return(Some(ValueId(2)))); // Value 2 defined in sibling block 1!
+    func_bad.blocks.insert(BlockId(2), b_right);
+
+    let mut mod_bad = Module::new("m_bad");
+    mod_bad.functions.push(func_bad);
+    let diags = HighLevelVerifier::verify_module(&mod_bad).unwrap_err();
+    assert!(diags.iter().any(|d| d.code == DiagnosticCode::SsaUseBeforeDef));
 }
 
 #[test]
 fn test_negative_verifier_undeclared_effect() {
     let mut func = Function::new("main", BlockId(0), Type::String);
-    // undeclared effect! declared_effects is empty
     let mut entry = Block::new(BlockId(0), Terminator::Return(None));
     entry.instructions.push(Instruction::Read {
         dest: ValueId(1),

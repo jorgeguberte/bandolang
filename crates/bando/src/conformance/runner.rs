@@ -29,8 +29,8 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
         };
     }
 
-    // 2. Lowering
-    let mut lowering = LoweringContext::new();
+    // 2. Lowering (with mutation configuration if any)
+    let mut lowering = LoweringContext::with_mutations(prog.mutations.clone());
     let vm_module = lowering.lower_module(&prog.module);
 
     // 3. VM Verifier
@@ -89,7 +89,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
     }
 
     // 7. Interpret
-    let interpreter = VmInterpreter::new(func, &adapters);
+    let interpreter = VmInterpreter::with_mutations(func, &adapters, prog.mutations.clone());
     let state = interpreter.execute(vm_inputs, 1000);
 
     let status_str = match state.status {

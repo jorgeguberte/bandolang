@@ -2,6 +2,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::ir::{
+    effects::{Effect, EffectRow},
     facts::LatentPostconditions,
     types::Type,
     values::Value as VmValue,
@@ -48,6 +49,15 @@ impl VmInstruction {
             VmInstruction::VmRead { dest, .. } => *dest,
             VmInstruction::VmInfer { dest, .. } => *dest,
             VmInstruction::VmAssign { dest, .. } => *dest,
+        }
+    }
+
+    pub fn required_effects(&self) -> Vec<Effect> {
+        match self {
+            VmInstruction::VmPure { .. } => Vec::new(),
+            VmInstruction::VmRead { domain, .. } => vec![Effect::Read(domain.clone())],
+            VmInstruction::VmInfer { .. } => vec![Effect::Infer],
+            VmInstruction::VmAssign { .. } => Vec::new(),
         }
     }
 }
@@ -102,6 +112,7 @@ pub struct VmFunction {
     pub name: String,
     pub params: Vec<(VmValueId, Type)>,
     pub return_type: Type,
+    pub declared_effects: EffectRow, // R2: Preserved effect row in VM IR
     pub entry: VmBlockId,
     pub blocks: BTreeMap<VmBlockId, VmBlock>,
 }
@@ -112,6 +123,7 @@ impl VmFunction {
             name: name.into(),
             params: Vec::new(),
             return_type,
+            declared_effects: EffectRow::empty(),
             entry,
             blocks: BTreeMap::new(),
         }

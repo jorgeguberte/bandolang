@@ -1,6 +1,7 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
+    analysis::DominanceTree,
     diagnostics::{Diagnostic, DiagnosticCode},
     ir::types::Type,
     vm_ir::{VmBlockId, VmFunction, VmInstruction, VmModule, VmTerminator, VmValueId},
@@ -9,7 +10,8 @@ use crate::{
 pub struct VmVerifier<'a> {
     func: &'a VmFunction,
     diagnostics: Vec<Diagnostic>,
-    defined_values: BTreeMap<VmValueId, Type>,
+    all_defined_values: BTreeMap<VmValueId, Type>,
+    block_definitions: BTreeMap<VmBlockId, Vec<VmValueId>>,
 }
 
 impl<'a> VmVerifier<'a> {
@@ -17,7 +19,8 @@ impl<'a> VmVerifier<'a> {
         Self {
             func,
             diagnostics: Vec::new(),
-            defined_values: BTreeMap::new(),
+            all_defined_values: BTreeMap::new(),
+            block_definitions: BTreeMap::new(),
         }
     }
 
@@ -37,10 +40,12 @@ impl<'a> VmVerifier<'a> {
     }
 
     pub fn verify(&mut self) -> Result<(), Vec<Diagnostic>> {
+        // 1. Check duplicate definitions for function params
         for (param_id, param_type) in &self.func.params {
-            self.define_value(*param_id, param_type.clone());
+            self.register_def(*param_id, param_type.clone());
         }
 
+        // 2. Validate entry block existence
         if !self.func.blocks.contains_key(&self.func.entry) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::CfgBadTarget,
@@ -48,16 +53,68 @@ impl<'a> VmVerifier<'a> {
             ));
         }
 
+        // 3. Register definitions across all blocks
         for (block_id, block) in &self.func.blocks {
+            let mut block_defs = Vec::new();
             for (param_id, param_type) in &block.params {
-                self.define_value(*param_id, param_type.clone());
+                self.register_def(*param_id, param_type.clone());
+                block_defs.push(*param_id);
             }
 
             for inst in &block.instructions {
-                self.verify_instruction(inst);
+                let dest = inst.dest();
+                let ty = match inst {
+                    VmInstruction::VmPure { ty, .. } => ty.clone(),
+                    VmInstruction::VmRead { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
+                    VmInstruction::VmInfer { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
+                    VmInstruction::VmAssign { ty, .. } => ty.clone(),
+                };
+                self.register_def(dest, ty);
+                block_defs.push(dest);
             }
 
-            self.verify_terminator(&block.terminator, *block_id);
+            self.block_definitions.insert(*block_id, block_defs);
+        }
+
+        // 4. Compute dominance tree (R3)
+        let block_ids: Vec<VmBlockId> = self.func.blocks.keys().copied().collect();
+        let dom_tree = DominanceTree::compute(self.func.entry, &block_ids, |b| self.find_predecessors(b));
+
+        // 5. Verify instructions & terminators with SSA dominance / visibility
+        for (block_id, block) in &self.func.blocks {
+            let mut visible_values = BTreeSet::new();
+
+            // Function params are visible
+            for (p_id, _) in &self.func.params {
+                visible_values.insert(*p_id);
+            }
+
+            // Definitions from strictly dominating blocks are visible
+            if let Some(doms) = dom_tree.dominators.get(block_id) {
+                for &dom_block in doms {
+                    if dom_block != *block_id {
+                        if let Some(defs) = self.block_definitions.get(&dom_block) {
+                            for d in defs {
+                                visible_values.insert(*d);
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Block params are visible
+            for (p_id, _) in &block.params {
+                visible_values.insert(*p_id);
+            }
+
+            // Verify instructions
+            for inst in &block.instructions {
+                self.verify_instruction(inst, &visible_values);
+                visible_values.insert(inst.dest());
+            }
+
+            // Verify terminator
+            self.verify_terminator(&block.terminator, *block_id, &visible_values);
         }
 
         if self.diagnostics.is_empty() {
@@ -67,59 +124,68 @@ impl<'a> VmVerifier<'a> {
         }
     }
 
-    fn define_value(&mut self, val_id: VmValueId, ty: Type) {
-        if self.defined_values.contains_key(&val_id) {
+    fn find_predecessors(&self, target: VmBlockId) -> Vec<VmBlockId> {
+        let mut preds = Vec::new();
+        for (b_id, b) in &self.func.blocks {
+            match &b.terminator {
+                VmTerminator::Br { target: t, .. } => {
+                    if t == &target {
+                        preds.push(*b_id);
+                    }
+                }
+                VmTerminator::CondBr { true_target, false_target, .. } => {
+                    if true_target == &target || false_target == &target {
+                        preds.push(*b_id);
+                    }
+                }
+                VmTerminator::SwitchResult { ok_target, err_target, .. } => {
+                    if ok_target == &target || err_target == &target {
+                        preds.push(*b_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+        preds
+    }
+
+    fn register_def(&mut self, val_id: VmValueId, ty: Type) {
+        if self.all_defined_values.contains_key(&val_id) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::SsaDuplicateDef,
                 format!("Duplicate VM SSA definition of value {:?}", val_id),
             ));
         } else {
-            self.defined_values.insert(val_id, ty);
+            self.all_defined_values.insert(val_id, ty);
         }
     }
 
-    fn get_type(&self, val_id: VmValueId) -> Option<Type> {
-        self.defined_values.get(&val_id).cloned()
-    }
-
-    fn require_defined(&mut self, val_id: VmValueId) -> Option<Type> {
-        if let Some(ty) = self.get_type(val_id) {
-            Some(ty)
-        } else {
+    fn check_visible(&mut self, val_id: VmValueId, visible: &BTreeSet<VmValueId>) -> Option<Type> {
+        if !visible.contains(&val_id) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::SsaUseBeforeDef,
-                format!("Use of undefined VM SSA value {:?}", val_id),
+                format!("Use of VM SSA value {:?} outside its dominating scope", val_id),
             ));
-            None
+            return None;
         }
+        self.all_defined_values.get(&val_id).cloned()
     }
 
-    fn verify_instruction(&mut self, inst: &VmInstruction) {
+    fn verify_instruction(&mut self, inst: &VmInstruction, visible: &BTreeSet<VmValueId>) {
+        // R2: Verify required_effects against declared_effects
+        for eff in inst.required_effects() {
+            if !self.func.declared_effects.contains(&eff) {
+                self.diagnostics.push(Diagnostic::error(
+                    DiagnosticCode::EffectUndeclared,
+                    format!("VM Instruction requires effect {:?} not declared in function effects {:?}", eff, self.func.declared_effects),
+                ));
+            }
+        }
+
         match inst {
-            VmInstruction::VmPure { dest, ty, .. } => {
-                self.define_value(*dest, ty.clone());
-            }
-            VmInstruction::VmRead {
-                dest,
-                ok_type,
-                err_type,
-                ..
-            } => {
-                let res_ty = Type::result(ok_type.clone(), err_type.clone());
-                self.define_value(*dest, res_ty);
-            }
-            VmInstruction::VmInfer {
-                dest,
-                prompt: _,
-                ok_type,
-                err_type,
-                latent: _,
-            } => {
-                let res_ty = Type::result(ok_type.clone(), err_type.clone());
-                self.define_value(*dest, res_ty);
-            }
-            VmInstruction::VmAssign { dest, source, ty } => {
-                if let Some(src_ty) = self.require_defined(*source) {
+            VmInstruction::VmPure { .. } | VmInstruction::VmRead { .. } | VmInstruction::VmInfer { .. } => {}
+            VmInstruction::VmAssign { source, ty, .. } => {
+                if let Some(src_ty) = self.check_visible(*source, visible) {
                     if &src_ty != ty {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::TypeMismatch,
@@ -127,16 +193,15 @@ impl<'a> VmVerifier<'a> {
                         ));
                     }
                 }
-                self.define_value(*dest, ty.clone());
             }
         }
     }
 
-    fn verify_terminator(&mut self, term: &VmTerminator, _current_block: VmBlockId) {
+    fn verify_terminator(&mut self, term: &VmTerminator, _current_block: VmBlockId, visible: &BTreeSet<VmValueId>) {
         match term {
             VmTerminator::Return(val_opt) => {
                 if let Some(val_id) = val_opt {
-                    if let Some(val_ty) = self.require_defined(*val_id) {
+                    if let Some(val_ty) = self.check_visible(*val_id, visible) {
                         if val_ty != self.func.return_type {
                             self.diagnostics.push(Diagnostic::error(
                                 DiagnosticCode::TypeMismatch,
@@ -152,7 +217,7 @@ impl<'a> VmVerifier<'a> {
                 }
             }
             VmTerminator::Br { target, args } => {
-                self.verify_branch_target(*target, args);
+                self.verify_branch_target(*target, args, visible);
             }
             VmTerminator::CondBr {
                 cond,
@@ -161,7 +226,7 @@ impl<'a> VmVerifier<'a> {
                 false_target,
                 false_args,
             } => {
-                if let Some(cond_ty) = self.require_defined(*cond) {
+                if let Some(cond_ty) = self.check_visible(*cond, visible) {
                     if cond_ty != Type::Bool {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::TypeMismatch,
@@ -169,8 +234,8 @@ impl<'a> VmVerifier<'a> {
                         ));
                     }
                 }
-                self.verify_branch_target(*true_target, true_args);
-                self.verify_branch_target(*false_target, false_args);
+                self.verify_branch_target(*true_target, true_args, visible);
+                self.verify_branch_target(*false_target, false_args, visible);
             }
             VmTerminator::SwitchResult {
                 result_val,
@@ -179,13 +244,11 @@ impl<'a> VmVerifier<'a> {
                 err_target,
                 err_arg,
             } => {
-                if let Some(res_ty) = self.require_defined(*result_val) {
+                if let Some(res_ty) = self.check_visible(*result_val, visible) {
                     match res_ty {
                         Type::Result { ok, err } => {
-                            let ok_t = *ok;
-                            let err_t = *err;
-                            self.verify_match_branch(*ok_target, *ok_arg, &ok_t);
-                            self.verify_match_branch(*err_target, *err_arg, &err_t);
+                            self.verify_match_branch(*ok_target, *ok_arg, &ok);
+                            self.verify_match_branch(*err_target, *err_arg, &err);
                         }
                         other => {
                             self.diagnostics.push(Diagnostic::error(
@@ -200,7 +263,7 @@ impl<'a> VmVerifier<'a> {
         }
     }
 
-    fn verify_branch_target(&mut self, target: VmBlockId, args: &[VmValueId]) {
+    fn verify_branch_target(&mut self, target: VmBlockId, args: &[VmValueId], visible: &BTreeSet<VmValueId>) {
         let block = if let Some(b) = self.func.blocks.get(&target) {
             b
         } else {
@@ -221,7 +284,7 @@ impl<'a> VmVerifier<'a> {
 
         let expected_types: Vec<_> = block.params.iter().map(|(_, t)| t.clone()).collect();
         for (i, (arg_id, expected_ty)) in args.iter().zip(expected_types.iter()).enumerate() {
-            if let Some(arg_ty) = self.require_defined(*arg_id) {
+            if let Some(arg_ty) = self.check_visible(*arg_id, visible) {
                 if &arg_ty != expected_ty {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::BlockArgType,

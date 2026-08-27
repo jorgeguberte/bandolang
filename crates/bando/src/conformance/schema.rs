@@ -20,6 +20,8 @@ pub struct ConformanceProgramV0 {
     pub read_errors: BTreeMap<String, String>,
     #[serde(default)]
     pub infer_errors: BTreeMap<String, String>,
+    #[serde(default)]
+    pub mutations: crate::lowering::CompilerMutations,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

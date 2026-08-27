@@ -2,6 +2,7 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 use crate::{
     ir::facts::{Fact, FactArg, LatentPostconditions},
+    lowering::CompilerMutations,
     vm_ir::{VmBlockId, VmFunction, VmInstruction, VmTerminator, VmValueId},
 };
 
@@ -14,11 +15,19 @@ pub struct AnalysisResult {
 
 pub struct PathFactAnalyzer<'a> {
     func: &'a VmFunction,
+    mutations: CompilerMutations,
 }
 
 impl<'a> PathFactAnalyzer<'a> {
     pub fn new(func: &'a VmFunction) -> Self {
-        Self { func }
+        Self {
+            func,
+            mutations: CompilerMutations::default(),
+        }
+    }
+
+    pub fn with_mutations(func: &'a VmFunction, mutations: CompilerMutations) -> Self {
+        Self { func, mutations }
     }
 
     pub fn analyze(&self) -> AnalysisResult {
@@ -49,7 +58,16 @@ impl<'a> PathFactAnalyzer<'a> {
         let mut edge_facts: BTreeMap<(VmBlockId, VmBlockId), BTreeSet<Fact>> = BTreeMap::new();
 
         for block_id in self.func.blocks.keys() {
-            block_in_facts.insert(*block_id, BTreeSet::new());
+            let mut init_facts = BTreeSet::new();
+            // Mutation M05: Eagerly discharge on_ok into entry block
+            if self.mutations.m05_eager_on_ok_materialization && *block_id == self.func.entry {
+                for latent in var_latent.values() {
+                    for f in latent.instantiate_ok("v_eager") {
+                        init_facts.insert(f);
+                    }
+                }
+            }
+            block_in_facts.insert(*block_id, init_facts);
             block_out_facts.insert(*block_id, BTreeSet::new());
         }
 
@@ -59,6 +77,11 @@ impl<'a> PathFactAnalyzer<'a> {
         worklist.push_back(self.func.entry);
 
         while let Some(curr_id) = worklist.pop_front() {
+            // Mutation M10: Single pass loop analysis (skip if already visited)
+            if self.mutations.m10_single_pass_loop_analysis && visited.contains(&curr_id) {
+                continue;
+            }
+
             let block = if let Some(b) = self.func.blocks.get(&curr_id) {
                 b
             } else {
@@ -74,7 +97,6 @@ impl<'a> PathFactAnalyzer<'a> {
             for (succ_id, facts_on_edge) in succ_edges {
                 edge_facts.insert((curr_id, succ_id), facts_on_edge);
 
-                // Recompute Ψ_in(succ) as intersection of all active incoming edges
                 let incoming_facts: Vec<BTreeSet<Fact>> = self
                     .find_predecessors(succ_id)
                     .into_iter()
@@ -83,6 +105,13 @@ impl<'a> PathFactAnalyzer<'a> {
 
                 let new_succ_in = if incoming_facts.is_empty() {
                     BTreeSet::new()
+                } else if self.mutations.m06_merge_union_facts {
+                    // Mutation M06: Union instead of intersection at merge
+                    let mut union_set = BTreeSet::new();
+                    for next_set in &incoming_facts {
+                        union_set.extend(next_set.iter().cloned());
+                    }
+                    union_set
                 } else {
                     let mut intersection = incoming_facts[0].clone();
                     for next_set in &incoming_facts[1..] {

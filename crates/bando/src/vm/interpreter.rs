@@ -35,11 +35,24 @@ pub struct VmExecutionState {
 pub struct VmInterpreter<'a> {
     func: &'a VmFunction,
     adapters: &'a RuntimeAdapters,
+    mutations: crate::lowering::CompilerMutations,
 }
 
 impl<'a> VmInterpreter<'a> {
     pub fn new(func: &'a VmFunction, adapters: &'a RuntimeAdapters) -> Self {
-        Self { func, adapters }
+        Self {
+            func,
+            adapters,
+            mutations: crate::lowering::CompilerMutations::default(),
+        }
+    }
+
+    pub fn with_mutations(
+        func: &'a VmFunction,
+        adapters: &'a RuntimeAdapters,
+        mutations: crate::lowering::CompilerMutations,
+    ) -> Self {
+        Self { func, adapters, mutations }
     }
 
     pub fn execute(&self, inputs: BTreeMap<VmValueId, VmValue>, max_steps: usize) -> VmExecutionState {
@@ -64,7 +77,7 @@ impl<'a> VmInterpreter<'a> {
         }
 
         // Run static path fact analysis to compute fixed point facts for blocks
-        let analysis = PathFactAnalyzer::new(self.func).analyze();
+        let analysis = PathFactAnalyzer::with_mutations(self.func, self.mutations.clone()).analyze();
 
         let mut steps = 0;
         while state.status == VmStatus::Running && steps < max_steps {
