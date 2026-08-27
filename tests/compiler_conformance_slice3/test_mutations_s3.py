@@ -935,9 +935,10 @@ def s3m19_internalize_uses_runtime_authority():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "x"}}, "ty": make_type_claim(make_type_string())}},
+                            {"Pure": {"dest": 10, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
                             {"Internalize": {"dest": 2, "policy_id": "p", "claim": 1}}
                         ],
-                        "terminator": {"Return": 1}
+                        "terminator": {"Return": 10}
                     }
                 }
             }]
@@ -947,9 +948,9 @@ def s3m19_internalize_uses_runtime_authority():
     mutant["mutations"] = {"s3m19_internalize_uses_runtime_authority": True}
 
     def check(base, mut):
-        if base["status"] == "verifier_error":
-            return True, "baseline required caller authority for internalization validation, rejecting runtime rescue"
-        return False, "caller authority bypassed"
+        if base["status"] == "verifier_error" and mut["status"] == "ok":
+            return True, "baseline required caller authority for internalization validation, mutant accepted due to runtime authority rescue"
+        return False, f"base={base['status']}, mut={mut['status']}"
 
     run_mutation_kill("S3M19_internalize_uses_runtime_authority", prog, mutant, check)
 
