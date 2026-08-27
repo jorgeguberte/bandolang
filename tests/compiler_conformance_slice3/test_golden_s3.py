@@ -585,7 +585,11 @@ def s3c13_nested_budget_conservation():
         "name": "S3C13_nested_budget", "entry_func": "main", "inputs": {},
         "initial_budget": {"compute": 100},
         "child_scenarios": {
-            "parent_intent": {"mode": "success", "spend_amount": 10}
+            "parent_intent": {
+                "mode": "nested_delegation",
+                "spend_amount": 5,
+                "nested_grandchild_spend": 7
+            }
         },
         "registry": {
             "agents": {"w": {"agent_id": "w", "native_authority": [{"Read": "x"}]}},
@@ -610,7 +614,7 @@ def s3c13_nested_budget_conservation():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
-                            {"Delegate": {"dest": 2, "intent_id": "parent_intent", "args": [], "requested_effects": [{"Read": "x"}], "authority_grant": [], "budget_grant": 50}},
+                            {"Delegate": {"dest": 2, "intent_id": "parent_intent", "args": [], "requested_effects": [{"Read": "x"}], "authority_grant": [], "budget_grant": 40}},
                             {"Await": {"dest": 3, "handle": 2}}
                         ],
                         "terminator": {"Return": 1}
@@ -757,6 +761,9 @@ def s3c16_settlement_unknown():
 def s3c17_resume_after_settlement():
     prog = {
         "name": "S3C17_resume_after_settlement", "entry_func": "main", "inputs": {},
+        "child_scenarios": {
+            "fetch": {"mode": "settlement_unknown", "auto_resume_settlement": True}
+        },
         "registry": {
             "agents": {"w": {"agent_id": "w", "native_authority": [{"Read": "data"}]}},
             "intents": {
@@ -789,7 +796,7 @@ def s3c17_resume_after_settlement():
             }]
         }
     }
-    run_golden("S3C17_resume_after_settlement", prog, expected_child_events=["AwaitResumed(h_1)"])
+    run_golden("S3C17_resume_after_settlement", prog, expected_child_events=["AwaitSuspended(h_1)", "Settled(h_1)", "AwaitResumed(h_1)"])
 
 def s3c18_await_twice():
     prog = {
@@ -870,29 +877,34 @@ def s3c20_late_response_after_cancellation():
     prog = {
         "name": "S3C20_late_response", "entry_func": "main",
         "current_agent_id": "agent_current",
-        "inputs": {
-            "v2": {
-                "kind": "ChildHandle",
-                "payload": {
-                    "handle_id": "h_stale", "child_id": "c_stale", "parent_id": "agent_current",
-                    "generation_token": "stale", "effects": {"effects": []}, "settlement_state": "Settled"
-                }
-            }
+        "inputs": {},
+        "child_scenarios": {
+            "fetch": {"mode": "external_effect_then_cancelled"}
         },
         "registry": {
-            "caller_authority": {"effects": []}
+            "agents": {"w": {"agent_id": "w", "native_authority": [{"Act": "database"}]}},
+            "intents": {
+                "fetch": {
+                    "intent_id": "fetch", "target_agent_id": "w",
+                    "input_types": [], "output_type": make_type_string(), "error_type": make_type_string(),
+                    "child_effects": {"effects": [{"Act": "database"}]},
+                    "exported_envelope": {"effects": [{"Act": "database"}]},
+                    "declared_envelope": {"effects": [{"Act": "database"}]},
+                    "authority_policy": "AllowNative"
+                }
+            },
+            "caller_authority": {"effects": [{"Act": "database"}]}
         },
         "module": {
             "name": "m", "functions": [{
-                "name": "main", "params": [
-                    [2, make_type_child_handle(make_type_string(), make_type_string(), [])]
-                ], "return_type": make_type_string(),
-                "declared_effects": {"effects": []}, "entry": 0,
+                "name": "main", "params": [], "return_type": make_type_string(),
+                "declared_effects": {"effects": [{"Act": "database"}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
+                            {"Delegate": {"dest": 2, "intent_id": "fetch", "args": [], "requested_effects": [{"Act": "database"}], "authority_grant": [], "budget_grant": 10}},
                             {"Await": {"dest": 3, "handle": 2}}
                         ],
                         "terminator": {"Return": 1}
@@ -901,7 +913,7 @@ def s3c20_late_response_after_cancellation():
             }]
         }
     }
-    run_golden("S3C20_late_response", prog, expected_status="error: StaleGenerationHandle")
+    run_golden("S3C20_late_response", prog, expected_status="error: StaleGenerationHandle", expected_child_events=["Cancelled(child_w_1)", "LateResponseRejected(h_1)"])
 
 # ==============================================================================
 # S3C21–S3C25: Handle Joins in CFG & Effect Unions & Provenance
@@ -1100,39 +1112,70 @@ def s3c23_handle_type_mismatch():
     run_golden("S3C23_handle_type_mismatch", prog, expected_status="verifier_error", expected_diag="IncompatibleHandleJoin")
 
 def s3c24_join_does_not_invent_provenance():
-    # Merged type carries union effects; no concrete result provenance until await
+    # Merged type carries exact union effects; no concrete result provenance until await
     prog = {
-        "name": "S3C24_no_invented_provenance", "entry_func": "main", "inputs": {},
+        "name": "S3C24_no_invented_provenance", "entry_func": "main",
+        "inputs": {"cond": {"kind": "Bool", "payload": True}},
         "registry": {
-            "agents": {"w": {"agent_id": "w", "native_authority": [{"Read": "data"}]}},
+            "agents": {
+                "w1": {"agent_id": "w1", "native_authority": [{"Read": "data"}]},
+                "w2": {"agent_id": "w2", "native_authority": [{"Infer": None}]}
+            },
             "intents": {
-                "fetch": {
-                    "intent_id": "fetch", "target_agent_id": "w",
+                "fetch1": {
+                    "intent_id": "fetch1", "target_agent_id": "w1",
                     "input_types": [], "output_type": make_type_string(), "error_type": make_type_string(),
                     "child_effects": {"effects": [{"Read": "data"}]},
                     "exported_envelope": {"effects": [{"Read": "data"}]},
                     "declared_envelope": {"effects": [{"Read": "data"}]},
                     "authority_policy": "AllowNative"
+                },
+                "fetch2": {
+                    "intent_id": "fetch2", "target_agent_id": "w2",
+                    "input_types": [], "output_type": make_type_string(), "error_type": make_type_string(),
+                    "child_effects": {"effects": [{"Infer": None}]},
+                    "exported_envelope": {"effects": [{"Infer": None}]},
+                    "declared_envelope": {"effects": [{"Infer": None}]},
+                    "authority_policy": "AllowNative"
                 }
             },
-            "caller_authority": {"effects": [{"Read": "data"}]}
+            "caller_authority": {"effects": [{"Read": "data"}, {"Infer": None}]}
         },
         "module": {
             "name": "m", "functions": [{
-                "name": "main", "params": [], "return_type": make_type_string(),
-                "declared_effects": {"effects": [{"Read": "data"}]}, "entry": 0,
+                "name": "main", "params": [[10, make_type_bool()]], "return_type": make_type_string(),
+                "declared_effects": {"effects": [{"Read": "data"}, {"Infer": None}]}, "entry": 0,
                 "blocks": {
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
-                            {"Delegate": {"dest": 2, "intent_id": "fetch", "args": [], "requested_effects": [{"Read": "data"}], "authority_grant": [], "budget_grant": 10}}
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}}
                         ],
-                        "terminator": {"Br": {"target": 1, "args": [2]}}
+                        "terminator": {
+                            "CondBr": {
+                                "cond": 10,
+                                "true_target": 1, "true_args": [],
+                                "false_target": 2, "false_args": []
+                            }
+                        }
                     },
                     "1": {
-                        "id": 1, "params": [
-                            [3, make_type_child_handle(make_type_string(), make_type_string(), [{"Read": "data"}, {"Infer": None}])]
+                        "id": 1, "params": [],
+                        "instructions": [
+                            {"Delegate": {"dest": 2, "intent_id": "fetch1", "args": [], "requested_effects": [{"Read": "data"}], "authority_grant": [], "budget_grant": 10}}
+                        ],
+                        "terminator": {"Br": {"target": 3, "args": [2]}}
+                    },
+                    "2": {
+                        "id": 2, "params": [],
+                        "instructions": [
+                            {"Delegate": {"dest": 3, "intent_id": "fetch2", "args": [], "requested_effects": [{"Infer": None}], "authority_grant": [], "budget_grant": 10}}
+                        ],
+                        "terminator": {"Br": {"target": 3, "args": [3]}}
+                    },
+                    "3": {
+                        "id": 3, "params": [
+                            [4, make_type_child_handle(make_type_string(), make_type_string(), [{"Read": "data"}, {"Infer": None}])]
                         ],
                         "instructions": [],
                         "terminator": {"Return": 1}
@@ -1308,8 +1351,8 @@ def s3c28_internalize_deferred_fails():
             "internalization_policies": {
                 "p_audit": {
                     "policy_id": "p_audit",
-                    "accepted_claim_contract": {"AcceptSubjectLiteral": "approved_doc"},
-                    "validation_requirements": ["CheckSubjectLiteral"],
+                    "accepted_claim_contract": "AcceptAll",
+                    "validation_requirements": ["CheckDocApproved"],
                     "validation_effect_envelope": {"effects": [{"Read": "policy_db"}]}
                 }
             },
@@ -1379,7 +1422,14 @@ def s3c30_internalize_uncovered():
     prog = {
         "name": "S3C30_internalize_uncovered", "entry_func": "main", "inputs": {},
         "registry": {
-            "internalization_policies": {}, # policy not registered
+            "internalization_policies": {
+                "p_pred": {
+                    "policy_id": "p_pred",
+                    "accepted_claim_contract": {"AcceptSubjectLiteral": "approved_doc"},
+                    "validation_requirements": [],
+                    "validation_effect_envelope": {"effects": []}
+                }
+            },
             "caller_authority": {"effects": []}
         },
         "module": {
@@ -1390,9 +1440,9 @@ def s3c30_internalize_uncovered():
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "data"}, "ty": make_type_string()}},
-                            {"Pure": {"dest": 2, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "data"}}, "ty": make_type_claim(make_type_string())}},
-                            {"Internalize": {"dest": 3, "policy_id": "unregistered_policy", "claim": 2}}
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "uncovered_doc"}, "ty": make_type_string()}},
+                            {"Pure": {"dest": 2, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "uncovered_doc"}}, "ty": make_type_claim(make_type_string())}},
+                            {"Internalize": {"dest": 3, "policy_id": "p_pred", "claim": 2}}
                         ],
                         "terminator": {"Return": 1}
                     }
@@ -1400,7 +1450,7 @@ def s3c30_internalize_uncovered():
             }]
         }
     }
-    run_golden("S3C30_internalize_uncovered", prog, expected_status="verifier_error", expected_diag="UnknownInternalizationPolicy")
+    run_golden("S3C30_internalize_uncovered", prog, expected_status="verifier_error", expected_diag="UncoveredRequirement")
 
 def s3c31_internalize_authority_fail_closed():
     # Function declared effects has read[policy_db], but CallerAuthority lacks it -> rejected!

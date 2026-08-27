@@ -238,7 +238,7 @@ def s3m05_granted_authority_unattenuated():
                     "authority_policy": "AllowGrant"
                 }
             },
-            "caller_authority": {"effects": [{"Read": "a"}, {"Act": "workspace"}]}
+            "caller_authority": {"effects": [{"Read": "a"}]} # Caller lacks act[workspace]!
         },
         "module": {
             "name": "m", "functions": [{
@@ -249,7 +249,7 @@ def s3m05_granted_authority_unattenuated():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
-                            {"Delegate": {"dest": 2, "intent_id": "intent", "args": [], "requested_effects": [{"Read": "a"}], "authority_grant": [{"Read": "a"}], "budget_grant": 0}}
+                            {"Delegate": {"dest": 2, "intent_id": "intent", "args": [], "requested_effects": [{"Read": "a"}, {"Act": "workspace"}], "authority_grant": [{"Act": "workspace"}], "budget_grant": 0}}
                         ],
                         "terminator": {"Return": 1}
                     }
@@ -261,8 +261,9 @@ def s3m05_granted_authority_unattenuated():
     mutant["mutations"] = {"s3m05_granted_authority_unattenuated": True}
 
     def check(base, mut):
-        b_auth = base.get("child_effective_authority", {}).get("h_1", [])
-        return True, "granted authority verified"
+        if base["status"] == "verifier_error" and mut["status"] == "ok":
+            return True, "baseline rejected grant exceeding caller authority, mutant bypassed check"
+        return False, f"base={base['status']}, mut={mut['status']}"
 
     run_mutation_kill("S3M05_granted_authority_unattenuated", prog, mutant, check)
 
@@ -913,8 +914,8 @@ def s3m20_failed_validation_constructs_belief():
         "registry": {
             "internalization_policies": {
                 "p": {
-                    "policy_id": "p", "accepted_claim_contract": {"AcceptSubjectLiteral": "valid_literal"},
-                    "validation_requirements": ["CheckSubjectLiteral"], "validation_effect_envelope": {"effects": []}
+                    "policy_id": "p", "accepted_claim_contract": "AcceptAll",
+                    "validation_requirements": ["CheckDocApproved"], "validation_effect_envelope": {"effects": []}
                 }
             },
             "caller_authority": {"effects": []}
@@ -928,7 +929,7 @@ def s3m20_failed_validation_constructs_belief():
                         "id": 0, "params": [],
                         "instructions": [
                             {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "ok"}, "ty": make_type_string()}},
-                            {"Pure": {"dest": 2, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "invalid_literal"}}, "ty": make_type_claim(make_type_string())}},
+                            {"Pure": {"dest": 2, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "unapproved_doc"}}, "ty": make_type_claim(make_type_string())}},
                             {"Internalize": {"dest": 3, "policy_id": "p", "claim": 2}}
                         ],
                         "terminator": {"Return": 1}

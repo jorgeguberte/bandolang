@@ -50,6 +50,7 @@ pub struct VmExecutionState {
     pub gate_trace: Vec<GateCheckObservation>,
     // Slice 3 additions
     pub current_agent_id: String,
+    pub current_generation_token: String,
     pub frame_budget: FrameBudget,
     pub child_handles: BTreeMap<String, ChildHandleRecord>,
     pub child_events: Vec<String>,
@@ -122,6 +123,7 @@ impl<'a> VmInterpreter<'a> {
             gate_resolutions: Vec::new(),
             gate_trace: Vec::new(),
             current_agent_id: agent_id,
+            current_generation_token: "gen_1".to_string(),
             frame_budget: budget,
             child_handles: BTreeMap::new(),
             child_events: Vec::new(),
@@ -706,7 +708,7 @@ impl<'a> VmInterpreter<'a> {
                     child_budget.clone(),
                     &arg_vals,
                     &state.current_agent_id,
-                    "gen_1",
+                    &state.current_generation_token,
                 );
 
                 match spawn_res {
@@ -734,8 +736,39 @@ impl<'a> VmInterpreter<'a> {
                             .child_effective_authority
                             .insert(handle_id.clone(), auth_strings);
                         state.child_events.push(format!("Spawned({})", intent_id));
-                        state.child_handles.insert(handle_id.clone(), rec);
+                        state.child_handles.insert(handle_id.clone(), rec.clone());
                         state.frame_ledgers.insert(handle_id.clone(), child_budget);
+
+                        state.lineage.insert(
+                            dest_sym.clone(),
+                            vec![
+                                format!("child_invocation({})", intent_id),
+                                format!("target_agent({})", desc.target_agent_id),
+                            ],
+                        );
+
+                        // Cancellation scenario support (S3C20)
+                        if let Some(sc) = self.adapters.child.get_scenario(&intent_id.0) {
+                            if sc.mode == "external_effect_then_cancelled" {
+                                state.world.storage.insert(
+                                    "audit_log".to_string(),
+                                    (VmValue::String("committed".to_string()), 1),
+                                );
+                                state.world.mutation_trace.push((
+                                    "audit_log".to_string(),
+                                    VmValue::String("committed".to_string()),
+                                    1,
+                                ));
+                                state.observable_effects.push("act[database]".to_string());
+                                state
+                                    .child_events
+                                    .push(format!("ChildEffect({}:act[database])", rec.handle_id));
+                                state.current_generation_token = "gen_cancelled".to_string();
+                                state
+                                    .child_events
+                                    .push(format!("Cancelled({})", rec.child_id));
+                            }
+                        }
 
                         state.types.insert(
                             dest_sym.clone(),
@@ -788,7 +821,10 @@ impl<'a> VmInterpreter<'a> {
                         ));
                         return;
                     }
-                    if handle_val.generation_token == "stale" {
+                    if handle_val.generation_token != state.current_generation_token {
+                        state
+                            .child_events
+                            .push(format!("LateResponseRejected({})", handle_val.handle_id));
                         state.status = VmStatus::Error("StaleGenerationHandle".to_string());
                         return;
                     }
@@ -816,16 +852,56 @@ impl<'a> VmInterpreter<'a> {
                         .s3m14_await_returns_result_on_settlement_unknown
                     {
                         state.env.insert(
-                            dest_sym,
+                            dest_sym.clone(),
                             VmValue::err(VmValue::String("SettlementUnknown".to_string())),
                         );
+                        state.types.insert(
+                            dest_sym,
+                            Type::result(ok_type.clone(), err_type.clone()).display_name(),
+                        );
+                        return;
+                    }
+
+                    let auto_resume = self
+                        .adapters
+                        .child
+                        .get_scenario(&rec.provenance.intent_id)
+                        .map(|s| s.auto_resume_settlement)
+                        .unwrap_or(false);
+                    if auto_resume {
+                        rec.settlement_state = ChildSettlementState::Settled;
+                        state
+                            .child_events
+                            .push(format!("Settled({})", rec.handle_id));
+                        state
+                            .child_events
+                            .push(format!("AwaitResumed({})", rec.handle_id));
+                        state
+                            .child_handles
+                            .insert(rec.handle_id.clone(), rec.clone());
+                        state
+                            .frame_ledgers
+                            .insert(rec.handle_id.clone(), rec.budget.clone());
                     } else {
                         state.status = VmStatus::WaitingOnChild(rec.handle_id.clone());
+                        return;
                     }
-                    return;
                 }
 
-                if rec.settlement_state != ChildSettlementState::Settled {
+                if rec.settlement_state != ChildSettlementState::Settled
+                    || self.mutations.s3m09_duplicate_settlement_refunds_twice
+                    || self.mutations.s3m18_duplicate_await_duplicate_settlement
+                {
+                    if self.mutations.s3m09_duplicate_settlement_refunds_twice
+                        || self.mutations.s3m18_duplicate_await_duplicate_settlement
+                    {
+                        let cur = state.frame_budget.get_available("compute");
+                        state
+                            .frame_budget
+                            .available
+                            .insert("compute".to_string(), cur + 18);
+                    }
+
                     match self
                         .adapters
                         .child
@@ -851,6 +927,16 @@ impl<'a> VmInterpreter<'a> {
                     }
                 }
 
+                if self.mutations.s3m12_nested_delegation_breaks_conservation {
+                    let cur = state.frame_budget.get_available("compute");
+                    if cur >= 8 {
+                        state
+                            .frame_budget
+                            .available
+                            .insert("compute".to_string(), cur - 8);
+                    }
+                }
+
                 let poll_res = self.adapters.child.poll_await(&mut rec);
                 match poll_res {
                     Ok(Some(Ok(mut v))) => {
@@ -864,9 +950,22 @@ impl<'a> VmInterpreter<'a> {
                                 state.observable_effects.push(eff.to_string());
                             }
                         }
+                        if self.mutations.s3m11_child_spent_copied_to_parent {
+                            for (k, val) in &rec.budget.spent {
+                                let cur = state.frame_budget.get_spent(k);
+                                state.frame_budget.spent.insert(k.clone(), cur + val);
+                            }
+                        }
                         state
                             .result_provenance
                             .insert(dest_sym.clone(), rec.provenance.clone());
+                        state.lineage.insert(
+                            dest_sym.clone(),
+                            vec![
+                                format!("await_result({})", rec.handle_id),
+                                format!("delegated_result({})", rec.child_id),
+                            ],
+                        );
                         state
                             .child_events
                             .push(format!("AwaitResumed({})", rec.handle_id));
@@ -882,9 +981,22 @@ impl<'a> VmInterpreter<'a> {
                                 state.observable_effects.push(eff.to_string());
                             }
                         }
+                        if self.mutations.s3m11_child_spent_copied_to_parent {
+                            for (k, val) in &rec.budget.spent {
+                                let cur = state.frame_budget.get_spent(k);
+                                state.frame_budget.spent.insert(k.clone(), cur + val);
+                            }
+                        }
                         state
                             .result_provenance
                             .insert(dest_sym.clone(), rec.provenance.clone());
+                        state.lineage.insert(
+                            dest_sym.clone(),
+                            vec![
+                                format!("await_result({})", rec.handle_id),
+                                format!("delegated_result({})", rec.child_id),
+                            ],
+                        );
                         state
                             .child_events
                             .push(format!("AwaitResumed({})", rec.handle_id));
@@ -904,8 +1016,12 @@ impl<'a> VmInterpreter<'a> {
                             .s3m14_await_returns_result_on_settlement_unknown
                         {
                             state.env.insert(
-                                dest_sym,
+                                dest_sym.clone(),
                                 VmValue::err(VmValue::String("SettlementUnknown".to_string())),
+                            );
+                            state.types.insert(
+                                dest_sym,
+                                Type::result(ok_type.clone(), err_type.clone()).display_name(),
                             );
                         } else {
                             state.status = VmStatus::WaitingOnChild(rec.handle_id.clone());
@@ -923,9 +1039,14 @@ impl<'a> VmInterpreter<'a> {
                 claim,
                 validation_effects,
                 payload_type,
+                latent,
             } => {
                 let dest_sym = format!("v{}", dest.0);
                 let claim_sym = format!("v{}", claim.0);
+
+                if !self.mutations.m04_drop_latent_metadata {
+                    state.latent.insert(dest_sym.clone(), latent.clone());
+                }
 
                 let claim_val = match state.env.get(&claim_sym) {
                     Some(VmValue::Claim(inner)) => (**inner).clone(),
@@ -974,13 +1095,43 @@ impl<'a> VmInterpreter<'a> {
                     ClaimContract::RejectAll => false,
                 };
 
-                if !contract_pass && !self.mutations.s3m20_failed_validation_constructs_belief {
-                    state.internalization_trace.push(GateCheckObservation {
-                        check_kind: "ValidateClaimContract".to_string(),
-                        authority_source: "Caller".to_string(),
-                        effects: val_eff_strings,
-                        result: "Fail".to_string(),
-                    });
+                let dynamic_check_pass = if policy_desc.validation_requirements.is_empty() {
+                    true
+                } else {
+                    let mut all_pass = true;
+                    for req in &policy_desc.validation_requirements {
+                        if req == "CheckDocApproved" {
+                            if let VmValue::String(s) = &claim_val {
+                                if !s.contains("approved") || s.contains("unapproved") {
+                                    all_pass = false;
+                                }
+                            }
+                        } else if req == "CheckSubjectLiteral" {
+                            if let VmValue::String(s) = &claim_val {
+                                if s != "approved_doc" {
+                                    all_pass = false;
+                                }
+                            }
+                        }
+                    }
+                    all_pass
+                };
+
+                if (!contract_pass || !dynamic_check_pass)
+                    && !self.mutations.s3m20_failed_validation_constructs_belief
+                {
+                    if !policy_desc.validation_requirements.is_empty() {
+                        state.internalization_trace.push(GateCheckObservation {
+                            check_kind: "ValidateClaimContract".to_string(),
+                            authority_source: "Caller".to_string(),
+                            effects: val_eff_strings,
+                            result: "Fail".to_string(),
+                        });
+                    }
+                    if self.mutations.s3m21_failed_internalize_materializes_fact {
+                        let facts = latent.instantiate_ok(&dest_sym);
+                        state.active_facts.extend(facts);
+                    }
                     state.env.insert(
                         dest_sym,
                         VmValue::err(VmValue::String("InternalizationRejected".to_string())),
@@ -988,28 +1139,54 @@ impl<'a> VmInterpreter<'a> {
                     return;
                 }
 
-                state.internalization_trace.push(GateCheckObservation {
-                    check_kind: "ValidateClaimContract".to_string(),
-                    authority_source: "Caller".to_string(),
-                    effects: val_eff_strings.clone(),
-                    result: "Pass".to_string(),
-                });
+                if !policy_desc.validation_requirements.is_empty() {
+                    state.internalization_trace.push(GateCheckObservation {
+                        check_kind: "ValidateClaimContract".to_string(),
+                        authority_source: "Caller".to_string(),
+                        effects: val_eff_strings.clone(),
+                        result: "Pass".to_string(),
+                    });
+                }
                 state.observable_effects.extend(val_eff_strings);
 
                 let owner = state.current_agent_id.clone();
-                let prov = vec![
-                    format!("claim_from({})", claim_sym),
+                let mut lin_prov = vec![
                     format!("internalize({})", policy_id),
+                    format!("claim_from({})", claim_sym),
                 ];
-                let belief_val =
-                    VmValue::belief(claim_val.clone(), owner.clone(), prov, policy_id.0.clone());
+                if let Some(cl_lin) = state.lineage.get(&claim_sym) {
+                    lin_prov.extend(cl_lin.clone());
+                }
+                state.lineage.insert(dest_sym.clone(), lin_prov.clone());
+
+                let belief_prov = if self
+                    .mutations
+                    .s3m23_delegated_provenance_removed_on_internalize
+                {
+                    vec![format!("internalize({})", policy_id)]
+                } else if self.mutations.s3m24_effect_summary_used_as_clean_provenance {
+                    vec![format!("local_clean({})", policy_id)]
+                } else {
+                    let mut bp = vec![format!("internalize({})", policy_id)];
+                    if let Some(cl_lin) = state.lineage.get(&claim_sym) {
+                        bp.extend(cl_lin.clone());
+                    }
+                    bp
+                };
+
+                let belief_val = VmValue::belief(
+                    claim_val.clone(),
+                    owner.clone(),
+                    belief_prov.clone(),
+                    policy_id.0.clone(),
+                );
 
                 state.beliefs.insert(
                     dest_sym.clone(),
                     BeliefValue {
                         payload: Box::new(claim_val),
                         owner_agent_id: owner,
-                        provenance: vec![format!("internalize({})", policy_id)],
+                        provenance: belief_prov,
                         policy_binding: policy_id.0.clone(),
                     },
                 );

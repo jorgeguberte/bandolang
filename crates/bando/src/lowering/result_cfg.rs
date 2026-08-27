@@ -745,12 +745,29 @@ impl LoweringContext {
                 let vm_dest = self.map_value(*dest);
                 let vm_claim = self.map_value(*claim);
 
+                let latent = if self.mutations.m04_drop_latent_metadata {
+                    crate::ir::facts::LatentPostconditions::empty()
+                } else {
+                    crate::ir::facts::LatentPostconditions {
+                        on_ok: vec![crate::ir::facts::FactTemplate {
+                            predicate: "Internalized".to_string(),
+                            args: vec![
+                                crate::ir::facts::FactArg::Symbol("$value".to_string()),
+                                crate::ir::facts::FactArg::Symbol(format!("v{}", claim.0)),
+                                crate::ir::facts::FactArg::Literal(policy_id.0.clone()),
+                            ],
+                        }],
+                        on_err: Vec::new(),
+                    }
+                };
+
                 VmInstruction::VmInternalize {
                     dest: vm_dest,
                     policy_id: policy_id.clone(),
                     claim: vm_claim,
                     validation_effects: val_effs,
                     payload_type: payload_ty,
+                    latent,
                 }
             }
         }

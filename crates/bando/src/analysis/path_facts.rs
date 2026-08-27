@@ -47,6 +47,9 @@ impl<'a> PathFactAnalyzer<'a> {
                     VmInstruction::VmAct { dest, latent, .. } => {
                         act_latent.insert(*dest, latent.clone());
                     }
+                    VmInstruction::VmInternalize { dest, latent, .. } => {
+                        var_latent.insert(*dest, latent.clone());
+                    }
                     VmInstruction::VmAssign { dest, source, .. } => {
                         if let Some(lat) = var_latent.get(source) {
                             var_latent.insert(*dest, lat.clone());

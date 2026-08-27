@@ -86,6 +86,7 @@ pub enum VmInstruction {
         claim: VmValueId,
         validation_effects: Vec<Effect>,
         payload_type: Type,
+        latent: LatentPostconditions,
     },
 }
 

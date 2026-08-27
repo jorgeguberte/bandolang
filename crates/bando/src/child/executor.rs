@@ -16,13 +16,15 @@ use crate::{
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ChildScenarioConfig {
-    pub mode: String, // "success", "semantic_failure", "settlement_unknown", "outstanding_commitment", "spawn_failure", "returns_claim", "returns_belief", "unspent_refund", etc.
+    pub mode: String, // "success", "semantic_failure", "settlement_unknown", "outstanding_commitment", "spawn_failure", "returns_claim", "returns_belief", "nested_delegation", etc.
     pub payload_string: Option<String>,
     pub spend_amount: Option<u64>,
     pub reserved_amount: Option<u64>,
     pub attempt_out_of_ceiling_effect: Option<Effect>,
     pub claim_predicate: Option<String>,
     pub nested_grandchild_spend: Option<u64>,
+    #[serde(default)]
+    pub auto_resume_settlement: bool,
 }
 
 pub trait ChildExecutor: Send + Sync {
@@ -47,6 +49,8 @@ pub trait ChildExecutor: Send + Sync {
         handle: &mut ChildHandleRecord,
         parent_budget: &mut FrameBudget,
     ) -> Result<BTreeMap<String, u64>, String>;
+
+    fn get_scenario(&self, intent_id: &str) -> Option<ChildScenarioConfig>;
 }
 
 #[derive(Debug, Clone, Default)]
@@ -106,12 +110,24 @@ impl ChildExecutor for DefaultTestChildExecutor {
 
         // Child budget execution
         if let Some(sc) = &scenario {
-            if let Some(sp) = sc.spend_amount {
-                let _ = budget.reserve("compute", sp);
-                let _ = budget.spend_reserved("compute", sp);
-            }
-            if let Some(res) = sc.reserved_amount {
-                let _ = budget.reserve("compute", res);
+            if sc.mode == "nested_delegation" {
+                // Section 19: Root -> Child -> Grandchild nested delegation
+                let mut grandchild_budget = FrameBudget::new();
+                let _ = budget.transfer_to_child("compute", 15, &mut grandchild_budget);
+                let gc_spend = sc.nested_grandchild_spend.unwrap_or(7);
+                let _ = grandchild_budget.spend_direct("compute", gc_spend);
+                let _ = budget.settle_from_child(&mut grandchild_budget);
+                let child_spend = sc.spend_amount.unwrap_or(5);
+                let _ = budget.spend_direct("compute", child_spend);
+                self.child_budgets
+                    .insert(format!("{}_grandchild", handle_id), grandchild_budget);
+            } else {
+                if let Some(sp) = sc.spend_amount {
+                    let _ = budget.spend_direct("compute", sp);
+                }
+                if let Some(res) = sc.reserved_amount {
+                    let _ = budget.reserve("compute", res);
+                }
             }
         }
 
@@ -269,5 +285,9 @@ impl ChildExecutor for DefaultTestChildExecutor {
             self.settled_handle_ids.insert(handle.handle_id.clone());
             Ok(BTreeMap::new())
         }
+    }
+
+    fn get_scenario(&self, intent_id: &str) -> Option<ChildScenarioConfig> {
+        self.scenarios.get(intent_id).cloned()
     }
 }

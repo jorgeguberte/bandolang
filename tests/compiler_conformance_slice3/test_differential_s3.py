@@ -489,7 +489,7 @@ def test_d7_internalize_success():
             "internalization_policies": {
                 "p_ok": {
                     "policy_id": "p_ok", "accepted_claim_contract": "AcceptAll",
-                    "validation_requirements": [], "validation_effect_envelope": {"effects": [{"Read": "policy_db"}]}
+                    "validation_requirements": ["CheckDocApproved"], "validation_effect_envelope": {"effects": [{"Read": "policy_db"}]}
                 }
             },
             "caller_authority": {"effects": [{"Read": "policy_db"}]}
@@ -502,8 +502,8 @@ def test_d7_internalize_success():
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "doc_content"}, "ty": make_type_string()}},
-                            {"Pure": {"dest": 2, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "doc_content"}}, "ty": make_type_claim(make_type_string())}},
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "approved_doc"}, "ty": make_type_string()}},
+                            {"Pure": {"dest": 2, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "approved_doc"}}, "ty": make_type_claim(make_type_string())}},
                             {"Internalize": {"dest": 3, "policy_id": "p_ok", "claim": 2}}
                         ],
                         "terminator": {
@@ -521,12 +521,15 @@ def test_d7_internalize_success():
     rust_obs = invoke_rust_conformance(prog)
     expected = {
         "status": "ok",
-        "return_val": {"kind": "String", "payload": "doc_content"},
+        "return_val": {"kind": "String", "payload": "approved_doc"},
         "effects": ["read[policy_db]"],
-        "active_facts": [{"predicate": "IsOk", "args": [{"Symbol": "v3"}]}],
+        "active_facts": [
+            {"predicate": "Internalized", "args": [{"Symbol": "v4"}, {"Symbol": "v2"}, {"Literal": "p_ok"}]},
+            {"predicate": "IsOk", "args": [{"Symbol": "v3"}]}
+        ],
         "beliefs": {
             "v3": {
-                "payload": {"kind": "String", "payload": "doc_content"},
+                "payload": {"kind": "String", "payload": "approved_doc"},
                 "owner_agent_id": "agent_alpha",
                 "provenance": ["internalize(p_ok)"],
                 "policy_binding": "p_ok"
@@ -549,8 +552,8 @@ def test_d8_internalize_failure():
         "registry": {
             "internalization_policies": {
                 "p_strict": {
-                    "policy_id": "p_strict", "accepted_claim_contract": {"AcceptSubjectLiteral": "correct_val"},
-                    "validation_requirements": ["CheckLiteral"], "validation_effect_envelope": {"effects": []}
+                    "policy_id": "p_strict", "accepted_claim_contract": "AcceptAll",
+                    "validation_requirements": ["CheckDocApproved"], "validation_effect_envelope": {"effects": []}
                 }
             },
             "caller_authority": {"effects": []}
@@ -563,8 +566,8 @@ def test_d8_internalize_failure():
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "wrong_val"}, "ty": make_type_string()}},
-                            {"Pure": {"dest": 2, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "wrong_val"}}, "ty": make_type_claim(make_type_string())}},
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "unapproved_val"}, "ty": make_type_string()}},
+                            {"Pure": {"dest": 2, "val": {"kind": "Claim", "payload": {"kind": "String", "payload": "unapproved_val"}}, "ty": make_type_claim(make_type_string())}},
                             {"Internalize": {"dest": 3, "policy_id": "p_strict", "claim": 2}}
                         ],
                         "terminator": {

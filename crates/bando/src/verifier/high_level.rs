@@ -10,6 +10,7 @@ use crate::{
         types::Type,
         BlockId, Function, Module, ValueId,
     },
+    lowering::CompilerMutations,
     registry::{AgentId, ClaimContract, IntentId, RegistrySnapshot},
 };
 
@@ -31,6 +32,7 @@ pub enum ValueOrigin {
 pub struct HighLevelVerifier<'a> {
     pub func: &'a Function,
     pub registry: Option<&'a RegistrySnapshot>,
+    pub mutations: Option<&'a CompilerMutations>,
     pub diagnostics: Vec<Diagnostic>,
     pub all_defined_values: BTreeMap<ValueId, Type>,
     pub value_origins: BTreeMap<ValueId, ValueOrigin>,
@@ -42,6 +44,7 @@ impl<'a> HighLevelVerifier<'a> {
         Self {
             func,
             registry: None,
+            mutations: None,
             diagnostics: Vec::new(),
             all_defined_values: BTreeMap::new(),
             value_origins: BTreeMap::new(),
@@ -53,6 +56,23 @@ impl<'a> HighLevelVerifier<'a> {
         Self {
             func,
             registry: Some(registry),
+            mutations: None,
+            diagnostics: Vec::new(),
+            all_defined_values: BTreeMap::new(),
+            value_origins: BTreeMap::new(),
+            static_gate_resolutions: Vec::new(),
+        }
+    }
+
+    pub fn with_registry_and_mutations(
+        func: &'a Function,
+        registry: &'a RegistrySnapshot,
+        mutations: &'a CompilerMutations,
+    ) -> Self {
+        Self {
+            func,
+            registry: Some(registry),
+            mutations: Some(mutations),
             diagnostics: Vec::new(),
             all_defined_values: BTreeMap::new(),
             value_origins: BTreeMap::new(),
@@ -79,10 +99,23 @@ impl<'a> HighLevelVerifier<'a> {
         registry: &RegistrySnapshot,
     ) -> Result<Vec<GateResolutionObservation>, (Vec<Diagnostic>, Vec<GateResolutionObservation>)>
     {
+        Self::verify_module_with_registry_and_mutations(
+            module,
+            registry,
+            &CompilerMutations::default(),
+        )
+    }
+
+    pub fn verify_module_with_registry_and_mutations(
+        module: &Module,
+        registry: &RegistrySnapshot,
+        mutations: &CompilerMutations,
+    ) -> Result<Vec<GateResolutionObservation>, (Vec<Diagnostic>, Vec<GateResolutionObservation>)>
+    {
         let mut all_diags = Vec::new();
         let mut all_resolutions = Vec::new();
         for func in &module.functions {
-            let mut v = HighLevelVerifier::with_registry(func, registry);
+            let mut v = HighLevelVerifier::with_registry_and_mutations(func, registry, mutations);
             v.verify();
             all_diags.extend(v.diagnostics);
             all_resolutions.extend(v.static_gate_resolutions);
@@ -149,6 +182,8 @@ impl<'a> HighLevelVerifier<'a> {
             }
             self.verify_block(block, &visible);
         }
+
+        self.verify_handle_joins();
     }
 
     fn compute_dominance_tree(&self) -> DominanceTree<BlockId> {
@@ -344,6 +379,13 @@ impl<'a> HighLevelVerifier<'a> {
                 if let crate::ir::values::Value::String(s) = val {
                     self.value_origins
                         .insert(*dest, ValueOrigin::Literal(s.clone()));
+                } else if let crate::ir::values::Value::Claim(inner) = val {
+                    if let crate::ir::values::Value::String(s) = &**inner {
+                        self.value_origins
+                            .insert(*dest, ValueOrigin::Literal(s.clone()));
+                    } else {
+                        self.value_origins.insert(*dest, ValueOrigin::Other(*dest));
+                    }
                 } else {
                     self.value_origins.insert(*dest, ValueOrigin::Other(*dest));
                 }
@@ -727,19 +769,38 @@ impl<'a> HighLevelVerifier<'a> {
                             }
                         }
 
-                        // 2. Ceiling checks: Σ_child ⊆ Σ_requested ⊆ Σ_exported
+                        // 2. Consistent descriptor: Σ_exported ⊆ Σ_declared_envelope
+                        if !desc.exported_envelope.is_subset(&desc.declared_envelope) {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::InvocationCeilingAboveExported,
+                                format!(
+                                    "Intent descriptor inconsistent: exported envelope {:?} exceeds declared envelope {:?}",
+                                    desc.exported_envelope, desc.declared_envelope
+                                ),
+                            ));
+                        }
+
+                        // 3. Ceiling checks: Σ_child ⊆ Σ_requested ⊆ Σ_exported
                         let req_row = EffectRow {
                             effects: requested_effects.iter().cloned().collect(),
                         };
 
-                        if !desc.child_effects.is_subset(&req_row) {
+                        let allow_below = self
+                            .mutations
+                            .map(|m| m.s3m02_allow_requested_below_child)
+                            .unwrap_or(false);
+                        if !allow_below && !desc.child_effects.is_subset(&req_row) {
                             self.diagnostics.push(Diagnostic::error(
                                 DiagnosticCode::InvocationCeilingBelowChild,
                                 format!("Invocation ceiling {:?} is below child effect requirement {:?}", req_row, desc.child_effects),
                             ));
                         }
 
-                        if !req_row.is_subset(&desc.exported_envelope) {
+                        let allow_above = self
+                            .mutations
+                            .map(|m| m.s3m03_allow_requested_above_exported)
+                            .unwrap_or(false);
+                        if !allow_above && !req_row.is_subset(&desc.exported_envelope) {
                             self.diagnostics.push(Diagnostic::error(
                                 DiagnosticCode::InvocationCeilingAboveExported,
                                 format!(
@@ -749,30 +810,54 @@ impl<'a> HighLevelVerifier<'a> {
                             ));
                         }
 
-                        // 3. Grant checks: grant ⊆ CallerAuthority && grant ⊆ Σ_requested
-                        if let Some(ca) = &reg.caller_authority {
-                            for g in authority_grant {
-                                if !ca.contains(g) {
+                        // 4. Authority policy and grants
+                        match desc.authority_policy.as_str() {
+                            "AllowNative" => {
+                                if !authority_grant.is_empty() {
                                     self.diagnostics.push(Diagnostic::error(
                                         DiagnosticCode::GrantExceedsCallerAuthority,
-                                        format!(
-                                            "Authority grant {:?} exceeds caller authority {:?}",
-                                            g, ca
-                                        ),
-                                    ));
-                                }
-                                if !req_row.contains(g) {
-                                    self.diagnostics.push(Diagnostic::error(
-                                        DiagnosticCode::GrantExceedsRequestedCeiling,
-                                        format!("Authority grant {:?} exceeds requested invocation ceiling {:?}", g, req_row),
+                                        format!("Authority policy AllowNative does not permit explicit caller grants: {:?}", authority_grant),
                                     ));
                                 }
                             }
-                        } else {
-                            self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::AuthorityInsufficient,
-                                "Caller authority absent for delegate",
-                            ));
+                            "AllowGrant" => {
+                                if let Some(ca) = &reg.caller_authority {
+                                    let allow_grant_leak = self
+                                        .mutations
+                                        .map(|m| m.s3m05_granted_authority_unattenuated)
+                                        .unwrap_or(false);
+                                    if !allow_grant_leak {
+                                        for g in authority_grant {
+                                            if !ca.contains(g) {
+                                                self.diagnostics.push(Diagnostic::error(
+                                                    DiagnosticCode::GrantExceedsCallerAuthority,
+                                                    format!(
+                                                        "Authority grant {:?} exceeds caller authority {:?}",
+                                                        g, ca
+                                                    ),
+                                                ));
+                                            }
+                                            if !req_row.contains(g) {
+                                                self.diagnostics.push(Diagnostic::error(
+                                                    DiagnosticCode::GrantExceedsRequestedCeiling,
+                                                    format!("Authority grant {:?} exceeds requested invocation ceiling {:?}", g, req_row),
+                                                ));
+                                            }
+                                        }
+                                    }
+                                } else {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        DiagnosticCode::AuthorityInsufficient,
+                                        "Caller authority absent for delegate",
+                                    ));
+                                }
+                            }
+                            other => {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::AuthorityInsufficient,
+                                    format!("Unknown or unsupported authority policy {:?}", other),
+                                ));
+                            }
                         }
 
                         // 4. Function declared effects must contain child effects (Section 8)
@@ -824,14 +909,44 @@ impl<'a> HighLevelVerifier<'a> {
 
                 if let Some(reg) = self.registry {
                     if let Some(policy_desc) = reg.internalization_policies.get(policy_id) {
-                        if matches!(
-                            policy_desc.accepted_claim_contract,
-                            ClaimContract::RejectAll
-                        ) {
-                            self.diagnostics.push(Diagnostic::error(
-                                DiagnosticCode::RefutedRequirement,
-                                format!("Claim rejected by internalization policy {:?}", policy_id),
-                            ));
+                        match &policy_desc.accepted_claim_contract {
+                            ClaimContract::RejectAll => {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::RefutedRequirement,
+                                    format!(
+                                        "Claim rejected by internalization policy {:?}",
+                                        policy_id
+                                    ),
+                                ));
+                            }
+                            ClaimContract::AcceptPredicate(pred) => {
+                                let matches_pred = match self.value_origins.get(claim) {
+                                    Some(ValueOrigin::VerifySubject { predicate, .. }) => {
+                                        predicate == pred
+                                    }
+                                    Some(ValueOrigin::Literal(lit)) => lit == pred,
+                                    _ => false,
+                                };
+                                if !matches_pred {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        DiagnosticCode::UncoveredRequirement,
+                                        format!("Claim does not satisfy accepted predicate {:?} of policy {:?}", pred, policy_id),
+                                    ));
+                                }
+                            }
+                            ClaimContract::AcceptSubjectLiteral(lit) => {
+                                let matches_lit = match self.value_origins.get(claim) {
+                                    Some(ValueOrigin::Literal(s)) => s == lit,
+                                    _ => false,
+                                };
+                                if !matches_lit {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        DiagnosticCode::UncoveredRequirement,
+                                        format!("Claim literal does not match accepted subject {:?} of policy {:?}", lit, policy_id),
+                                    ));
+                                }
+                            }
+                            ClaimContract::AcceptAll => {}
                         }
 
                         let val_effs: Vec<_> = policy_desc
@@ -851,8 +966,21 @@ impl<'a> HighLevelVerifier<'a> {
                             }
                         }
 
-                        // 2. Section 45: Caller authority must cover validation effects
-                        if let Some(ca) = &reg.caller_authority {
+                        // 2. Section 45: Caller authority must cover validation effects (unless s3m19 mutation is on)
+                        let use_runtime_auth = self
+                            .mutations
+                            .map(|m| m.s3m19_internalize_uses_runtime_authority)
+                            .unwrap_or(false);
+                        if use_runtime_auth {
+                            if let Some(ra) = &reg.runtime_authority {
+                                if !ra.covers(&val_effs) {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        DiagnosticCode::ValidationAuthorityInsufficient,
+                                        "Runtime authority insufficient",
+                                    ));
+                                }
+                            }
+                        } else if let Some(ca) = &reg.caller_authority {
                             if !ca.covers(&val_effs) {
                                 self.diagnostics.push(Diagnostic::error(
                                     DiagnosticCode::ValidationAuthorityInsufficient,
@@ -1128,6 +1256,138 @@ impl<'a> HighLevelVerifier<'a> {
                             target, i, param_id, expected_ty, arg_ty
                         ),
                     ));
+                }
+            }
+        }
+    }
+
+    fn collect_region_jumps(
+        &self,
+        source_block: BlockId,
+        region: &Region,
+        incoming_jumps: &mut BTreeMap<BlockId, Vec<(BlockId, Vec<ValueId>)>>,
+    ) {
+        match &region.terminator {
+            RegionTerminator::Br { target, args } => {
+                incoming_jumps
+                    .entry(*target)
+                    .or_default()
+                    .push((source_block, args.clone()));
+            }
+            RegionTerminator::Return(_) | RegionTerminator::Unreachable => {}
+        }
+    }
+
+    fn verify_handle_joins(&mut self) {
+        let mut incoming_jumps: BTreeMap<BlockId, Vec<(BlockId, Vec<ValueId>)>> = BTreeMap::new();
+        for (b_id, block) in &self.func.blocks {
+            match &block.terminator {
+                Terminator::Br { target, args } => {
+                    incoming_jumps
+                        .entry(*target)
+                        .or_default()
+                        .push((*b_id, args.clone()));
+                }
+                Terminator::CondBr {
+                    true_target,
+                    true_args,
+                    false_target,
+                    false_args,
+                    ..
+                } => {
+                    incoming_jumps
+                        .entry(*true_target)
+                        .or_default()
+                        .push((*b_id, true_args.clone()));
+                    incoming_jumps
+                        .entry(*false_target)
+                        .or_default()
+                        .push((*b_id, false_args.clone()));
+                }
+                Terminator::MatchResult {
+                    ok_body, err_body, ..
+                } => {
+                    self.collect_region_jumps(*b_id, ok_body, &mut incoming_jumps);
+                    self.collect_region_jumps(*b_id, err_body, &mut incoming_jumps);
+                }
+                Terminator::MatchActOutcome {
+                    success_body,
+                    failure_body,
+                    partial_body,
+                    unknown_body,
+                    ..
+                } => {
+                    self.collect_region_jumps(*b_id, success_body, &mut incoming_jumps);
+                    self.collect_region_jumps(*b_id, failure_body, &mut incoming_jumps);
+                    self.collect_region_jumps(*b_id, partial_body, &mut incoming_jumps);
+                    self.collect_region_jumps(*b_id, unknown_body, &mut incoming_jumps);
+                }
+                Terminator::Return(_) | Terminator::Unreachable => {}
+            }
+        }
+
+        for (target_id, target_block) in &self.func.blocks {
+            if target_id == &self.func.entry {
+                continue;
+            }
+            let jumps = match incoming_jumps.get(target_id) {
+                Some(j) => j,
+                None => continue,
+            };
+
+            for (param_idx, (param_id, expected_ty)) in target_block.params.iter().enumerate() {
+                if let Type::ChildHandle {
+                    ok: exp_ok,
+                    err: exp_err,
+                    effects: exp_effs,
+                } = expected_ty
+                {
+                    let mut incoming_handle_effects = Vec::new();
+                    for (_pred_id, args) in jumps {
+                        if param_idx < args.len() {
+                            let arg_id = args[param_idx];
+                            if let Some(arg_ty) = self.all_defined_values.get(&arg_id) {
+                                if let Type::ChildHandle {
+                                    ok: in_ok,
+                                    err: in_err,
+                                    effects: in_effs,
+                                } = arg_ty
+                                {
+                                    if in_ok != exp_ok || in_err != exp_err {
+                                        self.diagnostics.push(Diagnostic::error(
+                                            DiagnosticCode::IncompatibleHandleJoin,
+                                            format!(
+                                                "Handle join type mismatch: expected ok={:?}, err={:?}, got ok={:?}, err={:?}",
+                                                exp_ok, exp_err, in_ok, in_err
+                                            ),
+                                        ));
+                                    }
+                                    incoming_handle_effects.push(in_effs.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    let mut union_effects = EffectRow::empty();
+                    for in_eff in &incoming_handle_effects {
+                        for e in &in_eff.effects {
+                            union_effects = union_effects.with(e.clone());
+                        }
+                    }
+
+                    let allow_drop = self
+                        .mutations
+                        .map(|m| m.s3m16_handle_join_drops_effect)
+                        .unwrap_or(false);
+                    if !allow_drop && exp_effs != &union_effects {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::IncompatibleHandleJoin,
+                            format!(
+                                "Exact handle join effect violation on Block {:?} parameter {:?}: expected exact union {:?}, got {:?}",
+                                target_id, param_id, union_effects, exp_effs
+                            ),
+                        ));
+                    }
                 }
             }
         }

@@ -173,4 +173,19 @@ impl FrameBudget {
         self.spent.insert(resource.to_string(), sp + amount);
         Ok(())
     }
+
+    pub fn spend_direct(&mut self, resource: &str, amount: u64) -> Result<(), BudgetError> {
+        let avail = self.get_available(resource);
+        if avail < amount {
+            return Err(BudgetError::InsufficientAvailable {
+                resource: resource.to_string(),
+                needed: amount,
+                available: avail,
+            });
+        }
+        self.available.insert(resource.to_string(), avail - amount);
+        let sp = self.get_spent(resource);
+        self.spent.insert(resource.to_string(), sp + amount);
+        Ok(())
+    }
 }

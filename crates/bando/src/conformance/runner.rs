@@ -28,7 +28,11 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
 
     // 1. High-level verifier (with trusted registry binding, P1, Q2, Q3, Q4)
     if let Err((diags, gate_resolutions)) =
-        HighLevelVerifier::verify_module_with_registry(&prog.module, &registry)
+        HighLevelVerifier::verify_module_with_registry_and_mutations(
+            &prog.module,
+            &registry,
+            &prog.mutations,
+        )
     {
         return ConformanceObservationV0 {
             status: "verifier_error".to_string(),

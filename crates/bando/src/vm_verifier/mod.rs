@@ -152,6 +152,8 @@ impl<'a> VmVerifier<'a> {
             self.verify_terminator(&block.terminator, *block_id, &visible_values);
         }
 
+        self.verify_handle_joins();
+
         if self.diagnostics.is_empty() {
             Ok(())
         } else {
@@ -531,6 +533,144 @@ impl<'a> VmVerifier<'a> {
                     target, expected_ty, param_ty
                 ),
             ));
+        }
+    }
+
+    fn verify_handle_joins(&mut self) {
+        let mut incoming_jumps: BTreeMap<VmBlockId, Vec<(VmBlockId, Vec<VmValueId>)>> =
+            BTreeMap::new();
+        for (b_id, block) in &self.func.blocks {
+            match &block.terminator {
+                VmTerminator::Br { target, args } => {
+                    incoming_jumps
+                        .entry(*target)
+                        .or_default()
+                        .push((*b_id, args.clone()));
+                }
+                VmTerminator::CondBr {
+                    true_target,
+                    true_args,
+                    false_target,
+                    false_args,
+                    ..
+                } => {
+                    incoming_jumps
+                        .entry(*true_target)
+                        .or_default()
+                        .push((*b_id, true_args.clone()));
+                    incoming_jumps
+                        .entry(*false_target)
+                        .or_default()
+                        .push((*b_id, false_args.clone()));
+                }
+                VmTerminator::SwitchResult {
+                    ok_target,
+                    ok_arg,
+                    err_target,
+                    err_arg,
+                    ..
+                } => {
+                    incoming_jumps
+                        .entry(*ok_target)
+                        .or_default()
+                        .push((*b_id, vec![*ok_arg]));
+                    incoming_jumps
+                        .entry(*err_target)
+                        .or_default()
+                        .push((*b_id, vec![*err_arg]));
+                }
+                VmTerminator::SwitchActOutcome {
+                    success_target,
+                    success_arg,
+                    failure_target,
+                    failure_arg,
+                    partial_target,
+                    partial_arg,
+                    unknown_target,
+                    unknown_arg,
+                    ..
+                } => {
+                    incoming_jumps
+                        .entry(*success_target)
+                        .or_default()
+                        .push((*b_id, vec![*success_arg]));
+                    incoming_jumps
+                        .entry(*failure_target)
+                        .or_default()
+                        .push((*b_id, vec![*failure_arg]));
+                    incoming_jumps
+                        .entry(*partial_target)
+                        .or_default()
+                        .push((*b_id, vec![*partial_arg]));
+                    incoming_jumps
+                        .entry(*unknown_target)
+                        .or_default()
+                        .push((*b_id, vec![*unknown_arg]));
+                }
+                VmTerminator::Return(_) | VmTerminator::Unreachable => {}
+            }
+        }
+
+        for (target_id, target_block) in &self.func.blocks {
+            if target_id == &self.func.entry {
+                continue;
+            }
+            let jumps = match incoming_jumps.get(target_id) {
+                Some(j) => j,
+                None => continue,
+            };
+
+            for (param_idx, (param_id, expected_ty)) in target_block.params.iter().enumerate() {
+                if let Type::ChildHandle {
+                    ok: exp_ok,
+                    err: exp_err,
+                    effects: exp_effs,
+                } = expected_ty
+                {
+                    let mut incoming_handle_effects = Vec::new();
+                    for (_pred_id, args) in jumps {
+                        if param_idx < args.len() {
+                            let arg_id = args[param_idx];
+                            if let Some(arg_ty) = self.all_defined_values.get(&arg_id) {
+                                if let Type::ChildHandle {
+                                    ok: in_ok,
+                                    err: in_err,
+                                    effects: in_effs,
+                                } = arg_ty
+                                {
+                                    if in_ok != exp_ok || in_err != exp_err {
+                                        self.diagnostics.push(Diagnostic::error(
+                                            DiagnosticCode::IncompatibleHandleJoin,
+                                            format!(
+                                                "VM Handle join type mismatch: expected ok={:?}, err={:?}, got ok={:?}, err={:?}",
+                                                exp_ok, exp_err, in_ok, in_err
+                                            ),
+                                        ));
+                                    }
+                                    incoming_handle_effects.push(in_effs.clone());
+                                }
+                            }
+                        }
+                    }
+
+                    let mut union_effects = EffectRow::empty();
+                    for in_eff in &incoming_handle_effects {
+                        for e in &in_eff.effects {
+                            union_effects = union_effects.with(e.clone());
+                        }
+                    }
+
+                    if exp_effs != &union_effects {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::IncompatibleHandleJoin,
+                            format!(
+                                "VM Exact handle join effect violation on Block {:?} param {:?}: expected exact union {:?}, got {:?}",
+                                target_id, param_id, union_effects, exp_effs
+                            ),
+                        ));
+                    }
+                }
+            }
         }
     }
 }
