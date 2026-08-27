@@ -423,6 +423,8 @@ impl LoweringContext {
                     budget_scope,
                     max_steps,
                     max_satisfaction_attempts,
+                    space_effects,
+                    satisfier_effects,
                     partial_type,
                     satisfied_type,
                     ..
@@ -470,6 +472,8 @@ impl LoweringContext {
                             .collect(),
                         space_faults: space_faults.clone(),
                         fault_spec: fault_spec.clone(),
+                        space_effects: space_effects.effects.iter().cloned().collect(),
+                        satisfier_effects: satisfier_effects.effects.iter().cloned().collect(),
                     });
                     loop_block.terminator = VmTerminator::CondBr {
                         cond: step_status_var,

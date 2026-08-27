@@ -655,3 +655,217 @@ fn test_slice4_converge_pipeline() {
     assert_eq!(state.observable_effects.len(), 0);
     assert_eq!(state.converge_domains.len(), 1);
 }
+
+#[test]
+fn test_slice4_vm_verifier_rejects_dropped_converge_effect() {
+    let registry = RegistrySnapshot::default();
+
+    let expected_return_ty = Type::result(
+        Type::convergence_outcome(Type::String, Type::exhaustion_report(Type::String)),
+        Type::String,
+    );
+
+    let mut func = Function::new("main", BlockId(0), expected_return_ty);
+    func.declared_effects = EffectRow::empty().with(Effect::Act("space_target".to_string()));
+
+    let mut entry = Block::new(BlockId(0), Terminator::Return(Some(ValueId(1))));
+
+    let mut node_ops = std::collections::BTreeMap::new();
+    node_ops.insert(
+        "root".to_string(),
+        bando::ir::ops::SpaceOpDef {
+            op_id: "opExt".to_string(),
+            kind: "external".to_string(),
+            cost: 10,
+            actual_cost: None,
+            request_id: None,
+            dedup_capable: true,
+            idempotent: true,
+            required_effects: vec![Effect::Act("space_target".to_string())],
+        },
+    );
+
+    entry.instructions.push(Instruction::Converge {
+        dest: ValueId(1),
+        root_node: "root".to_string(),
+        initial_frontier: vec!["root".to_string()],
+        successors: std::collections::BTreeMap::new(),
+        node_ops,
+        satisfier: bando::ir::ops::SatisfierDef::default(),
+        partial_map: std::collections::BTreeMap::new(),
+        space_faults: std::collections::BTreeMap::new(),
+        fault_spec: bando::ir::ops::ConvergeFaultSpec::default(),
+        space_ops: vec![],
+        satisfier_op: bando::registry::OperationId("local_satisfier".to_string()),
+        search_policy: bando::ir::ops::SearchPolicyDescriptor {
+            policy_id: "pure_policy".to_string(),
+            on_step_failure: "abort".to_string(),
+            on_satisfier_error: "abort".to_string(),
+            policy_effects: EffectRow::empty(),
+        },
+        budget_scope: bando::ir::ops::BudgetScopeConfig {
+            resource: "usd".to_string(),
+            limit: 100,
+        },
+        max_steps: 10,
+        max_satisfaction_attempts: 5,
+        space_effects: EffectRow::empty().with(Effect::Act("space_target".to_string())),
+        satisfier_effects: EffectRow::empty(),
+        partial_type: Type::String,
+        satisfied_type: Type::String,
+    });
+
+    func.blocks.insert(BlockId(0), entry);
+
+    let mut module = Module::new("test_s4_eff");
+    module.functions.push(func);
+
+    // 1. High level verifier passes
+    assert!(HighLevelVerifier::verify_module_with_registry(&module, &registry).is_ok());
+
+    // 2. Lowering creates valid VM module
+    let mut lowering =
+        LoweringContext::with_registry(registry.clone(), CompilerMutations::default());
+    let mut vm_module = lowering.lower_module(&module);
+    assert!(VmVerifier::verify_module(&vm_module).is_ok());
+
+    // 3. Corrupt/drop the declared effect from the VM function
+    vm_module.functions[0].declared_effects = EffectRow::empty();
+
+    // 4. VmVerifier MUST reject the VM function with EffectUndeclared
+    let vm_res = VmVerifier::verify_module(&vm_module);
+    assert!(vm_res.is_err(), "R4: VmVerifier must reject VM function when converge effect is undeclared");
+}
+
+#[test]
+fn test_slice4_crash_recovery_instance_reconstruction() {
+    let registry = RegistrySnapshot::default();
+
+    let expected_return_ty = Type::result(
+        Type::convergence_outcome(Type::String, Type::exhaustion_report(Type::String)),
+        Type::String,
+    );
+
+    let mut func = Function::new("main", BlockId(0), expected_return_ty);
+    func.declared_effects = EffectRow::empty().with(Effect::Act("opRoot".to_string()));
+
+    let mut entry = Block::new(BlockId(0), Terminator::Return(Some(ValueId(1))));
+
+    let mut node_ops = std::collections::BTreeMap::new();
+    node_ops.insert(
+        "root".to_string(),
+        bando::ir::ops::SpaceOpDef {
+            op_id: "opRoot".to_string(),
+            kind: "external".to_string(),
+            cost: 10,
+            actual_cost: None,
+            request_id: None,
+            dedup_capable: true,
+            idempotent: true,
+            required_effects: vec![Effect::Act("opRoot".to_string())],
+        },
+    );
+    node_ops.insert(
+        "succ".to_string(),
+        bando::ir::ops::SpaceOpDef {
+            op_id: "opSucc".to_string(),
+            kind: "local".to_string(),
+            cost: 0,
+            actual_cost: None,
+            request_id: None,
+            dedup_capable: true,
+            idempotent: true,
+            required_effects: vec![],
+        },
+    );
+
+    let mut succs = std::collections::BTreeMap::new();
+    succs.insert("root".to_string(), vec!["succ".to_string()]);
+
+    let mut satisfier_map = std::collections::BTreeMap::new();
+    satisfier_map.insert("root".to_string(), serde_json::json!(["ok", false, null]));
+    satisfier_map.insert("succ".to_string(), serde_json::json!(["ok", true, {"kind": "String", "payload": "T-recovered"}]));
+
+    let mut partial_map = std::collections::BTreeMap::new();
+    partial_map.insert("succ".to_string(), bando::ir::values::Value::String("P_succ".to_string()));
+
+    let mut fault_spec = bando::ir::ops::ConvergeFaultSpec::default();
+    fault_spec.crash_after_settlement = true;
+
+    entry.instructions.push(Instruction::Converge {
+        dest: ValueId(1),
+        root_node: "root".to_string(),
+        initial_frontier: vec!["root".to_string()],
+        successors: succs,
+        node_ops,
+        satisfier: bando::ir::ops::SatisfierDef {
+            kind: "local".to_string(),
+            effectful_op: None,
+            satisfier_map,
+        },
+        partial_map,
+        space_faults: std::collections::BTreeMap::new(),
+        fault_spec,
+        space_ops: vec![],
+        satisfier_op: bando::registry::OperationId("local_satisfier".to_string()),
+        search_policy: bando::ir::ops::SearchPolicyDescriptor {
+            policy_id: "pure_policy".to_string(),
+            on_step_failure: "abort".to_string(),
+            on_satisfier_error: "abort".to_string(),
+            policy_effects: EffectRow::empty(),
+        },
+        budget_scope: bando::ir::ops::BudgetScopeConfig {
+            resource: "usd".to_string(),
+            limit: 100,
+        },
+        max_steps: 10,
+        max_satisfaction_attempts: 5,
+        space_effects: EffectRow::empty().with(Effect::Act("opRoot".to_string())),
+        satisfier_effects: EffectRow::empty(),
+        partial_type: Type::String,
+        satisfied_type: Type::String,
+    });
+
+    func.blocks.insert(BlockId(0), entry);
+
+    let mut module = Module::new("test_s4_crash");
+    module.functions.push(func);
+
+    let mut lowering =
+        LoweringContext::with_registry(registry.clone(), CompilerMutations::default());
+    let vm_module = lowering.lower_module(&module);
+
+    // 1. Instantiate First Interpreter
+    let mut adapters1 = RuntimeAdapters::default();
+    let mut interp1 = VmInterpreter::new(&vm_module.functions[0], &mut adapters1, &registry);
+    let state1 = interp1.execute(
+        BTreeMap::new(),
+        WorldState::new(),
+        BTreeSet::new(),
+        None,
+        None,
+        100,
+    );
+
+    // 2. Snapshot the state and completely discard the first interpreter instance (R6)
+    let snapshot_json = serde_json::to_string(&state1).expect("Failed to serialize snapshot");
+    drop(interp1);
+    drop(state1);
+
+    // 3. Deserialize into a new state
+    let mut state2: bando::vm::interpreter::VmExecutionState =
+        serde_json::from_str(&snapshot_json).expect("Failed to deserialize snapshot");
+
+    // 4. Instantiate a brand NEW interpreter instance
+    let mut adapters2 = RuntimeAdapters::default();
+    let mut interp2 = VmInterpreter::new(&vm_module.functions[0], &mut adapters2, &registry);
+
+    // 5. Resume execution on the reconstructed state
+    interp2.resume(&mut state2, 100);
+
+    // 6. Verify completion applied exactly once and execution terminated in Satisfied
+    assert_eq!(state2.status, VmStatus::Terminated);
+    assert_eq!(state2.observable_effects, vec!["external(opRoot)".to_string()]);
+    let domain = state2.converge_domains.values().last().unwrap();
+    assert_eq!(domain.frame_status, bando::converge::domain::SearchStatus::Satisfied);
+}

@@ -109,6 +109,30 @@ pub enum VmInstruction {
         partial_map: std::collections::BTreeMap<String, VmValue>,
         space_faults: std::collections::BTreeMap<String, serde_json::Value>,
         fault_spec: crate::ir::ops::ConvergeFaultSpec,
+        space_effects: std::collections::BTreeSet<Effect>,
+        satisfier_effects: std::collections::BTreeSet<Effect>,
+    },
+    VmConvergeStage {
+        handle_dest: VmValueId,
+        frame_var: VmValueId,
+    },
+    VmConvergeEmit {
+        frame_var: VmValueId,
+        handle_var: VmValueId,
+        space_effects: std::collections::BTreeSet<Effect>,
+        satisfier_effects: std::collections::BTreeSet<Effect>,
+    },
+    VmConvergeAdmitCompletion {
+        frame_var: VmValueId,
+        handle_var: VmValueId,
+    },
+    VmConvergeSettle {
+        frame_var: VmValueId,
+        handle_var: VmValueId,
+    },
+    VmConvergeApply {
+        frame_var: VmValueId,
+        handle_var: VmValueId,
     },
     VmConvergeFinish {
         dest: VmValueId,
@@ -132,6 +156,11 @@ impl VmInstruction {
             VmInstruction::VmInternalize { dest, .. } => *dest,
             VmInstruction::VmConvergeInit { frame_var, .. } => *frame_var,
             VmInstruction::VmConvergeStep { dest, .. } => *dest,
+            VmInstruction::VmConvergeStage { handle_dest, .. } => *handle_dest,
+            VmInstruction::VmConvergeEmit { handle_var, .. } => *handle_var,
+            VmInstruction::VmConvergeAdmitCompletion { handle_var, .. } => *handle_var,
+            VmInstruction::VmConvergeSettle { handle_var, .. } => *handle_var,
+            VmInstruction::VmConvergeApply { handle_var, .. } => *handle_var,
             VmInstruction::VmConvergeFinish { dest, .. } => *dest,
         }
     }
@@ -160,7 +189,28 @@ impl VmInstruction {
                 validation_effects, ..
             } => validation_effects.clone(),
             VmInstruction::VmConvergeInit { .. } => Vec::new(),
-            VmInstruction::VmConvergeStep { .. } => Vec::new(),
+            VmInstruction::VmConvergeStep {
+                space_effects,
+                satisfier_effects,
+                ..
+            } => {
+                let mut effs = space_effects.clone();
+                effs.extend(satisfier_effects.iter().cloned());
+                effs.into_iter().collect()
+            }
+            VmInstruction::VmConvergeStage { .. } => Vec::new(),
+            VmInstruction::VmConvergeEmit {
+                space_effects,
+                satisfier_effects,
+                ..
+            } => {
+                let mut effs = space_effects.clone();
+                effs.extend(satisfier_effects.iter().cloned());
+                effs.into_iter().collect()
+            }
+            VmInstruction::VmConvergeAdmitCompletion { .. } => Vec::new(),
+            VmInstruction::VmConvergeSettle { .. } => Vec::new(),
+            VmInstruction::VmConvergeApply { .. } => Vec::new(),
             VmInstruction::VmConvergeFinish { .. } => Vec::new(),
         }
     }

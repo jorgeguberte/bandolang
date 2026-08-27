@@ -129,6 +129,11 @@ impl<'a> VmVerifier<'a> {
                     }
                     VmInstruction::VmConvergeInit { .. } => Type::Unit,
                     VmInstruction::VmConvergeStep { .. } => Type::Bool,
+                    VmInstruction::VmConvergeStage { .. } => Type::String,
+                    VmInstruction::VmConvergeEmit { .. } => Type::Unit,
+                    VmInstruction::VmConvergeAdmitCompletion { .. } => Type::Unit,
+                    VmInstruction::VmConvergeSettle { .. } => Type::Unit,
+                    VmInstruction::VmConvergeApply { .. } => Type::Unit,
                     VmInstruction::VmConvergeFinish {
                         partial_type,
                         satisfied_type,
@@ -336,6 +341,41 @@ impl<'a> VmVerifier<'a> {
             VmInstruction::VmConvergeInit { .. } => {}
             VmInstruction::VmConvergeStep { frame_var, .. } => {
                 self.check_visible(*frame_var, visible);
+            }
+            VmInstruction::VmConvergeStage { frame_var, .. } => {
+                self.check_visible(*frame_var, visible);
+            }
+            VmInstruction::VmConvergeEmit {
+                frame_var,
+                handle_var,
+                ..
+            } => {
+                self.check_visible(*frame_var, visible);
+                self.check_visible(*handle_var, visible);
+            }
+            VmInstruction::VmConvergeAdmitCompletion {
+                frame_var,
+                handle_var,
+                ..
+            } => {
+                self.check_visible(*frame_var, visible);
+                self.check_visible(*handle_var, visible);
+            }
+            VmInstruction::VmConvergeSettle {
+                frame_var,
+                handle_var,
+                ..
+            } => {
+                self.check_visible(*frame_var, visible);
+                self.check_visible(*handle_var, visible);
+            }
+            VmInstruction::VmConvergeApply {
+                frame_var,
+                handle_var,
+                ..
+            } => {
+                self.check_visible(*frame_var, visible);
+                self.check_visible(*handle_var, visible);
             }
             VmInstruction::VmConvergeFinish { frame_var, .. } => {
                 self.check_visible(*frame_var, visible);

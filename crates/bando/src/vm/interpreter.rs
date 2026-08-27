@@ -1289,6 +1289,8 @@ impl<'a> VmInterpreter<'a> {
                 partial_map,
                 space_faults,
                 fault_spec,
+                space_effects: _,
+                satisfier_effects: _,
             } => {
                 let frame_sym = format!("v{}", frame_var.0);
                 let dest_sym = format!("v{}", dest.0);
@@ -1629,17 +1631,21 @@ impl<'a> VmInterpreter<'a> {
                                                 st.completion = None;
                                             }
                                         } else {
-                                            if let Ok(serialized) =
-                                                serde_json::to_string(&domain)
-                                            {
-                                                if let Ok(restored) = serde_json::from_str::<
-                                                    crate::converge::domain::ConvergeTransactionDomain,
-                                                >(
-                                                    &serialized
-                                                ) {
-                                                    domain = restored;
-                                                }
-                                            }
+                                            // R6: Real VM execution state snapshot & reconstruction
+                                            state.converge_domains.insert(frame_sym.clone(), domain);
+                                            let serialized_state = serde_json::to_string(&*state)
+                                                .expect("Failed to serialize VmExecutionState snapshot");
+                                            let mut restored_state: VmExecutionState =
+                                                serde_json::from_str(&serialized_state)
+                                                    .expect("Failed to deserialize VmExecutionState");
+                                            restored_state
+                                                .invalidated_keys
+                                                .insert("__crashed_and_reconstructed__".to_string());
+                                            *state = restored_state;
+                                            domain = state
+                                                .converge_domains
+                                                .remove(&frame_sym)
+                                                .unwrap_or_default();
                                         }
                                     }
 
@@ -1966,6 +1972,36 @@ impl<'a> VmInterpreter<'a> {
                 state.types.insert(dest_sym, Type::Bool.display_name());
                 state.converge_domains.insert(frame_sym, domain);
             }
+            VmInstruction::VmConvergeStage {
+                handle_dest,
+                frame_var,
+            } => {
+                let frame_sym = format!("v{}", frame_var.0);
+                let handle_sym = format!("v{}", handle_dest.0);
+                let handle_id = state
+                    .converge_domains
+                    .get(&frame_sym)
+                    .and_then(|d| d.handles.keys().last().cloned())
+                    .unwrap_or_else(|| "h_staged".to_string());
+                state.env.insert(handle_sym.clone(), VmValue::String(handle_id));
+                state.types.insert(handle_sym, Type::String.display_name());
+            }
+            VmInstruction::VmConvergeEmit {
+                frame_var: _,
+                handle_var: _,
+                space_effects,
+                satisfier_effects,
+            } => {
+                for eff in space_effects.iter().chain(satisfier_effects.iter()) {
+                    let eff_str = eff.to_string();
+                    if !state.observable_effects.contains(&eff_str) {
+                        state.observable_effects.push(eff_str);
+                    }
+                }
+            }
+            VmInstruction::VmConvergeAdmitCompletion { .. } => {}
+            VmInstruction::VmConvergeSettle { .. } => {}
+            VmInstruction::VmConvergeApply { .. } => {}
             VmInstruction::VmConvergeFinish {
                 dest,
                 frame_var,
