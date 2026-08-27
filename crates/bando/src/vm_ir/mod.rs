@@ -1,0 +1,134 @@
+use std::collections::BTreeMap;
+use serde::{Deserialize, Serialize};
+
+use crate::ir::{
+    facts::LatentPostconditions,
+    types::Type,
+    values::Value as VmValue,
+};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct VmValueId(pub u32);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct VmBlockId(pub u32);
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VmInstruction {
+    VmPure {
+        dest: VmValueId,
+        val: VmValue,
+        ty: Type,
+    },
+    VmRead {
+        dest: VmValueId,
+        domain: String,
+        ok_type: Type,
+        err_type: Type,
+        latent: LatentPostconditions,
+    },
+    VmInfer {
+        dest: VmValueId,
+        prompt: String,
+        ok_type: Type,
+        err_type: Type,
+        latent: LatentPostconditions,
+    },
+    VmAssign {
+        dest: VmValueId,
+        source: VmValueId,
+        ty: Type,
+    },
+}
+
+impl VmInstruction {
+    pub fn dest(&self) -> VmValueId {
+        match self {
+            VmInstruction::VmPure { dest, .. } => *dest,
+            VmInstruction::VmRead { dest, .. } => *dest,
+            VmInstruction::VmInfer { dest, .. } => *dest,
+            VmInstruction::VmAssign { dest, .. } => *dest,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum VmTerminator {
+    Return(Option<VmValueId>),
+    Br {
+        target: VmBlockId,
+        args: Vec<VmValueId>,
+    },
+    CondBr {
+        cond: VmValueId,
+        true_target: VmBlockId,
+        true_args: Vec<VmValueId>,
+        false_target: VmBlockId,
+        false_args: Vec<VmValueId>,
+    },
+    SwitchResult {
+        result_val: VmValueId,
+        ok_target: VmBlockId,
+        ok_arg: VmValueId,
+        err_target: VmBlockId,
+        err_arg: VmValueId,
+    },
+    Unreachable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmBlock {
+    pub id: VmBlockId,
+    pub name: Option<String>,
+    pub params: Vec<(VmValueId, Type)>,
+    pub instructions: Vec<VmInstruction>,
+    pub terminator: VmTerminator,
+}
+
+impl VmBlock {
+    pub fn new(id: VmBlockId, terminator: VmTerminator) -> Self {
+        Self {
+            id,
+            name: None,
+            params: Vec::new(),
+            instructions: Vec::new(),
+            terminator,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmFunction {
+    pub name: String,
+    pub params: Vec<(VmValueId, Type)>,
+    pub return_type: Type,
+    pub entry: VmBlockId,
+    pub blocks: BTreeMap<VmBlockId, VmBlock>,
+}
+
+impl VmFunction {
+    pub fn new(name: impl Into<String>, entry: VmBlockId, return_type: Type) -> Self {
+        Self {
+            name: name.into(),
+            params: Vec::new(),
+            return_type,
+            entry,
+            blocks: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmModule {
+    pub name: String,
+    pub functions: Vec<VmFunction>,
+}
+
+impl VmModule {
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            functions: Vec::new(),
+        }
+    }
+}
