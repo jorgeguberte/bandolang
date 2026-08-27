@@ -1027,6 +1027,8 @@ impl<'a> HighLevelVerifier<'a> {
             }
             Instruction::Converge {
                 space_ops,
+                node_ops,
+                satisfier,
                 search_policy,
                 budget_scope,
                 max_steps,
@@ -1105,7 +1107,36 @@ impl<'a> HighLevelVerifier<'a> {
                     }
                 }
 
-                // 5. Compute required effects: Σ_converge = Σ_space ∪ Σ_satisfier
+                // 5. R4: Operation effect envelope validation
+                for (node_id, op) in node_ops {
+                    for eff in op.effective_effects() {
+                        if !space_effects.contains(&eff) {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::EffectUndeclared,
+                                format!(
+                                    "External node operation {:?} on node '{}' requires effect {:?} not declared in space_effects",
+                                    op.op_id, node_id, eff
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                if let Some(es) = &satisfier.effectful_op {
+                    for eff in es.effective_effects() {
+                        if !satisfier_effects.contains(&eff) {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::EffectUndeclared,
+                                format!(
+                                    "Effectful satisfier operation {:?} requires effect {:?} not declared in satisfier_effects",
+                                    es.op_id, eff
+                                ),
+                            ));
+                        }
+                    }
+                }
+
+                // 6. Compute required effects: Σ_converge = Σ_space ∪ Σ_satisfier
                 let mut effs = space_effects.effects.clone();
                 effs.extend(satisfier_effects.effects.clone());
                 effs.into_iter().collect()

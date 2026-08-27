@@ -46,8 +46,45 @@ def canonical_repr(d):
 
 
 def make_converge_program(name: str, converge_spec: dict, declared_effects: list | None = None) -> dict:
-    if declared_effects is None:
-        declared_effects = []
+    node_ops = converge_spec.get("node_ops", {})
+    space_effs = []
+    for node, op in node_ops.items():
+        if op.get("kind") == "external":
+            eff = {"Act": op.get("op_id", node)}
+            if eff not in space_effs:
+                space_effs.append(eff)
+            if "required_effects" not in op:
+                op["required_effects"] = [eff]
+
+    satisfier = converge_spec.get(
+        "satisfier",
+        {"kind": "local", "effectful_op": None, "satisfier_map": {}},
+    )
+    satisfier_effs = []
+    if satisfier.get("effectful_op") is not None:
+        es = satisfier["effectful_op"]
+        eff = {"Act": es.get("op_id", "sat_op")}
+        satisfier_effs.append(eff)
+        if "required_effects" not in es:
+            es["required_effects"] = [eff]
+
+    if "space_effects" in converge_spec:
+        space_effs_obj = converge_spec["space_effects"]
+    else:
+        space_effs_obj = {"effects": space_effs}
+
+    if "satisfier_effects" in converge_spec:
+        satisfier_effs_obj = converge_spec["satisfier_effects"]
+    else:
+        satisfier_effs_obj = {"effects": satisfier_effs}
+
+    all_effs = list(declared_effects) if declared_effects else []
+    for e in space_effs_obj.get("effects", []):
+        if e not in all_effs:
+            all_effs.append(e)
+    for e in satisfier_effs_obj.get("effects", []):
+        if e not in all_effs:
+            all_effs.append(e)
 
     ret_ty = {
         "kind": "Result",
@@ -78,7 +115,7 @@ def make_converge_program(name: str, converge_spec: dict, declared_effects: list
                     "name": "main",
                     "params": [],
                     "return_type": ret_ty,
-                    "declared_effects": {"effects": declared_effects},
+                    "declared_effects": {"effects": all_effs},
                     "entry": 0,
                     "blocks": {
                         "0": {
@@ -92,11 +129,8 @@ def make_converge_program(name: str, converge_spec: dict, declared_effects: list
                                         "root_node": converge_spec.get("root_node", "root"),
                                         "initial_frontier": converge_spec.get("initial_frontier", ["root"]),
                                         "successors": converge_spec.get("successors", {}),
-                                        "node_ops": converge_spec.get("node_ops", {}),
-                                        "satisfier": converge_spec.get(
-                                            "satisfier",
-                                            {"kind": "local", "effectful_op": None, "satisfier_map": {}},
-                                        ),
+                                        "node_ops": node_ops,
+                                        "satisfier": satisfier,
                                         "partial_map": converge_spec.get("partial_map", {}),
                                         "space_faults": converge_spec.get("space_faults", {}),
                                         "fault_spec": converge_spec.get("fault_spec", {}),
@@ -120,8 +154,8 @@ def make_converge_program(name: str, converge_spec: dict, declared_effects: list
                                         ),
                                         "max_steps": converge_spec.get("max_steps", 6),
                                         "max_satisfaction_attempts": converge_spec.get("max_satisfaction_attempts", 5),
-                                        "space_effects": converge_spec.get("space_effects", {"effects": []}),
-                                        "satisfier_effects": converge_spec.get("satisfier_effects", {"effects": []}),
+                                        "space_effects": space_effs_obj,
+                                        "satisfier_effects": satisfier_effs_obj,
                                         "partial_type": converge_spec.get("partial_type", {"kind": "String"}),
                                         "satisfied_type": converge_spec.get("satisfied_type", {"kind": "String"}),
                                     }

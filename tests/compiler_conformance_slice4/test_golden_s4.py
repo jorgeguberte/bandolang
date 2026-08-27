@@ -243,15 +243,22 @@ def s4c05_effectful_satisfier():
         "partial_map": {"root": {"kind": "String", "payload": "P_root"}},
         "satisfier": {
             "kind": "external",
-            "effectful_op": {"op_id": "opSatExt", "kind": "external", "cost": 15, "actual_cost": 12},
+            "effectful_op": {
+                "op_id": "opSatExt",
+                "kind": "external",
+                "cost": 15,
+                "actual_cost": 12,
+                "required_effects": [{"Act": "opSatExt"}],
+            },
             "satisfier_map": {
                 "root": ["ok", True, {"kind": "String", "payload": "T-effectful"}],
             },
         },
+        "satisfier_effects": {"effects": [{"Act": "opSatExt"}]},
         "budget_limit": 100,
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C05_effectful_satisfier", spec)
+    prog = make_converge_program("S4C05_effectful_satisfier", spec, declared_effects=[{"Act": "opSatExt"}])
     run_golden("S4C05_effectful_satisfier", prog, expected_converge_status="Satisfied", expected_val_payload="T-effectful")
 
 
@@ -261,12 +268,20 @@ def s4c06_stage_local_rejection():
         "root_node": "root",
         "initial_frontier": ["root"],
         "successors": {"root": []},
-        "node_ops": {"root": {"op_id": "opExpensive", "kind": "external", "cost": 150}},
+        "node_ops": {
+            "root": {
+                "op_id": "opExpensive",
+                "kind": "external",
+                "cost": 150,
+                "required_effects": [{"Act": "opExpensive"}],
+            }
+        },
+        "space_effects": {"effects": [{"Act": "opExpensive"}]},
         "partial_map": {},
         "budget_limit": 100,
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C06_stage_local_rejection", spec)
+    prog = make_converge_program("S4C06_stage_local_rejection", spec, declared_effects=[{"Act": "opExpensive"}])
     run_golden("S4C06_stage_local_rejection", prog, expected_converge_status="Exhausted")
 
 
@@ -277,9 +292,15 @@ def s4c07_first_external_emission():
         "initial_frontier": ["root"],
         "successors": {"root": ["succ"]},
         "node_ops": {
-            "root": {"op_id": "opExt", "kind": "external", "cost": 15},
+            "root": {
+                "op_id": "opExt",
+                "kind": "external",
+                "cost": 15,
+                "required_effects": [{"Act": "opExt"}],
+            },
             "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
         },
+        "space_effects": {"effects": [{"Act": "opExt"}]},
         "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
         "satisfier": {
             "kind": "local",
@@ -292,7 +313,7 @@ def s4c07_first_external_emission():
         "budget_limit": 100,
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C07_first_external_emission", spec)
+    prog = make_converge_program("S4C07_first_external_emission", spec, declared_effects=[{"Act": "opExt"}])
     run_golden("S4C07_first_external_emission", prog, expected_converge_status="Satisfied", expected_val_payload="T-ext")
 
 
@@ -303,9 +324,16 @@ def s4c08_safe_transport_retry():
         "initial_frontier": ["root"],
         "successors": {"root": ["succ"]},
         "node_ops": {
-            "root": {"op_id": "opRetry", "kind": "external", "cost": 20, "dedup_capable": True},
+            "root": {
+                "op_id": "opRetry",
+                "kind": "external",
+                "cost": 20,
+                "dedup_capable": True,
+                "required_effects": [{"Act": "opRetry"}],
+            },
             "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
         },
+        "space_effects": {"effects": [{"Act": "opRetry"}]},
         "fault_spec": {"delivery_unknown": True, "safe_retry": True},
         "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
         "satisfier": {
@@ -319,7 +347,7 @@ def s4c08_safe_transport_retry():
         "budget_limit": 100,
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C08_safe_transport_retry", spec)
+    prog = make_converge_program("S4C08_safe_transport_retry", spec, declared_effects=[{"Act": "opRetry"}])
     run_golden("S4C08_safe_transport_retry", prog, expected_converge_status="Satisfied", expected_val_payload="T-retry")
 
 
@@ -329,14 +357,39 @@ def s4c09_unsafe_delivery_unknown():
         "root_node": "root",
         "initial_frontier": ["root"],
         "successors": {"root": []},
-        "node_ops": {"root": {"op_id": "opNonIdemp", "kind": "external", "cost": 30, "dedup_capable": False, "idempotent": False}},
+        "node_ops": {
+            "root": {
+                "op_id": "opNonIdemp",
+                "kind": "external",
+                "cost": 30,
+                "dedup_capable": False,
+                "idempotent": False,
+                "required_effects": [{"Act": "opNonIdemp"}],
+            }
+        },
         "fault_spec": {"delivery_unknown": True, "safe_retry": False},
+        "space_effects": {"effects": [{"Act": "opNonIdemp"}]},
         "partial_map": {},
         "budget_limit": 100,
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C09_unsafe_delivery_unknown", spec)
-    run_golden("S4C09_unsafe_delivery_unknown", prog, expected_converge_status="Waiting")
+    # 1. Without resume: frame suspends in Waiting, VM is not Terminated, return_val is None (R3)
+    prog = make_converge_program("S4C09_unsafe_delivery_unknown", spec, declared_effects=[{"Act": "opNonIdemp"}])
+    obs = invoke_rust_conformance(prog)
+    assert obs["status"].startswith("waiting_on_converge"), f"R3: expected waiting_on_converge, got {obs['status']}"
+    assert obs["return_val"] is None, f"R3: expected return_val None, got {obs['return_val']}"
+    assert obs["converge_observation"]["status"] == "Waiting", f"R3: expected converge status Waiting, got {obs['converge_observation']['status']}"
+
+    # 2. With simulated resumption: resumes continuation to termination (R3)
+    prog_resumed = make_converge_program("S4C09_unsafe_delivery_unknown_resumed", spec, declared_effects=[{"Act": "opNonIdemp"}])
+    prog_resumed["simulate_suspension_and_resume"] = True
+    obs_resumed = invoke_rust_conformance(prog_resumed)
+    assert obs_resumed["status"] == "ok", f"R3: expected ok on resumed continuation, got {obs_resumed['status']}"
+    assert obs_resumed["return_val"] is not None, "R3: expected return_val on resumed continuation"
+
+    global PASS
+    print("  ✓ PASS S4C09_unsafe_delivery_unknown (verified Waiting suspension without Result + resumed continuation)")
+    PASS += 1
 
 
 # S4C10: Duplicate completion
@@ -345,12 +398,20 @@ def s4c10_duplicate_completion():
         "root_node": "root",
         "initial_frontier": ["root"],
         "successors": {"root": []},
-        "node_ops": {"root": {"op_id": "opDup", "kind": "external", "cost": 10}},
+        "node_ops": {
+            "root": {
+                "op_id": "opDup",
+                "kind": "external",
+                "cost": 10,
+                "required_effects": [{"Act": "opDup"}],
+            }
+        },
+        "space_effects": {"effects": [{"Act": "opDup"}]},
         "fault_spec": {"duplicate_completion": True},
         "partial_map": {},
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C10_duplicate_completion", spec)
+    prog = make_converge_program("S4C10_duplicate_completion", spec, declared_effects=[{"Act": "opDup"}])
     run_golden("S4C10_duplicate_completion", prog, expected_converge_status="Exhausted")
 
 
@@ -368,16 +429,22 @@ def s4c11_receipt_equivocation():
     run_golden("S4C11_receipt_equivocation", prog, expected_converge_status="Exhausted")
 
 
-# S4C12: Crash after settlement recovery
+# S4C12: Crash after settlement recovery (R6)
 def s4c12_crash_after_settlement():
     spec = {
         "root_node": "root",
         "initial_frontier": ["root"],
         "successors": {"root": ["succ"]},
         "node_ops": {
-            "root": {"op_id": "opRoot", "kind": "external", "cost": 10},
+            "root": {
+                "op_id": "opRoot",
+                "kind": "external",
+                "cost": 10,
+                "required_effects": [{"Act": "opRoot"}],
+            },
             "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
         },
+        "space_effects": {"effects": [{"Act": "opRoot"}]},
         "fault_spec": {"crash_after_settlement": True},
         "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
         "satisfier": {
@@ -390,7 +457,7 @@ def s4c12_crash_after_settlement():
         },
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C12_crash_after_settlement", spec)
+    prog = make_converge_program("S4C12_crash_after_settlement", spec, declared_effects=[{"Act": "opRoot"}])
     run_golden("S4C12_crash_after_settlement", prog, expected_converge_status="Satisfied", expected_val_payload="T-recovered")
 
 
@@ -400,12 +467,20 @@ def s4c13_cancel_in_flight():
         "root_node": "root",
         "initial_frontier": ["root"],
         "successors": {"root": []},
-        "node_ops": {"root": {"op_id": "opCancel", "kind": "external", "cost": 10}},
+        "node_ops": {
+            "root": {
+                "op_id": "opCancel",
+                "kind": "external",
+                "cost": 10,
+                "required_effects": [{"Act": "opCancel"}],
+            }
+        },
+        "space_effects": {"effects": [{"Act": "opCancel"}]},
         "partial_map": {},
         "fault_spec": {"delivery_unknown": False, "cancel_in_flight": True},
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C13_cancel_in_flight", spec)
+    prog = make_converge_program("S4C13_cancel_in_flight", spec, declared_effects=[{"Act": "opCancel"}])
     run_golden("S4C13_cancel_in_flight", prog, expected_converge_status="Cancelled")
 
 
@@ -415,11 +490,19 @@ def s4c14_late_settlement_during_closing():
         "root_node": "root",
         "initial_frontier": ["root"],
         "successors": {"root": []},
-        "node_ops": {"root": {"op_id": "opLate", "kind": "external", "cost": 10}},
+        "node_ops": {
+            "root": {
+                "op_id": "opLate",
+                "kind": "external",
+                "cost": 10,
+                "required_effects": [{"Act": "opLate"}],
+            }
+        },
+        "space_effects": {"effects": [{"Act": "opLate"}]},
         "partial_map": {},
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C14_late_settlement_during_closing", spec)
+    prog = make_converge_program("S4C14_late_settlement_during_closing", spec, declared_effects=[{"Act": "opLate"}])
     run_golden("S4C14_late_settlement_during_closing", prog, expected_converge_status="Exhausted")
 
 
@@ -429,13 +512,21 @@ def s4c15_step_failure_abort():
         "root_node": "root",
         "initial_frontier": ["root"],
         "successors": {"root": []},
-        "node_ops": {"root": {"op_id": "opFail", "kind": "external", "cost": 10}},
+        "node_ops": {
+            "root": {
+                "op_id": "opFail",
+                "kind": "external",
+                "cost": 10,
+                "required_effects": [{"Act": "opFail"}],
+            }
+        },
+        "space_effects": {"effects": [{"Act": "opFail"}]},
         "space_faults": {"opFail": "StepError"},
         "on_step_failure": "abort",
         "partial_map": {},
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C15_step_failure_abort", spec)
+    prog = make_converge_program("S4C15_step_failure_abort", spec, declared_effects=[{"Act": "opFail"}])
     run_golden("S4C15_step_failure_abort", prog, expected_converge_status="Failed")
 
 
@@ -446,9 +537,15 @@ def s4c16_step_failure_prune():
         "initial_frontier": ["root", "other"],
         "successors": {"root": [], "other": []},
         "node_ops": {
-            "root": {"op_id": "opFail", "kind": "external", "cost": 10},
+            "root": {
+                "op_id": "opFail",
+                "kind": "external",
+                "cost": 10,
+                "required_effects": [{"Act": "opFail"}],
+            },
             "other": {"op_id": "opOther", "kind": "local", "cost": 0},
         },
+        "space_effects": {"effects": [{"Act": "opFail"}]},
         "space_faults": {"opFail": "PruneError"},
         "on_step_failure": "prune",
         "partial_map": {"other": {"kind": "String", "payload": "P_other"}},
@@ -462,7 +559,7 @@ def s4c16_step_failure_prune():
         },
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C16_step_failure_prune", spec)
+    prog = make_converge_program("S4C16_step_failure_prune", spec, declared_effects=[{"Act": "opFail"}])
     run_golden("S4C16_step_failure_prune", prog, expected_converge_status="Satisfied", expected_val_payload="T-prune-success")
 
 
@@ -473,9 +570,15 @@ def s4c17_step_failure_requeue():
         "initial_frontier": ["root"],
         "successors": {"root": ["succQ"]},
         "node_ops": {
-            "root": {"op_id": "opRequeue", "kind": "external", "cost": 10},
+            "root": {
+                "op_id": "opRequeue",
+                "kind": "external",
+                "cost": 10,
+                "required_effects": [{"Act": "opRequeue"}],
+            },
             "succQ": {"op_id": "opSuccQ", "kind": "local", "cost": 0},
         },
+        "space_effects": {"effects": [{"Act": "opRequeue"}]},
         "space_faults": {"opRequeue": ["TransientFail", None]},
         "on_step_failure": "requeue",
         "partial_map": {"succQ": {"kind": "String", "payload": "P_succQ"}},
@@ -489,7 +592,7 @@ def s4c17_step_failure_requeue():
         },
         "max_steps": 6,
     }
-    prog = make_converge_program("S4C17_step_failure_requeue", spec)
+    prog = make_converge_program("S4C17_step_failure_requeue", spec, declared_effects=[{"Act": "opRequeue"}])
     run_golden("S4C17_step_failure_requeue", prog, expected_converge_status="Satisfied", expected_val_payload="T-requeue-success")
 
 

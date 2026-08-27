@@ -273,9 +273,40 @@ def s4v07_malformed_on_satisfier_error():
     run_negative("S4V07_malformed_on_satisfier_error", prog, "MalformedDescriptor")
 
 
+# S4V08: External node operation attempts effect undeclared in space_effects (R4)
+def s4v08_external_node_effect_undeclared():
+    inst = {
+        "dest": 1,
+        "root_node": "root",
+        "node_ops": {
+            "root": {
+                "op_id": "opExtUnauthorized",
+                "kind": "external",
+                "cost": 10,
+                "required_effects": [{"Act": "unauthorized_domain"}],
+            }
+        },
+        "search_policy": {
+            "policy_id": "pure_policy",
+            "on_step_failure": "abort",
+            "on_satisfier_error": "abort",
+            "policy_effects": {"effects": []},
+        },
+        "budget_scope": {"resource": "usd", "limit": 100},
+        "max_steps": 10,
+        "max_satisfaction_attempts": 5,
+        "space_effects": {"effects": [{"Read": "space_data"}]},
+        "satisfier_effects": {"effects": []},
+        "partial_type": make_type_string(),
+        "satisfied_type": make_type_string(),
+    }
+    prog = base_converge_program(inst, declared_effects=[{"Read": "space_data"}])
+    run_negative("S4V08_external_node_effect_undeclared", prog, "EffectUndeclared")
+
+
 def main():
     print("=" * 70)
-    print("SOMA COMPILER CONFORMANCE v0 (SLICE 4) — Negative Verifier Tests (S4V01–S4V07)")
+    print("SOMA COMPILER CONFORMANCE v0 (SLICE 4) — Negative Verifier Tests (S4V01–S4V08)")
 
     s4v01_effectful_search_policy()
     s4v02_converge_effect_undeclared()
@@ -284,12 +315,13 @@ def main():
     s4v05_invalid_max_satisfaction_attempts_zero()
     s4v06_malformed_on_step_failure()
     s4v07_malformed_on_satisfier_error()
+    s4v08_external_node_effect_undeclared()
 
     print("=" * 70)
     print(f"SLICE 4 NEGATIVE VERIFIER RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")
     if FAIL > 0:
         sys.exit(1)
-    print("All 7 Slice 4 Negative Verifier Tests correctly rejected by Rust Verifier.")
+    print("All 8 Slice 4 Negative Verifier Tests correctly rejected by Rust Verifier.")
 
 
 if __name__ == "__main__":

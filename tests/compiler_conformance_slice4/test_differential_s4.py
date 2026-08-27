@@ -77,8 +77,13 @@ def canonical_repr(d):
 
 
 def convert_scenario_to_rust_json(prog: ScenarioProgram) -> dict:
+    space_effs = []
     node_ops_json = {}
     for node, op in prog.node_ops.items():
+        effs = [{"Act": op.op_id}] if op.kind == "external" else []
+        if op.kind == "external" and {"Act": op.op_id} not in space_effs:
+            space_effs.append({"Act": op.op_id})
+
         node_ops_json[node] = {
             "op_id": op.op_id,
             "kind": op.kind,
@@ -87,6 +92,7 @@ def convert_scenario_to_rust_json(prog: ScenarioProgram) -> dict:
             "request_id": op.request_id,
             "dedup_capable": op.dedup_capable,
             "idempotent": op.idempotent,
+            "required_effects": effs,
         }
 
     partial_map_json = {}
@@ -126,9 +132,11 @@ def convert_scenario_to_rust_json(prog: ScenarioProgram) -> dict:
                     val_json = {"kind": "String", "payload": str(val)}
             satisfier_map_json[node] = [tag, is_sat, val_json]
 
+    satisfier_effs = []
     effectful_sat_json = None
     if prog.effectful_satisfier is not None:
         es = prog.effectful_satisfier
+        satisfier_effs.append({"Act": es.op_id})
         effectful_sat_json = {
             "op_id": es.op_id,
             "kind": es.kind,
@@ -137,7 +145,13 @@ def convert_scenario_to_rust_json(prog: ScenarioProgram) -> dict:
             "request_id": es.request_id,
             "dedup_capable": es.dedup_capable,
             "idempotent": es.idempotent,
+            "required_effects": [{"Act": es.op_id}],
         }
+
+    all_declared_effs = list(space_effs)
+    for e in satisfier_effs:
+        if e not in all_declared_effs:
+            all_declared_effs.append(e)
 
     ret_ty = {
         "kind": "Result",
@@ -164,7 +178,7 @@ def convert_scenario_to_rust_json(prog: ScenarioProgram) -> dict:
                     "name": "main",
                     "params": [],
                     "return_type": ret_ty,
-                    "declared_effects": {"effects": []},
+                    "declared_effects": {"effects": all_declared_effs},
                     "entry": 0,
                     "blocks": {
                         "0": {
@@ -209,8 +223,8 @@ def convert_scenario_to_rust_json(prog: ScenarioProgram) -> dict:
                                         },
                                         "max_steps": prog.max_steps,
                                         "max_satisfaction_attempts": prog.max_satisfaction_attempts,
-                                        "space_effects": {"effects": []},
-                                        "satisfier_effects": {"effects": []},
+                                        "space_effects": {"effects": space_effs},
+                                        "satisfier_effects": {"effects": satisfier_effs},
                                         "partial_type": {"kind": "String"},
                                         "satisfied_type": {"kind": "String"},
                                     }

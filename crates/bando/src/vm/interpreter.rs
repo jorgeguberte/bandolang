@@ -29,11 +29,12 @@ pub enum VmStatus {
     Running,
     Terminated,
     WaitingOnChild(String),
+    WaitingOnConverge(String),
     Error(String),
     ProtocolViolation(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmExecutionState {
     pub current_block: VmBlockId,
     pub env: BTreeMap<String, VmValue>,
@@ -1677,6 +1678,27 @@ impl<'a> VmInterpreter<'a> {
                             }
                         }
 
+                        if domain.frame_status == crate::converge::domain::SearchStatus::Waiting
+                            && !(self.mutations.s4m08_second_unsettled_request_allowed
+                                && !domain.frontier.is_empty())
+                        {
+                            let in_flight_h = domain
+                                .handles
+                                .values()
+                                .find(|s| {
+                                    s.settlement.is_none()
+                                        && s.state != "Aborted"
+                                        && s.state != "ConfirmedNotDelivered"
+                                })
+                                .map(|s| s.handle_id.clone())
+                                .unwrap_or_else(|| "h_converge".to_string());
+                            state.status = VmStatus::WaitingOnConverge(in_flight_h);
+                            state.return_value = None;
+                            state.types.insert(dest_sym, Type::Bool.display_name());
+                            state.converge_domains.insert(frame_sym, domain);
+                            return;
+                        }
+
                         let is_still_searching = domain.frame_status
                             == crate::converge::domain::SearchStatus::Searching
                             || (self.mutations.s4m08_second_unsettled_request_allowed
@@ -1902,11 +1924,35 @@ impl<'a> VmInterpreter<'a> {
                                             self.mutations.s4m16_terminalizes_with_commitment,
                                         );
                                     }
-                                    if domain.frame_status == crate::converge::domain::SearchStatus::Closing {
-                                        let _ = crate::converge::engine::finish_if_drained(&mut domain);
+                                    if domain.frame_status
+                                        == crate::converge::domain::SearchStatus::Closing
+                                    {
+                                        let _ =
+                                            crate::converge::engine::finish_if_drained(&mut domain);
                                     }
                                 }
                             }
+                        }
+
+                        if domain.frame_status == crate::converge::domain::SearchStatus::Waiting
+                            && !(self.mutations.s4m08_second_unsettled_request_allowed
+                                && !domain.frontier.is_empty())
+                        {
+                            let in_flight_h = domain
+                                .handles
+                                .values()
+                                .find(|s| {
+                                    s.settlement.is_none()
+                                        && s.state != "Aborted"
+                                        && s.state != "ConfirmedNotDelivered"
+                                })
+                                .map(|s| s.handle_id.clone())
+                                .unwrap_or_else(|| "h_converge".to_string());
+                            state.status = VmStatus::WaitingOnConverge(in_flight_h);
+                            state.return_value = None;
+                            state.types.insert(dest_sym, Type::Bool.display_name());
+                            state.converge_domains.insert(frame_sym, domain);
+                            return;
                         }
 
                         let is_still_searching = domain.frame_status

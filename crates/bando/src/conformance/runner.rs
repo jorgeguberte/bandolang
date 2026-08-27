@@ -201,6 +201,59 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
             }
             state.status = VmStatus::Running;
             interpreter.resume(&mut state, 1000);
+        } else if let VmStatus::WaitingOnConverge(ref h_id) = state.status {
+            let suspended_h = h_id.clone();
+            // External completion & settlement arrive!
+            for d in state.converge_domains.values_mut() {
+                if let Some(st) = d.handles.get_mut(&suspended_h) {
+                    st.state = "Delivered".to_string();
+                    let charge = st.reserved_amount;
+                    let receipt = crate::converge::domain::ExecutionReceipt {
+                        request_id: st.request_id.clone(),
+                        receipt_id: format!("receipt-{}", st.request_id),
+                        resource: "usd".to_string(),
+                        amount: charge,
+                    };
+                    let completion = crate::converge::domain::CompletionRecord {
+                        handle_id: suspended_h.clone(),
+                        receipt_id: format!("receipt-{}", st.request_id),
+                        digest: format!("digest-{}", st.request_id),
+                        outcome: "Success".to_string(),
+                        semantic_payload: Some(crate::converge::domain::SemanticPayload::Space(
+                            crate::converge::domain::SpaceOutcome {
+                                successors: vec!["succ_resumed".to_string()],
+                                error: None,
+                                is_failure: false,
+                            },
+                        )),
+                        receipt: Some(receipt.clone()),
+                    };
+                    let _ = crate::converge::engine::admit_completion(
+                        d,
+                        &suspended_h,
+                        completion,
+                        false,
+                    );
+                    let _ = crate::converge::engine::reconcile_settlement(
+                        d,
+                        &suspended_h,
+                        receipt,
+                        false,
+                        false,
+                    );
+                    let _ = crate::converge::engine::apply_semantic(
+                        d,
+                        &suspended_h,
+                        false,
+                        false,
+                        false,
+                        false,
+                    );
+                }
+                d.frame_status = crate::converge::domain::SearchStatus::Searching;
+            }
+            state.status = VmStatus::Running;
+            interpreter.resume(&mut state, 1000);
         }
     }
 
@@ -208,6 +261,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
         VmStatus::Running => "running".to_string(),
         VmStatus::Terminated => "ok".to_string(),
         VmStatus::WaitingOnChild(h) => format!("waiting_on_child({})", h),
+        VmStatus::WaitingOnConverge(h) => format!("waiting_on_converge({})", h),
         VmStatus::Error(msg) => format!("error: {}", msg),
         VmStatus::ProtocolViolation(msg) => format!("protocol_violation: {}", msg),
     };

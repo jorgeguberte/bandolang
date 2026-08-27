@@ -154,6 +154,20 @@ pub struct SpaceOpDef {
     pub dedup_capable: bool,
     #[serde(default = "default_true")]
     pub idempotent: bool,
+    #[serde(default)]
+    pub required_effects: Vec<Effect>,
+}
+
+impl SpaceOpDef {
+    pub fn effective_effects(&self) -> Vec<Effect> {
+        if !self.required_effects.is_empty() {
+            self.required_effects.clone()
+        } else if self.kind == "external" {
+            vec![Effect::Act(self.op_id.clone())]
+        } else {
+            Vec::new()
+        }
+    }
 }
 
 impl Default for SpaceOpDef {
@@ -166,6 +180,7 @@ impl Default for SpaceOpDef {
             request_id: None,
             dedup_capable: true,
             idempotent: true,
+            required_effects: Vec::new(),
         }
     }
 }
