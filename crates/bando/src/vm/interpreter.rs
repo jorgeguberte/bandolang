@@ -1356,11 +1356,7 @@ impl<'a> VmInterpreter<'a> {
 
                 match action {
                     crate::converge::scheduler::SchedulerAction::Stop { reason } => {
-                        crate::converge::engine::exhaust(&mut domain, &reason);
-                        let _ = crate::converge::engine::terminalize(
-                            &mut domain,
-                            self.mutations.s4m16_terminalizes_with_commitment,
-                        );
+                        domain.pending_stop = Some(reason);
                         domain.pending_action = None;
                         state.env.insert(dest_sym.clone(), VmValue::Bool(false));
                     }
@@ -2013,6 +2009,24 @@ impl<'a> VmInterpreter<'a> {
                 }
 
                 domain.pending_action = None;
+                state.converge_domains.insert(frame_sym, domain);
+            }
+            VmInstruction::VmConvergeExhaust { frame_var } => {
+                let frame_sym = format!("v{}", frame_var.0);
+
+                let mut domain = state
+                    .converge_domains
+                    .remove(&frame_sym)
+                    .unwrap_or_default();
+
+                if let Some(reason) = domain.pending_stop.take() {
+                    crate::converge::engine::exhaust(&mut domain, &reason);
+                    let _ = crate::converge::engine::terminalize(
+                        &mut domain,
+                        self.mutations.s4m16_terminalizes_with_commitment,
+                    );
+                }
+
                 state.converge_domains.insert(frame_sym, domain);
             }
             VmInstruction::VmConvergeFinish {

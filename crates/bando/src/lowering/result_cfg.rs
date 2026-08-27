@@ -546,9 +546,12 @@ impl LoweringContext {
                     };
                     generated_blocks.insert(tx_body_id, tx_block);
 
-                    // 3. Exit Block
+                    // 3. Exit Block (Discrete Exhaustion/Closing and Final Outcome Materialization)
                     let mut exit_block = VmBlock::new(exit_block_id, VmTerminator::Unreachable);
                     exit_block.name = Some("converge_exit".to_string());
+                    exit_block
+                        .instructions
+                        .push(VmInstruction::VmConvergeExhaust { frame_var });
                     exit_block.instructions.push(VmInstruction::VmConvergeFinish {
                         dest: vm_dest,
                         frame_var,

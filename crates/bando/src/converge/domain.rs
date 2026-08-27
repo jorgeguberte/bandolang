@@ -218,6 +218,8 @@ pub struct ConvergeTransactionDomain {
     #[serde(default)]
     pub pending_action: Option<PendingAction>,
     #[serde(default)]
+    pub pending_stop: Option<String>,
+    #[serde(default)]
     pub last_staged_handle: Option<String>,
 
     // 4. Coordinated accounting
@@ -263,6 +265,7 @@ impl Default for ConvergeTransactionDomain {
             applied_completions: Vec::new(),
             settlement_reconciliations: BTreeMap::new(),
             pending_action: None,
+            pending_stop: None,
             last_staged_handle: None,
             scope_limit: BTreeMap::new(),
             scope_committed: BTreeMap::new(),

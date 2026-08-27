@@ -942,6 +942,107 @@ fn test_slice4_local_boundary_stopping_between_selection_and_execution() {
     assert!(!final_domain.visited.is_empty(), "R2: dispatch_local executed on resume");
     assert_eq!(final_domain.visited[0].node_id, "root");
 }
+
+#[test]
+fn test_slice4_stop_boundary_stopping_between_selection_and_exhaustion() {
+    let registry = RegistrySnapshot::default();
+
+    let expected_return_ty = Type::result(
+        Type::convergence_outcome(Type::String, Type::exhaustion_report(Type::String)),
+        Type::String,
+    );
+
+    let mut func = Function::new("main", BlockId(0), expected_return_ty);
+    let mut entry = Block::new(BlockId(0), Terminator::Return(Some(ValueId(1))));
+
+    // Converge with max_steps: 0 -> scheduler immediately selects Stop("FuelExhausted")
+    entry.instructions.push(Instruction::Converge {
+        dest: ValueId(1),
+        root_node: "root".to_string(),
+        initial_frontier: vec!["root".to_string()],
+        successors: std::collections::BTreeMap::new(),
+        node_ops: std::collections::BTreeMap::new(),
+        satisfier: bando::ir::ops::SatisfierDef::default(),
+        partial_map: std::collections::BTreeMap::new(),
+        space_faults: std::collections::BTreeMap::new(),
+        fault_spec: bando::ir::ops::ConvergeFaultSpec::default(),
+        space_ops: vec![],
+        satisfier_op: bando::registry::OperationId("local_satisfier".to_string()),
+        search_policy: bando::ir::ops::SearchPolicyDescriptor {
+            policy_id: "pure_policy".to_string(),
+            on_step_failure: "abort".to_string(),
+            on_satisfier_error: "abort".to_string(),
+            policy_effects: EffectRow::empty(),
+        },
+        budget_scope: bando::ir::ops::BudgetScopeConfig {
+            resource: "usd".to_string(),
+            limit: 100,
+        },
+        max_steps: 0,
+        max_satisfaction_attempts: 5,
+        space_effects: EffectRow::empty(),
+        satisfier_effects: EffectRow::empty(),
+        partial_type: Type::String,
+        satisfied_type: Type::String,
+    });
+
+    func.blocks.insert(BlockId(0), entry);
+
+    let mut module = Module::new("test_s4_stop_boundary");
+    module.functions.push(func);
+
+    let mut lowering =
+        LoweringContext::with_registry(registry.clone(), CompilerMutations::default());
+    let vm_module = lowering.lower_module(&module);
+
+    let mut adapters = RuntimeAdapters::default();
+    let mut interp = VmInterpreter::new(&vm_module.functions[0], &mut adapters, &registry);
+
+    // 1. Execute up to step 2 (Init -> Br -> Step -> CondBr(false)).
+    // Stops at exit block BEFORE VmConvergeExhaust executes!
+    let mut state = interp.execute(
+        BTreeMap::new(),
+        WorldState::new(),
+        BTreeSet::new(),
+        None,
+        None,
+        2,
+    );
+
+    // 2. Assert that scheduler Stop decision occurred, but frame is NOT yet terminalized
+    assert_ne!(state.status, VmStatus::Terminated);
+    let domain = state.converge_domains.values().last().unwrap();
+    assert_eq!(
+        domain.pending_stop,
+        Some("FuelExhausted".to_string()),
+        "R2: pending_stop must be recorded by VmConvergeStep"
+    );
+    assert_eq!(
+        domain.frame_status,
+        bando::converge::domain::SearchStatus::Searching,
+        "R2: frame must NOT be terminal yet"
+    );
+    assert_eq!(
+        domain.exhaustion_reason, None,
+        "R2: exhaust() must not have executed yet"
+    );
+
+    // 3. Resume execution to execute VmConvergeExhaust -> VmConvergeFinish
+    state.status = VmStatus::Running;
+    interp.resume(&mut state, 100);
+
+    // 4. Assert that frame is now properly exhausted and terminalized
+    assert_eq!(state.status, VmStatus::Terminated);
+    let final_domain = state.converge_domains.values().last().unwrap();
+    assert_eq!(
+        final_domain.frame_status,
+        bando::converge::domain::SearchStatus::Exhausted
+    );
+    assert_eq!(
+        final_domain.exhaustion_reason,
+        Some("FuelExhausted".to_string())
+    );
+}
 #[test]
 fn test_slice4_crash_recovery_instance_reconstruction() {
     let registry = RegistrySnapshot::default();

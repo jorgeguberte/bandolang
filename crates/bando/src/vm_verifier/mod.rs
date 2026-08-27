@@ -383,6 +383,9 @@ impl<'a> VmVerifier<'a> {
                 self.check_visible(*frame_var, visible);
                 self.check_visible(*handle_var, visible);
             }
+            VmInstruction::VmConvergeExhaust { frame_var } => {
+                self.check_visible(*frame_var, visible);
+            }
             VmInstruction::VmConvergeFinish { frame_var, .. } => {
                 self.check_visible(*frame_var, visible);
             }

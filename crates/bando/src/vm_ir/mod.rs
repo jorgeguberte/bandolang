@@ -157,6 +157,9 @@ pub enum VmInstruction {
         handle_var: VmValueId,
         fault_spec: crate::ir::ops::ConvergeFaultSpec,
     },
+    VmConvergeExhaust {
+        frame_var: VmValueId,
+    },
     VmConvergeFinish {
         dest: VmValueId,
         frame_var: VmValueId,
@@ -186,6 +189,7 @@ impl VmInstruction {
             VmInstruction::VmConvergeAdmitCompletion { .. } => None,
             VmInstruction::VmConvergeSettle { .. } => None,
             VmInstruction::VmConvergeApply { .. } => None,
+            VmInstruction::VmConvergeExhaust { .. } => None,
             VmInstruction::VmConvergeFinish { dest, .. } => Some(*dest),
         }
     }
@@ -238,6 +242,7 @@ impl VmInstruction {
             VmInstruction::VmConvergeAdmitCompletion { .. } => Vec::new(),
             VmInstruction::VmConvergeSettle { .. } => Vec::new(),
             VmInstruction::VmConvergeApply { .. } => Vec::new(),
+            VmInstruction::VmConvergeExhaust { .. } => Vec::new(),
             VmInstruction::VmConvergeFinish { .. } => Vec::new(),
         }
     }
