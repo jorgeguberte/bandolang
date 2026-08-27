@@ -127,6 +127,18 @@ impl<'a> VmVerifier<'a> {
                     VmInstruction::VmInternalize { payload_type, .. } => {
                         Type::result(Type::belief(payload_type.clone()), Type::String)
                     }
+                    VmInstruction::VmConvergeInit { .. } => Type::Unit,
+                    VmInstruction::VmConvergeStep {
+                        partial_type,
+                        satisfied_type,
+                        ..
+                    } => {
+                        let outcome_ty = Type::convergence_outcome(
+                            satisfied_type.clone(),
+                            Type::exhaustion_report(partial_type.clone()),
+                        );
+                        Type::result(outcome_ty, Type::String)
+                    }
                 };
                 self.register_def(dest, ty);
                 block_defs.push(dest);
@@ -319,6 +331,10 @@ impl<'a> VmVerifier<'a> {
             }
             VmInstruction::VmInternalize { claim, .. } => {
                 self.check_visible(*claim, visible);
+            }
+            VmInstruction::VmConvergeInit { .. } => {}
+            VmInstruction::VmConvergeStep { frame_var, .. } => {
+                self.check_visible(*frame_var, visible);
             }
         }
     }

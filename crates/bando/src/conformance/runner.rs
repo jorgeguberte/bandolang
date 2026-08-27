@@ -24,6 +24,37 @@ use crate::{
 };
 
 pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 {
+    // Check if running declarative converge scenario
+    if let Some(scen) = &prog.converge_scenario {
+        let (_d, converge_obs) =
+            crate::converge::runner::run_converge_scenario(scen, &prog.mutations);
+        let ret_val = converge_obs.value.clone();
+        let effs = converge_obs.effects.clone();
+        return ConformanceObservationV0 {
+            status: "ok".to_string(),
+            return_val: ret_val,
+            effects: effs,
+            active_facts: Vec::new(),
+            latent_facts: BTreeMap::new(),
+            types: BTreeMap::new(),
+            bindings: BTreeMap::new(),
+            lineage: BTreeMap::new(),
+            diagnostics: Vec::new(),
+            mutation_trace: Vec::new(),
+            final_world: None,
+            gate_resolutions: Vec::new(),
+            gate_trace: Vec::new(),
+            child_handles: BTreeMap::new(),
+            child_events: Vec::new(),
+            frame_ledgers: BTreeMap::new(),
+            child_effective_authority: BTreeMap::new(),
+            result_provenance: BTreeMap::new(),
+            beliefs: BTreeMap::new(),
+            internalization_trace: Vec::new(),
+            converge_observation: Some(converge_obs),
+        };
+    }
+
     let registry = prog.registry.clone().unwrap_or_else(RegistrySnapshot::new);
 
     // 1. High-level verifier (with trusted registry binding, P1, Q2, Q3, Q4)
@@ -55,6 +86,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
             result_provenance: BTreeMap::new(),
             beliefs: BTreeMap::new(),
             internalization_trace: Vec::new(),
+            converge_observation: None,
         };
     }
 
@@ -85,6 +117,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
             result_provenance: BTreeMap::new(),
             beliefs: BTreeMap::new(),
             internalization_trace: Vec::new(),
+            converge_observation: None,
         };
     }
 
@@ -117,6 +150,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
                 result_provenance: BTreeMap::new(),
                 beliefs: BTreeMap::new(),
                 internalization_trace: Vec::new(),
+                converge_observation: None,
             };
         }
     };
@@ -311,6 +345,80 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
         );
     }
 
+    let converge_obs = state
+        .converge_domains
+        .values()
+        .last()
+        .map(|d| {
+            let status_str = match d.frame_status {
+                crate::converge::domain::SearchStatus::Searching => "Searching".to_string(),
+                crate::converge::domain::SearchStatus::Waiting => "Waiting".to_string(),
+                crate::converge::domain::SearchStatus::Closing => "Closing".to_string(),
+                crate::converge::domain::SearchStatus::Failed => "Failed".to_string(),
+                crate::converge::domain::SearchStatus::Satisfied => "Satisfied".to_string(),
+                crate::converge::domain::SearchStatus::Exhausted => "Exhausted".to_string(),
+                crate::converge::domain::SearchStatus::Cancelled => "Cancelled".to_string(),
+            };
+
+            let error_str = if d.frame_status == crate::converge::domain::SearchStatus::Failed
+                || d.frame_status == crate::converge::domain::SearchStatus::Closing
+            {
+                d.closing_reason
+                    .as_ref()
+                    .and_then(|r| r.error.clone().or_else(|| Some(r.kind.clone())))
+            } else {
+                None
+            };
+
+            let curr_avail = *d.intent_available.get("usd").unwrap_or(&100);
+            let avail_consumed = 100u64.saturating_sub(curr_avail);
+            let attr_reserved = d.intent_reserved.values().sum::<u64>();
+            let unsettled_count = d
+                .handles
+                .values()
+                .filter(|s| {
+                    s.settlement.is_none()
+                        && s.state != "Aborted"
+                        && s.state != "ConfirmedNotDelivered"
+                })
+                .count() as u64;
+
+            let mut effs: Vec<String> = d
+                .outbox
+                .values()
+                .filter(|rec| {
+                    d.first_emission_flags
+                        .get(&rec.request_id)
+                        .copied()
+                        .unwrap_or(false)
+                        && !rec.local_only
+                })
+                .map(|rec| format!("external({})", rec.op_id))
+                .collect();
+            effs.sort();
+
+            crate::conformance::schema::ConvergeObservationV0 {
+                status: status_str,
+                value: d.satisfied_value.clone(),
+                error: error_str,
+                step_count: d.step_count,
+                satisfaction_attempts: d.satisfaction_attempts,
+                visited: d.visited.iter().map(|v| v.node_id.clone()).collect(),
+                frontier: d.frontier.clone(),
+                budget_spent: d.scope_spent.values().sum(),
+                outstanding_scope_commitment: d.scope_committed.values().sum(),
+                unsettled_request_count: unsettled_count,
+                attributable_owner_reserved: attr_reserved,
+                intent_available_consumed: avail_consumed,
+                effects: effs,
+                exhaustion_reason: if d.frame_status == crate::converge::domain::SearchStatus::Exhausted {
+                    d.exhaustion_reason.clone()
+                } else {
+                    None
+                },
+            }
+        });
+
     ConformanceObservationV0 {
         status: status_str,
         return_val: state.return_value,
@@ -332,5 +440,6 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
         result_provenance: result_prov_obs,
         beliefs: beliefs_obs,
         internalization_trace: state.internalization_trace,
+        converge_observation: converge_obs,
     }
 }

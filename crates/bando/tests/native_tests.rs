@@ -574,3 +574,76 @@ fn test_slice3_delegate_await_internalize() {
     assert_eq!(state.child_handles.len(), 1);
     assert_eq!(state.beliefs.len(), 1);
 }
+
+#[test]
+fn test_slice4_converge_pipeline() {
+    let registry = RegistrySnapshot::default();
+
+    let expected_return_ty = Type::result(
+        Type::convergence_outcome(Type::String, Type::exhaustion_report(Type::String)),
+        Type::String,
+    );
+
+    let mut func = Function::new("main", BlockId(0), expected_return_ty);
+    func.declared_effects = EffectRow::empty().with(Effect::Read("data".to_string()));
+
+    let mut entry = Block::new(
+        BlockId(0),
+        Terminator::Return(Some(ValueId(1))),
+    );
+
+    entry.instructions.push(Instruction::Converge {
+        dest: ValueId(1),
+        root_node: "root".to_string(),
+        space_ops: vec![bando::registry::OperationId("local_op".to_string())],
+        satisfier_op: bando::registry::OperationId("local_satisfier".to_string()),
+        search_policy: bando::ir::ops::SearchPolicyDescriptor {
+            policy_id: "pure_policy".to_string(),
+            on_step_failure: "abort".to_string(),
+            on_satisfier_error: "abort".to_string(),
+            policy_effects: EffectRow::empty(),
+        },
+        budget_scope: bando::ir::ops::BudgetScopeConfig {
+            resource: "usd".to_string(),
+            limit: 100,
+        },
+        max_steps: 10,
+        max_satisfaction_attempts: 5,
+        space_effects: EffectRow::empty().with(Effect::Read("data".to_string())),
+        satisfier_effects: EffectRow::empty(),
+        partial_type: Type::String,
+        satisfied_type: Type::String,
+    });
+
+    func.blocks.insert(BlockId(0), entry);
+
+    let mut module = Module::new("test_s4");
+    module.functions.push(func);
+
+    // 1. High level verifier
+    assert!(HighLevelVerifier::verify_module_with_registry(&module, &registry).is_ok());
+
+    // 2. Lowering
+    let mut lowering =
+        LoweringContext::with_registry(registry.clone(), CompilerMutations::default());
+    let vm_module = lowering.lower_module(&module);
+
+    // 3. VM Verifier
+    assert!(VmVerifier::verify_module(&vm_module).is_ok());
+
+    // 4. Interpreter execution
+    let mut adapters = RuntimeAdapters::default();
+    let mut interp = VmInterpreter::new(&vm_module.functions[0], &mut adapters, &registry);
+    let state = interp.execute(
+        BTreeMap::new(),
+        WorldState::new(),
+        BTreeSet::new(),
+        None,
+        None,
+        100,
+    );
+
+    assert_eq!(state.status, VmStatus::Terminated);
+    assert!(state.observable_effects.contains(&"read[data]".to_string()));
+    assert_eq!(state.converge_domains.len(), 1);
+}

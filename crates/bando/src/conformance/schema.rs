@@ -98,7 +98,112 @@ pub struct ConformanceProgramV0 {
     #[serde(default)]
     pub simulate_suspension_and_resume: bool,
     #[serde(default)]
+    pub converge_scenario: Option<ConvergeScenarioConfig>,
+    #[serde(default)]
     pub mutations: crate::lowering::CompilerMutations,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConvergeScenarioConfig {
+    pub name: String,
+    pub initial_frontier: Vec<String>,
+    #[serde(default)]
+    pub successors: BTreeMap<String, Vec<String>>,
+    #[serde(default)]
+    pub node_ops: BTreeMap<String, OpDefObservation>,
+    #[serde(default)]
+    pub satisfier_map: BTreeMap<String, serde_json::Value>,
+    #[serde(default = "default_abort_str")]
+    pub on_satisfier_error: String,
+    #[serde(default)]
+    pub space_faults: BTreeMap<String, serde_json::Value>,
+    #[serde(default = "default_abort_str")]
+    pub on_step_failure: String,
+    #[serde(default = "default_max_steps")]
+    pub max_steps: u64,
+    #[serde(default = "default_budget_limit")]
+    pub budget_limit: u64,
+    #[serde(default)]
+    pub fault_spec: FaultSpecObservation,
+    #[serde(default)]
+    pub effectful_satisfier: Option<OpDefObservation>,
+    #[serde(default)]
+    pub partial_map: BTreeMap<String, Value>,
+    #[serde(default = "default_max_attempts")]
+    pub max_satisfaction_attempts: u64,
+}
+
+fn default_abort_str() -> String {
+    "abort".to_string()
+}
+fn default_max_steps() -> u64 {
+    6
+}
+fn default_budget_limit() -> u64 {
+    100
+}
+fn default_max_attempts() -> u64 {
+    10
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OpDefObservation {
+    pub op_id: String,
+    #[serde(default = "default_local_str")]
+    pub kind: String,
+    #[serde(default)]
+    pub cost: u64,
+    #[serde(default)]
+    pub actual_cost: Option<u64>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub dedup_capable: bool,
+    #[serde(default = "default_true")]
+    pub idempotent: bool,
+}
+
+fn default_local_str() -> String {
+    "local".to_string()
+}
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FaultSpecObservation {
+    #[serde(default)]
+    pub delivery_unknown: bool,
+    #[serde(default)]
+    pub delivery_unknown_ops: Vec<String>,
+    #[serde(default)]
+    pub safe_retry: bool,
+    #[serde(default)]
+    pub double_delivery_unknown: bool,
+    #[serde(default)]
+    pub duplicate_completion: bool,
+    #[serde(default)]
+    pub crash_after_settlement: bool,
+    #[serde(default)]
+    pub cancel_in_flight: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergeObservationV0 {
+    pub status: String,
+    pub value: Option<Value>,
+    pub error: Option<String>,
+    pub step_count: u64,
+    pub satisfaction_attempts: u64,
+    pub visited: Vec<String>,
+    pub frontier: Vec<String>,
+    pub budget_spent: u64,
+    pub outstanding_scope_commitment: u64,
+    pub unsettled_request_count: u64,
+    pub attributable_owner_reserved: u64,
+    pub intent_available_consumed: u64,
+    pub effects: Vec<String>,
+    pub exhaustion_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -135,4 +240,7 @@ pub struct ConformanceObservationV0 {
     pub beliefs: BTreeMap<String, BeliefObservation>,
     #[serde(default)]
     pub internalization_trace: Vec<GateCheckObservation>,
+    // Slice 4 observables
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub converge_observation: Option<ConvergeObservationV0>,
 }

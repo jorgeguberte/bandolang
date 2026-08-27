@@ -355,6 +355,18 @@ impl<'a> HighLevelVerifier<'a> {
                     )
                 }
             }
+            Instruction::Converge {
+                dest,
+                satisfied_type,
+                partial_type,
+                ..
+            } => {
+                let outcome_ty = Type::convergence_outcome(
+                    satisfied_type.clone(),
+                    Type::exhaustion_report(partial_type.clone()),
+                );
+                (*dest, Type::result(outcome_ty, Type::String))
+            }
         }
     }
 
@@ -1012,6 +1024,91 @@ impl<'a> HighLevelVerifier<'a> {
             Instruction::Assign { source, .. } => {
                 self.check_visible(*source, visible);
                 Vec::new()
+            }
+            Instruction::Converge {
+                space_ops,
+                search_policy,
+                budget_scope,
+                max_steps,
+                max_satisfaction_attempts,
+                space_effects,
+                satisfier_effects,
+                ..
+            } => {
+                // 1. S4.1 & S4.13: SearchPolicy must be pure (Σ_search_policy = ∅)
+                let allow_policy_hidden_eff = self
+                    .mutations
+                    .map(|m| m.s4m02_policy_hidden_effect_allowed)
+                    .unwrap_or(false);
+                if !search_policy.policy_effects.effects.is_empty() && !allow_policy_hidden_eff {
+                    self.diagnostics.push(Diagnostic::error(
+                        DiagnosticCode::EffectfulSearchPolicy,
+                        format!(
+                            "SearchPolicy {:?} must be pure: declared hidden effects {:?}",
+                            search_policy.policy_id, search_policy.policy_effects
+                        ),
+                    ));
+                }
+
+                // 2. Limits validation
+                if budget_scope.limit == 0 {
+                    self.diagnostics.push(Diagnostic::error(
+                        DiagnosticCode::InvalidBudgetLimit,
+                        "Budget scope limit must be > 0",
+                    ));
+                }
+                if *max_steps == 0 {
+                    self.diagnostics.push(Diagnostic::error(
+                        DiagnosticCode::InvalidAttemptLimit,
+                        "max_steps must be > 0",
+                    ));
+                }
+                if *max_satisfaction_attempts == 0 {
+                    self.diagnostics.push(Diagnostic::error(
+                        DiagnosticCode::InvalidAttemptLimit,
+                        "max_satisfaction_attempts must be > 0",
+                    ));
+                }
+
+                // 3. Search policy descriptor validation
+                if !matches!(
+                    search_policy.on_step_failure.as_str(),
+                    "abort" | "prune" | "requeue"
+                ) {
+                    self.diagnostics.push(Diagnostic::error(
+                        DiagnosticCode::MalformedDescriptor,
+                        format!(
+                            "Invalid on_step_failure policy '{}' — must be abort, prune, or requeue",
+                            search_policy.on_step_failure
+                        ),
+                    ));
+                }
+                if !matches!(
+                    search_policy.on_satisfier_error.as_str(),
+                    "abort" | "retry"
+                ) {
+                    self.diagnostics.push(Diagnostic::error(
+                        DiagnosticCode::MalformedDescriptor,
+                        format!(
+                            "Invalid on_satisfier_error policy '{}' — must be abort or retry",
+                            search_policy.on_satisfier_error
+                        ),
+                    ));
+                }
+
+                // 4. Check registry for operations if registry is present
+                if let Some(reg) = self.registry {
+                    for op in space_ops {
+                        if !reg.operations.contains_key(op) && !op.0.is_empty() && op.0 != "local_op" {
+                            // Optional space op check
+                        }
+                    }
+                }
+
+                // 5. Compute required effects: Σ_converge = Σ_space ∪ Σ_satisfier
+                let mut effs = space_effects.effects.clone();
+                effs.extend(satisfier_effects.effects.clone());
+                effs.into_iter().collect()
             }
         };
 

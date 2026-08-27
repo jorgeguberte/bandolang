@@ -34,6 +34,13 @@ pub enum DiagnosticCode {
     UnknownInternalizationPolicy,
     InternalizeNonClaim,
     ValidationAuthorityInsufficient,
+    // Slice 4 Diagnostic Codes
+    EffectfulSearchPolicy,
+    InvalidBudgetLimit,
+    InvalidAttemptLimit,
+    MalformedDescriptor,
+    UnknownSpaceOperation,
+    UnknownSatisfier,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

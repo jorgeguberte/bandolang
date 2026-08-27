@@ -1,6 +1,7 @@
 pub mod analysis;
 pub mod child;
 pub mod conformance;
+pub mod converge;
 pub mod diagnostics;
 pub mod gate;
 pub mod ir;

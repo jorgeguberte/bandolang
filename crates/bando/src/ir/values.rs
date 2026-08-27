@@ -61,6 +61,24 @@ pub enum Value {
     ChildHandle(ChildHandleValue),
     Claim(Box<Value>),
     Belief(BeliefValue),
+    ConvergenceOutcome(ConvergenceOutcomeValue),
+    ExhaustionReport(ExhaustionReportValue),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExhaustionReportValue {
+    pub best_partial: Option<Box<Value>>,
+    pub policy: String,
+    pub reason: String,
+    pub visited_nodes: Vec<String>,
+    pub trace: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "payload")]
+pub enum ConvergenceOutcomeValue {
+    Satisfied(Box<Value>),
+    Exhausted(ExhaustionReportValue),
 }
 
 impl Value {
@@ -130,5 +148,13 @@ impl Value {
             provenance,
             policy_binding: policy_binding.into(),
         })
+    }
+
+    pub fn satisfied(payload: Value) -> Self {
+        Value::ConvergenceOutcome(ConvergenceOutcomeValue::Satisfied(Box::new(payload)))
+    }
+
+    pub fn exhausted(report: ExhaustionReportValue) -> Self {
+        Value::ConvergenceOutcome(ConvergenceOutcomeValue::Exhausted(report))
     }
 }

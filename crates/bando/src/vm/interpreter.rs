@@ -60,6 +60,8 @@ pub struct VmExecutionState {
     pub result_provenance: BTreeMap<String, ChildResultProvenance>,
     pub beliefs: BTreeMap<String, BeliefValue>,
     pub internalization_trace: Vec<GateCheckObservation>,
+    // Slice 4 additions
+    pub converge_domains: BTreeMap<String, crate::converge::domain::ConvergeTransactionDomain>,
 }
 
 pub struct VmInterpreter<'a> {
@@ -134,6 +136,7 @@ impl<'a> VmInterpreter<'a> {
             result_provenance: BTreeMap::new(),
             beliefs: BTreeMap::new(),
             internalization_trace: Vec::new(),
+            converge_domains: BTreeMap::new(),
         };
 
         // Static path fact analysis
@@ -1227,6 +1230,212 @@ impl<'a> VmInterpreter<'a> {
                     Type::result(Type::belief(payload_type.clone()), Type::String).display_name(),
                 );
                 state.env.insert(dest_sym, VmValue::ok(belief_val));
+            }
+            // Slice 4: soma.converge execution
+            VmInstruction::VmConvergeInit {
+                frame_var,
+                root_node,
+                budget_resource,
+                budget_limit,
+                max_steps,
+                max_satisfaction_attempts,
+                on_step_failure,
+                on_satisfier_error,
+            } => {
+                let frame_sym = format!("v{}", frame_var.0);
+                let mut domain = crate::converge::domain::ConvergeTransactionDomain::default();
+                domain.nodes.insert(
+                    root_node.clone(),
+                    crate::converge::domain::SearchNode::new(root_node.clone()),
+                );
+                domain.frontier.push(root_node.clone());
+                domain
+                    .scope_limit
+                    .insert(budget_resource.clone(), *budget_limit);
+
+                let current_avail = *state
+                    .frame_budget
+                    .available
+                    .get(budget_resource)
+                    .unwrap_or(budget_limit);
+                domain
+                    .intent_initial_total
+                    .insert(budget_resource.clone(), current_avail);
+                domain
+                    .intent_available
+                    .insert(budget_resource.clone(), current_avail);
+                domain.max_steps = *max_steps;
+                domain.max_satisfaction_attempts = *max_satisfaction_attempts;
+                domain.on_step_failure = on_step_failure.clone();
+                domain.on_satisfier_error = on_satisfier_error.clone();
+                domain.frame_status = crate::converge::domain::SearchStatus::Searching;
+
+                state.converge_domains.insert(frame_sym.clone(), domain);
+                state.env.insert(frame_sym.clone(), VmValue::Unit);
+                state.types.insert(frame_sym, Type::Unit.display_name());
+            }
+            VmInstruction::VmConvergeStep {
+                dest,
+                frame_var,
+                space_ops,
+                satisfier_op,
+                space_effects,
+                satisfier_effects,
+                partial_type,
+                satisfied_type,
+            } => {
+                let frame_sym = format!("v{}", frame_var.0);
+                let dest_sym = format!("v{}", dest.0);
+
+                let mut domain = state
+                    .converge_domains
+                    .remove(&frame_sym)
+                    .unwrap_or_else(|| {
+                        let mut d = crate::converge::domain::ConvergeTransactionDomain::default();
+                        d.nodes.insert(
+                            "root".to_string(),
+                            crate::converge::domain::SearchNode::new("root"),
+                        );
+                        d.frontier.push("root".to_string());
+                        d
+                    });
+
+                let mut node_ops = std::collections::BTreeMap::new();
+                for op in space_ops {
+                    node_ops.insert(
+                        op.0.clone(),
+                        crate::converge::scheduler::SpaceOpInfo {
+                            op_id: op.0.clone(),
+                            kind: "local".to_string(),
+                            cost: 0,
+                        },
+                    );
+                }
+
+                let partial_map = std::collections::BTreeMap::new();
+                let effectful_sat =
+                    if !satisfier_op.0.is_empty() && satisfier_op.0 != "local_satisfier" {
+                        Some(crate::converge::scheduler::SatisfierOpInfo {
+                            op_id: satisfier_op.0.clone(),
+                            kind: "local".to_string(),
+                            cost: 0,
+                        })
+                    } else {
+                        None
+                    };
+
+                while domain.frame_status == crate::converge::domain::SearchStatus::Searching {
+                    let action = crate::converge::scheduler::scheduler_step(
+                        &mut domain,
+                        &node_ops,
+                        &partial_map,
+                        effectful_sat.as_ref(),
+                        self.mutations.s4m01_scheduler_pops_unaffordable_node,
+                        self.mutations.s4m17_budget_scope_mints_ownership,
+                        self.mutations
+                            .s4m20_satisfaction_retry_bypasses_attempt_ceiling,
+                        self.mutations.s4m08_second_unsettled_request_allowed,
+                    );
+
+                    match action {
+                        crate::converge::scheduler::SchedulerAction::Stop { reason } => {
+                            crate::converge::engine::exhaust(&mut domain, &reason);
+                            let _ = crate::converge::engine::terminalize(
+                                &mut domain,
+                                self.mutations.s4m16_terminalizes_with_commitment,
+                            );
+                            break;
+                        }
+                        crate::converge::scheduler::SchedulerAction::Wait { .. } => {
+                            break;
+                        }
+                        crate::converge::scheduler::SchedulerAction::Expand(act) => {
+                            if act.kind == "local" {
+                                let succs = Vec::new();
+                                if let Err(e) = crate::converge::engine::dispatch_local(
+                                    &mut domain,
+                                    &act.node_id,
+                                    &act.op_id,
+                                    &succs,
+                                ) {
+                                    crate::converge::engine::fatal_close(
+                                        &mut domain,
+                                        &format!("{}", e),
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        crate::converge::scheduler::SchedulerAction::CheckSatisfaction(act) => {
+                            let _ = crate::converge::engine::check_satisfaction(
+                                &mut domain,
+                                &act.node_id,
+                                &act.op_id,
+                                false,
+                                None,
+                                None,
+                                self.mutations.s4m03_ranking_promotes_satisfied,
+                                self.mutations
+                                    .s4m20_satisfaction_retry_bypasses_attempt_ceiling,
+                            );
+                        }
+                    }
+                }
+
+                // Materialize observable effects
+                for eff in &space_effects.effects {
+                    state.observable_effects.push(eff.to_string());
+                }
+                for eff in &satisfier_effects.effects {
+                    state.observable_effects.push(eff.to_string());
+                }
+
+                let res_val = match domain.frame_status {
+                    crate::converge::domain::SearchStatus::Satisfied => {
+                        let sat_val = domain.satisfied_value.clone().unwrap_or(VmValue::Unit);
+                        VmValue::ok(VmValue::satisfied(sat_val))
+                    }
+                    crate::converge::domain::SearchStatus::Exhausted => {
+                        let rep = crate::ir::values::ExhaustionReportValue {
+                            best_partial: domain.best_partial.clone().map(Box::new),
+                            policy: "SearchPolicy".to_string(),
+                            reason: domain
+                                .exhaustion_reason
+                                .clone()
+                                .unwrap_or_else(|| "FrontierEmpty".to_string()),
+                            visited_nodes: domain
+                                .visited
+                                .iter()
+                                .map(|v| v.node_id.clone())
+                                .collect(),
+                            trace: Vec::new(),
+                        };
+                        VmValue::ok(VmValue::exhausted(rep))
+                    }
+                    crate::converge::domain::SearchStatus::Failed => {
+                        let err_msg = domain
+                            .closing_reason
+                            .as_ref()
+                            .and_then(|r| r.error.clone())
+                            .unwrap_or_else(|| "ConvergeFailed".to_string());
+                        VmValue::err(VmValue::String(err_msg))
+                    }
+                    crate::converge::domain::SearchStatus::Cancelled => {
+                        VmValue::err(VmValue::String("Cancelled".to_string()))
+                    }
+                    _ => VmValue::err(VmValue::String("IncompleteSearch".to_string())),
+                };
+
+                let outcome_ty = Type::convergence_outcome(
+                    satisfied_type.clone(),
+                    Type::exhaustion_report(partial_type.clone()),
+                );
+                state.types.insert(
+                    dest_sym.clone(),
+                    Type::result(outcome_ty, Type::String).display_name(),
+                );
+                state.env.insert(dest_sym, res_val);
+                state.converge_domains.insert(frame_sym, domain);
             }
         }
     }

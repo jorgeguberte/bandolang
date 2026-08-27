@@ -2,7 +2,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     ir::{
-        effects::Effect,
+        effects::{Effect, EffectRow},
         facts::{ActLatentPostconditions, LatentPostconditions},
         types::Type,
         values::{BlockId, Value, ValueId},
@@ -104,6 +104,44 @@ pub enum Instruction {
         policy_id: PolicyId,
         claim: ValueId,
     },
+    // Slice 4: soma.converge
+    Converge {
+        dest: ValueId,
+        root_node: String,
+        space_ops: Vec<OperationId>,
+        satisfier_op: OperationId,
+        search_policy: SearchPolicyDescriptor,
+        budget_scope: BudgetScopeConfig,
+        max_steps: u64,
+        max_satisfaction_attempts: u64,
+        #[serde(default)]
+        space_effects: EffectRow,
+        #[serde(default)]
+        satisfier_effects: EffectRow,
+        partial_type: Type,
+        satisfied_type: Type,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchPolicyDescriptor {
+    pub policy_id: String,
+    #[serde(default = "default_abort_policy")]
+    pub on_step_failure: String, // "abort" | "prune" | "requeue"
+    #[serde(default = "default_abort_policy")]
+    pub on_satisfier_error: String, // "abort" | "retry"
+    #[serde(default)]
+    pub policy_effects: EffectRow,
+}
+
+fn default_abort_policy() -> String {
+    "abort".to_string()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BudgetScopeConfig {
+    pub resource: String,
+    pub limit: u64,
 }
 
 fn default_subject_type() -> Type {
@@ -122,6 +160,7 @@ impl Instruction {
             Instruction::Delegate { dest, .. } => *dest,
             Instruction::Await { dest, .. } => *dest,
             Instruction::Internalize { dest, .. } => *dest,
+            Instruction::Converge { dest, .. } => *dest,
         }
     }
 
@@ -151,6 +190,16 @@ impl Instruction {
             Instruction::Await { .. } => Vec::new(),
             // Section 46: Σ_internalize = Σ_validation
             Instruction::Internalize { .. } => Vec::new(),
+            // Slice 4: Σ_converge = Σ_space ∪ Σ_satisfier, Σ_search_policy = ∅
+            Instruction::Converge {
+                space_effects,
+                satisfier_effects,
+                ..
+            } => {
+                let mut effs = space_effects.effects.clone();
+                effs.extend(satisfier_effects.effects.clone());
+                effs.into_iter().collect()
+            }
         }
     }
 }

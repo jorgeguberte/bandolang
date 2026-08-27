@@ -119,6 +119,48 @@ pub struct CompilerMutations {
     pub s3m23_delegated_provenance_removed_on_internalize: bool,
     #[serde(default)]
     pub s3m24_effect_summary_used_as_clean_provenance: bool,
+
+    // Slice 4 mutations (S4M01–S4M20)
+    #[serde(default)]
+    pub s4m01_scheduler_pops_unaffordable_node: bool,
+    #[serde(default)]
+    pub s4m02_policy_hidden_effect_allowed: bool,
+    #[serde(default)]
+    pub s4m03_ranking_promotes_satisfied: bool,
+    #[serde(default)]
+    pub s4m04_stage_rejected_leaves_reservation: bool,
+    #[serde(default)]
+    pub s4m05_first_emit_fails_step: bool,
+    #[serde(default)]
+    pub s4m06_transport_retry_increments_step: bool,
+    #[serde(default)]
+    pub s4m07_transport_retry_changes_request_id: bool,
+    #[serde(default)]
+    pub s4m08_second_unsettled_request_allowed: bool,
+    #[serde(default)]
+    pub s4m09_delivery_unknown_releases_commitment: bool,
+    #[serde(default)]
+    pub s4m10_duplicate_completion_applies_twice: bool,
+    #[serde(default)]
+    pub s4m11_duplicate_settlement_reconciles_twice: bool,
+    #[serde(default)]
+    pub s4m12_settlement_marks_applied_automatically: bool,
+    #[serde(default)]
+    pub s4m13_crash_after_settlement_loses_semantic_result: bool,
+    #[serde(default)]
+    pub s4m14_closing_accepts_late_payload: bool,
+    #[serde(default)]
+    pub s4m15_closing_mutates_frontier: bool,
+    #[serde(default)]
+    pub s4m16_terminalizes_with_commitment: bool,
+    #[serde(default)]
+    pub s4m17_budget_scope_mints_ownership: bool,
+    #[serde(default)]
+    pub s4m18_requeue_reuses_request_id: bool,
+    #[serde(default)]
+    pub s4m19_failed_requeue_incorporates_successors: bool,
+    #[serde(default)]
+    pub s4m20_satisfaction_retry_bypasses_attempt_ceiling: bool,
 }
 
 pub struct LoweringContext {
@@ -127,6 +169,7 @@ pub struct LoweringContext {
     pub value_map: BTreeMap<crate::ir::ValueId, VmValueId>,
     pub block_map: BTreeMap<crate::ir::BlockId, VmBlockId>,
     pub next_block_id: u32,
+    pub next_value_id: u32,
     pub value_types: BTreeMap<crate::ir::ValueId, Type>,
 }
 
@@ -138,6 +181,7 @@ impl LoweringContext {
             value_map: BTreeMap::new(),
             block_map: BTreeMap::new(),
             next_block_id: 100,
+            next_value_id: 5000,
             value_types: BTreeMap::new(),
         }
     }
@@ -149,6 +193,7 @@ impl LoweringContext {
             value_map: BTreeMap::new(),
             block_map: BTreeMap::new(),
             next_block_id: 100,
+            next_value_id: 5000,
             value_types: BTreeMap::new(),
         }
     }
@@ -160,6 +205,7 @@ impl LoweringContext {
             value_map: BTreeMap::new(),
             block_map: BTreeMap::new(),
             next_block_id: 100,
+            next_value_id: 5000,
             value_types: BTreeMap::new(),
         }
     }
@@ -169,6 +215,12 @@ impl LoweringContext {
             .value_map
             .entry(val)
             .or_insert_with(|| VmValueId(val.0))
+    }
+
+    pub fn alloc_value(&mut self) -> VmValueId {
+        let id = VmValueId(self.next_value_id);
+        self.next_value_id += 1;
+        id
     }
 
     pub fn map_block(&mut self, block: crate::ir::BlockId) -> VmBlockId {
@@ -296,6 +348,19 @@ impl LoweringContext {
                             );
                         }
                     }
+                    Instruction::Converge {
+                        dest,
+                        satisfied_type,
+                        partial_type,
+                        ..
+                    } => {
+                        let outcome_ty = Type::convergence_outcome(
+                            satisfied_type.clone(),
+                            Type::exhaustion_report(partial_type.clone()),
+                        );
+                        self.value_types
+                            .insert(*dest, Type::result(outcome_ty, Type::String));
+                    }
                 }
             }
         }
@@ -333,9 +398,7 @@ impl LoweringContext {
                 }
             }
 
-            for inst in &block.instructions {
-                vm_block.instructions.push(self.lower_instruction(inst));
-            }
+            self.lower_instruction_sequence(&block.instructions, &mut vm_block.instructions);
 
             match &block.terminator {
                 Terminator::MatchResult {
@@ -359,9 +422,7 @@ impl LoweringContext {
                     let mut ok_vm_block = VmBlock::new(ok_block_id, VmTerminator::Unreachable);
                     ok_vm_block.name = Some("ok_branch".to_string());
                     ok_vm_block.params.push((vm_ok_arg, ok_ty));
-                    for inst in &ok_body.instructions {
-                        ok_vm_block.instructions.push(self.lower_instruction(inst));
-                    }
+                    self.lower_instruction_sequence(&ok_body.instructions, &mut ok_vm_block.instructions);
                     ok_vm_block.terminator = self.lower_region_terminator(&ok_body.terminator);
                     generated_blocks.insert(ok_block_id, ok_vm_block);
 
@@ -375,9 +436,7 @@ impl LoweringContext {
                     };
 
                     err_vm_block.params.push((vm_err_arg, err_block_param_ty));
-                    for inst in &err_body.instructions {
-                        err_vm_block.instructions.push(self.lower_instruction(inst));
-                    }
+                    self.lower_instruction_sequence(&err_body.instructions, &mut err_vm_block.instructions);
                     err_vm_block.terminator = self.lower_region_terminator(&err_body.terminator);
                     generated_blocks.insert(err_block_id, err_vm_block);
 
@@ -434,9 +493,7 @@ impl LoweringContext {
                     let mut succ_block = VmBlock::new(succ_block_id, VmTerminator::Unreachable);
                     succ_block.name = Some("success_branch".to_string());
                     succ_block.params.push((vm_succ_arg, succ_ty));
-                    for inst in &success_body.instructions {
-                        succ_block.instructions.push(self.lower_instruction(inst));
-                    }
+                    self.lower_instruction_sequence(&success_body.instructions, &mut succ_block.instructions);
                     succ_block.terminator = self.lower_region_terminator(&success_body.terminator);
                     generated_blocks.insert(succ_block_id, succ_block);
 
@@ -444,9 +501,7 @@ impl LoweringContext {
                     let mut fail_block = VmBlock::new(fail_block_id, VmTerminator::Unreachable);
                     fail_block.name = Some("failure_branch".to_string());
                     fail_block.params.push((vm_fail_arg, fail_ty));
-                    for inst in &failure_body.instructions {
-                        fail_block.instructions.push(self.lower_instruction(inst));
-                    }
+                    self.lower_instruction_sequence(&failure_body.instructions, &mut fail_block.instructions);
                     fail_block.terminator = self.lower_region_terminator(&failure_body.terminator);
                     generated_blocks.insert(fail_block_id, fail_block);
 
@@ -454,9 +509,7 @@ impl LoweringContext {
                     let mut part_block = VmBlock::new(part_block_id, VmTerminator::Unreachable);
                     part_block.name = Some("partial_branch".to_string());
                     part_block.params.push((vm_part_arg, Type::PartialReport));
-                    for inst in &partial_body.instructions {
-                        part_block.instructions.push(self.lower_instruction(inst));
-                    }
+                    self.lower_instruction_sequence(&partial_body.instructions, &mut part_block.instructions);
                     part_block.terminator = self.lower_region_terminator(&partial_body.terminator);
                     generated_blocks.insert(part_block_id, part_block);
 
@@ -464,9 +517,7 @@ impl LoweringContext {
                     let mut unk_block = VmBlock::new(unk_block_id, VmTerminator::Unreachable);
                     unk_block.name = Some("unknown_branch".to_string());
                     unk_block.params.push((vm_unk_arg, Type::String));
-                    for inst in &unknown_body.instructions {
-                        unk_block.instructions.push(self.lower_instruction(inst));
-                    }
+                    self.lower_instruction_sequence(&unknown_body.instructions, &mut unk_block.instructions);
                     unk_block.terminator = self.lower_region_terminator(&unknown_body.terminator);
                     generated_blocks.insert(unk_block_id, unk_block);
 
@@ -492,6 +543,55 @@ impl LoweringContext {
 
         vm_func.blocks = generated_blocks;
         vm_func
+    }
+
+    fn lower_instruction_sequence(
+        &mut self,
+        instructions: &[Instruction],
+        target_vec: &mut Vec<VmInstruction>,
+    ) {
+        for inst in instructions {
+            if let Instruction::Converge {
+                dest,
+                root_node,
+                space_ops,
+                satisfier_op,
+                search_policy,
+                budget_scope,
+                max_steps,
+                max_satisfaction_attempts,
+                space_effects,
+                satisfier_effects,
+                partial_type,
+                satisfied_type,
+            } = inst
+            {
+                let vm_dest = self.map_value(*dest);
+                let frame_var = self.alloc_value();
+                target_vec.push(VmInstruction::VmConvergeInit {
+                    frame_var,
+                    root_node: root_node.clone(),
+                    budget_resource: budget_scope.resource.clone(),
+                    budget_limit: budget_scope.limit,
+                    max_steps: *max_steps,
+                    max_satisfaction_attempts: *max_satisfaction_attempts,
+                    on_step_failure: search_policy.on_step_failure.clone(),
+                    on_satisfier_error: search_policy.on_satisfier_error.clone(),
+                });
+                target_vec.push(VmInstruction::VmConvergeStep {
+                    dest: vm_dest,
+                    frame_var,
+                    space_ops: space_ops.clone(),
+                    satisfier_op: satisfier_op.clone(),
+                    space_effects: space_effects.clone(),
+                    satisfier_effects: satisfier_effects.clone(),
+                    partial_type: partial_type.clone(),
+                    satisfied_type: satisfied_type.clone(),
+                });
+            } else {
+                target_vec.push(self.lower_instruction(inst));
+            }
+        }
     }
 
     fn lower_instruction(&mut self, inst: &Instruction) -> VmInstruction {
@@ -768,6 +868,28 @@ impl LoweringContext {
                     validation_effects: val_effs,
                     payload_type: payload_ty,
                     latent,
+                }
+            }
+            Instruction::Converge {
+                dest,
+                space_ops,
+                satisfier_op,
+                space_effects,
+                satisfier_effects,
+                partial_type,
+                satisfied_type,
+                ..
+            } => {
+                let vm_dest = self.map_value(*dest);
+                VmInstruction::VmConvergeStep {
+                    dest: vm_dest,
+                    frame_var: vm_dest,
+                    space_ops: space_ops.clone(),
+                    satisfier_op: satisfier_op.clone(),
+                    space_effects: space_effects.clone(),
+                    satisfier_effects: satisfier_effects.clone(),
+                    partial_type: partial_type.clone(),
+                    satisfied_type: satisfied_type.clone(),
                 }
             }
         }

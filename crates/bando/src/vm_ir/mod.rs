@@ -88,6 +88,27 @@ pub enum VmInstruction {
         payload_type: Type,
         latent: LatentPostconditions,
     },
+    // Slice 4: soma.converge explicit machine operations
+    VmConvergeInit {
+        frame_var: VmValueId,
+        root_node: String,
+        budget_resource: String,
+        budget_limit: u64,
+        max_steps: u64,
+        max_satisfaction_attempts: u64,
+        on_step_failure: String,
+        on_satisfier_error: String,
+    },
+    VmConvergeStep {
+        dest: VmValueId,
+        frame_var: VmValueId,
+        space_ops: Vec<OperationId>,
+        satisfier_op: OperationId,
+        space_effects: EffectRow,
+        satisfier_effects: EffectRow,
+        partial_type: Type,
+        satisfied_type: Type,
+    },
 }
 
 impl VmInstruction {
@@ -102,6 +123,8 @@ impl VmInstruction {
             VmInstruction::VmSpawnChild { dest, .. } => *dest,
             VmInstruction::VmAwaitChild { dest, .. } => *dest,
             VmInstruction::VmInternalize { dest, .. } => *dest,
+            VmInstruction::VmConvergeInit { frame_var, .. } => *frame_var,
+            VmInstruction::VmConvergeStep { dest, .. } => *dest,
         }
     }
 
@@ -128,6 +151,16 @@ impl VmInstruction {
             VmInstruction::VmInternalize {
                 validation_effects, ..
             } => validation_effects.clone(),
+            VmInstruction::VmConvergeInit { .. } => Vec::new(),
+            VmInstruction::VmConvergeStep {
+                space_effects,
+                satisfier_effects,
+                ..
+            } => {
+                let mut effs = space_effects.effects.clone();
+                effs.extend(satisfier_effects.effects.clone());
+                effs.into_iter().collect()
+            }
         }
     }
 }

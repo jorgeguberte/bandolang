@@ -28,6 +28,11 @@ pub enum Type {
     },
     Claim(Box<Type>),
     Belief(Box<Type>),
+    ConvergenceOutcome {
+        satisfied: Box<Type>,
+        exhausted: Box<Type>,
+    },
+    ExhaustionReport(Box<Type>),
 }
 
 impl Type {
@@ -68,6 +73,17 @@ impl Type {
         Type::Belief(Box::new(payload))
     }
 
+    pub fn convergence_outcome(satisfied: Type, exhausted: Type) -> Self {
+        Type::ConvergenceOutcome {
+            satisfied: Box::new(satisfied),
+            exhausted: Box::new(exhausted),
+        }
+    }
+
+    pub fn exhaustion_report(payload: Type) -> Self {
+        Type::ExhaustionReport(Box::new(payload))
+    }
+
     pub fn display_name(&self) -> String {
         match self {
             Type::Unit => "unit".to_string(),
@@ -98,6 +114,14 @@ impl Type {
             }
             Type::Claim(payload) => format!("Claim<{}>", payload.display_name()),
             Type::Belief(payload) => format!("Belief<{}>", payload.display_name()),
+            Type::ConvergenceOutcome { satisfied, exhausted } => format!(
+                "ConvergenceOutcome<{}, {}>",
+                satisfied.display_name(),
+                exhausted.display_name()
+            ),
+            Type::ExhaustionReport(payload) => {
+                format!("ExhaustionReport<{}>", payload.display_name())
+            }
         }
     }
 }
