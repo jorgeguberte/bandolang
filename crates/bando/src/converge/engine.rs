@@ -28,6 +28,57 @@ impl std::fmt::Display for EngineError {
 
 impl std::error::Error for EngineError {}
 
+pub fn parse_sat_entry(
+    v: &serde_json::Value,
+    attempt_no: u64,
+) -> (String, bool, Option<Value>, Option<String>) {
+    let item = if let Some(arr) = v.as_array() {
+        if !arr.is_empty() && arr[0].is_array() {
+            let idx = (attempt_no.saturating_sub(1) as usize).min(arr.len() - 1);
+            &arr[idx]
+        } else {
+            v
+        }
+    } else {
+        v
+    };
+
+    if let Some(arr) = item.as_array() {
+        let tag = arr.get(0).and_then(|x| x.as_str()).unwrap_or("ok").to_string();
+        let satisfied = arr.get(1).and_then(|x| x.as_bool()).unwrap_or(false);
+        let val_json = arr.get(2);
+        if tag == "ok" {
+            let val = val_json.and_then(|j| {
+                if j.is_null() {
+                    None
+                } else if let Ok(v) = serde_json::from_value::<Value>(j.clone()) {
+                    Some(v)
+                } else if let Some(s) = j.as_str() {
+                    Some(Value::String(s.to_string()))
+                } else {
+                    None
+                }
+            });
+            ("ok".to_string(), satisfied, val, None)
+        } else {
+            let err_msg = val_json
+                .and_then(|j| {
+                    if let Some(s) = j.as_str() {
+                        Some(s.to_string())
+                    } else if let Some(p) = j.get("payload").and_then(|x| x.as_str()) {
+                        Some(p.to_string())
+                    } else {
+                        Some("SatisfierError".to_string())
+                    }
+                })
+                .unwrap_or_else(|| "SatisfierError".to_string());
+            ("err".to_string(), false, None, Some(err_msg))
+        }
+    } else {
+        ("ok".to_string(), false, None, None)
+    }
+}
+
 static NEXT_ID_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 pub fn next_id(prefix: &str) -> String {
@@ -166,7 +217,7 @@ pub fn stage_local(
         ));
     }
 
-    if d.frame_status != SearchStatus::Searching {
+    if d.frame_status != SearchStatus::Searching && !mutations_second_unsettled_allowed {
         return Err(EngineError::TransitionError(
             "StageLocal outside Searching frame".to_string(),
         ));

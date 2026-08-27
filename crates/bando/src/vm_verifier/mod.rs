@@ -128,7 +128,8 @@ impl<'a> VmVerifier<'a> {
                         Type::result(Type::belief(payload_type.clone()), Type::String)
                     }
                     VmInstruction::VmConvergeInit { .. } => Type::Unit,
-                    VmInstruction::VmConvergeStep {
+                    VmInstruction::VmConvergeStep { .. } => Type::Bool,
+                    VmInstruction::VmConvergeFinish {
                         partial_type,
                         satisfied_type,
                         ..
@@ -334,6 +335,9 @@ impl<'a> VmVerifier<'a> {
             }
             VmInstruction::VmConvergeInit { .. } => {}
             VmInstruction::VmConvergeStep { frame_var, .. } => {
+                self.check_visible(*frame_var, visible);
+            }
+            VmInstruction::VmConvergeFinish { frame_var, .. } => {
                 self.check_visible(*frame_var, visible);
             }
         }

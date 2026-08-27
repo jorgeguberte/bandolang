@@ -108,7 +108,23 @@ pub enum Instruction {
     Converge {
         dest: ValueId,
         root_node: String,
+        #[serde(default)]
+        initial_frontier: Vec<String>,
+        #[serde(default)]
+        successors: std::collections::BTreeMap<String, Vec<String>>,
+        #[serde(default)]
+        node_ops: std::collections::BTreeMap<String, SpaceOpDef>,
+        #[serde(default)]
+        satisfier: SatisfierDef,
+        #[serde(default)]
+        partial_map: std::collections::BTreeMap<String, Value>,
+        #[serde(default)]
+        space_faults: std::collections::BTreeMap<String, serde_json::Value>,
+        #[serde(default)]
+        fault_spec: ConvergeFaultSpec,
+        #[serde(default)]
         space_ops: Vec<OperationId>,
+        #[serde(default)]
         satisfier_op: OperationId,
         search_policy: SearchPolicyDescriptor,
         budget_scope: BudgetScopeConfig,
@@ -121,6 +137,83 @@ pub enum Instruction {
         partial_type: Type,
         satisfied_type: Type,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SpaceOpDef {
+    pub op_id: String,
+    #[serde(default = "default_local_kind")]
+    pub kind: String, // "local" | "external"
+    #[serde(default)]
+    pub cost: u64,
+    #[serde(default)]
+    pub actual_cost: Option<u64>,
+    #[serde(default)]
+    pub request_id: Option<String>,
+    #[serde(default = "default_true")]
+    pub dedup_capable: bool,
+    #[serde(default = "default_true")]
+    pub idempotent: bool,
+}
+
+impl Default for SpaceOpDef {
+    fn default() -> Self {
+        Self {
+            op_id: "op".to_string(),
+            kind: "local".to_string(),
+            cost: 0,
+            actual_cost: None,
+            request_id: None,
+            dedup_capable: true,
+            idempotent: true,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SatisfierDef {
+    #[serde(default = "default_local_kind")]
+    pub kind: String, // "local" | "external"
+    #[serde(default)]
+    pub effectful_op: Option<SpaceOpDef>,
+    #[serde(default)]
+    pub satisfier_map: std::collections::BTreeMap<String, serde_json::Value>,
+}
+
+impl Default for SatisfierDef {
+    fn default() -> Self {
+        Self {
+            kind: "local".to_string(),
+            effectful_op: None,
+            satisfier_map: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConvergeFaultSpec {
+    #[serde(default)]
+    pub delivery_unknown: bool,
+    #[serde(default)]
+    pub delivery_unknown_ops: Vec<String>,
+    #[serde(default)]
+    pub safe_retry: bool,
+    #[serde(default)]
+    pub double_delivery_unknown: bool,
+    #[serde(default)]
+    pub duplicate_completion: bool,
+    #[serde(default)]
+    pub crash_after_settlement: bool,
+    #[serde(default)]
+    pub cancel_in_flight: bool,
+}
+
+fn default_local_kind() -> String {
+    "local".to_string()
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

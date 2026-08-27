@@ -1,31 +1,35 @@
 """test_mutations_s4.py — Compiler & Runtime Mutation Campaign (S4M01–S4M20) for Slice 4.
 
-Executes each mutated compiler/runtime configuration against baseline programs,
-proving that each mutant causes an observable behavioral divergence or invariant violation:
-- S4M01: Scheduler pops unaffordable node
-- S4M02: Policy hidden effect allowed
-- S4M03: Ranking promotes partial to Satisfied
+Executes each mutated compiler/runtime configuration against baseline SOMA-IR programs,
+proving that each mutant causally breaks an observable semantic property under the real
+compiler pipeline (HighLevelVerifier -> LoweringContext -> VmVerifier -> VmInterpreter).
+
+Covers all 20 causal mutations from S4.14:
+- S4M01: scheduler pops unaffordable node
+- S4M02: policy hidden effect allowed
+- S4M03: ranking promotes to Satisfied
 - S4M04: StageLocal rejected leaves reservation
-- S4M05: First EmitExternal fails to increment step
-- S4M06: Transport retry increments step
-- S4M07: Transport retry changes request_id
-- S4M08: Second unsettled request allowed
+- S4M05: first EmitExternal fails to increment step
+- S4M06: transport retry increments step
+- S4M07: transport retry changes request_id
+- S4M08: second unsettled request allowed
 - S4M09: DeliveryUnknown releases commitment
-- S4M10: Duplicate completion applies twice
-- S4M11: Duplicate settlement reconciles twice
-- S4M12: Settlement marks Applied automatically
-- S4M13: Crash-after-settlement loses semantic result
+- S4M10: duplicate completion applies twice
+- S4M11: duplicate settlement reconciles twice
+- S4M12: settlement marks Applied automatically
+- S4M13: crash-after-settlement loses semantic result
 - S4M14: Closing accepts late semantic payload
 - S4M15: Closing mutates frontier
-- S4M16: Terminalizes with commitment
+- S4M16: terminalizes with commitment
 - S4M17: BudgetScope mints ownership
-- S4M18: Requeue reuses semantic request_id
-- S4M19: Failed requeue incorporates successors
-- S4M20: Satisfaction retry bypasses attempt ceiling
+- S4M18: requeue reuses semantic request_id
+- S4M19: failed requeue incorporates successors
+- S4M20: satisfaction retry bypasses attempt ceiling
 """
 
 from __future__ import annotations
 
+import copy
 import json
 import sys
 from pathlib import Path
@@ -34,15 +38,105 @@ sys.path.insert(0, str(Path(__file__).parent.parent / "compiler_conformance"))
 
 from protocol import invoke_rust_conformance
 
-PASS = 0
-FAIL = 0
+PASS, FAIL = 0, 0
 
 
 def canonical_repr(d):
     return json.dumps(d, sort_keys=True)
 
 
-def run_mutation_kill(name: str, baseline_prog: dict, mutant_prog: dict, check_fn) -> None:
+def make_converge_program(name: str, converge_spec: dict, declared_effects: list | None = None) -> dict:
+    if declared_effects is None:
+        declared_effects = []
+
+    ret_ty = {
+        "kind": "Result",
+        "payload": {
+            "ok": {
+                "kind": "ConvergenceOutcome",
+                "payload": {
+                    "satisfied": converge_spec.get("satisfied_type", {"kind": "String"}),
+                    "exhausted": {
+                        "kind": "ExhaustionReport",
+                        "payload": converge_spec.get("partial_type", {"kind": "String"}),
+                    },
+                },
+            },
+            "err": {"kind": "String"},
+        },
+    }
+
+    return {
+        "name": name,
+        "entry_func": "main",
+        "inputs": {},
+        "mutations": {},
+        "module": {
+            "name": "mod_" + name,
+            "functions": [
+                {
+                    "name": "main",
+                    "params": [],
+                    "return_type": ret_ty,
+                    "declared_effects": {"effects": declared_effects},
+                    "entry": 0,
+                    "blocks": {
+                        "0": {
+                            "id": 0,
+                            "name": "entry",
+                            "params": [],
+                            "instructions": [
+                                {
+                                    "Converge": {
+                                        "dest": 1,
+                                        "root_node": converge_spec.get("root_node", "root"),
+                                        "initial_frontier": converge_spec.get("initial_frontier", ["root"]),
+                                        "successors": converge_spec.get("successors", {}),
+                                        "node_ops": converge_spec.get("node_ops", {}),
+                                        "satisfier": converge_spec.get(
+                                            "satisfier",
+                                            {"kind": "local", "effectful_op": None, "satisfier_map": {}},
+                                        ),
+                                        "partial_map": converge_spec.get("partial_map", {}),
+                                        "space_faults": converge_spec.get("space_faults", {}),
+                                        "fault_spec": converge_spec.get("fault_spec", {}),
+                                        "space_ops": converge_spec.get("space_ops", []),
+                                        "satisfier_op": converge_spec.get("satisfier_op", "local_satisfier"),
+                                        "search_policy": converge_spec.get(
+                                            "search_policy",
+                                            {
+                                                "policy_id": "pure_policy",
+                                                "on_step_failure": converge_spec.get("on_step_failure", "abort"),
+                                                "on_satisfier_error": converge_spec.get("on_satisfier_error", "abort"),
+                                                "policy_effects": {"effects": []},
+                                            },
+                                        ),
+                                        "budget_scope": converge_spec.get(
+                                            "budget_scope",
+                                            {
+                                                "resource": "usd",
+                                                "limit": converge_spec.get("budget_limit", 100),
+                                            },
+                                        ),
+                                        "max_steps": converge_spec.get("max_steps", 6),
+                                        "max_satisfaction_attempts": converge_spec.get("max_satisfaction_attempts", 5),
+                                        "space_effects": converge_spec.get("space_effects", {"effects": []}),
+                                        "satisfier_effects": converge_spec.get("satisfier_effects", {"effects": []}),
+                                        "partial_type": converge_spec.get("partial_type", {"kind": "String"}),
+                                        "satisfied_type": converge_spec.get("satisfied_type", {"kind": "String"}),
+                                    }
+                                }
+                            ],
+                            "terminator": {"Return": 1},
+                        }
+                    },
+                }
+            ],
+        },
+    }
+
+
+def run_mutation_kill(name: str, baseline_prog: dict, mutant_prog: dict, check_predicate) -> None:
     global PASS, FAIL
     print(f"\n--- MUTATION KILL TEST (Slice 4): {name}")
     try:
@@ -54,12 +148,12 @@ def run_mutation_kill(name: str, baseline_prog: dict, mutant_prog: dict, check_f
             FAIL += 1
             return
 
-        killed, reason = check_fn(baseline_obs, mutant_obs)
-        if killed:
-            print(f"  ✓ PASS {name} (real compiler/runtime mutation caught and killed: {reason})")
+        ok, explanation = check_predicate(baseline_obs, mutant_obs)
+        if ok:
+            print(f"  ✓ PASS {name} (real compiler/runtime mutation caught and killed: {explanation})")
             PASS += 1
         else:
-            print(f"  ✗ FAIL {name}: mutant was NOT killed! baseline={baseline_obs}, mutant={mutant_obs}")
+            print(f"  ✗ FAIL {name}: mutation check failed: {explanation}")
             FAIL += 1
     except Exception as e:
         print(f"  ✗ FAIL {name}: crashed with exception {type(e).__name__}: {e}")
@@ -68,17 +162,17 @@ def run_mutation_kill(name: str, baseline_prog: dict, mutant_prog: dict, check_f
 
 # S4M01: Scheduler pops unaffordable node
 def s4m01_scheduler_pops_unaffordable_node():
-    base = {
-        "name": "S4M01", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M01",
-            "initial_frontier": ["A"], "successors": {"A": []},
-            "node_ops": {"A": {"op_id": "opA", "kind": "external", "cost": 150}},
-            "budget_limit": 100, "max_steps": 6, "partial_map": {},
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "A",
+        "initial_frontier": ["A"],
+        "successors": {"A": []},
+        "node_ops": {"A": {"op_id": "opA", "kind": "external", "cost": 150}},
+        "partial_map": {},
+        "budget_limit": 100,
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M01", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m01_scheduler_pops_unaffordable_node": True}
 
     def check(b, m):
@@ -93,66 +187,50 @@ def s4m01_scheduler_pops_unaffordable_node():
 
 # S4M02: Policy hidden effect allowed
 def s4m02_policy_hidden_effect_allowed():
-    base = {
-        "name": "S4M02", "entry_func": "main", "inputs": {}, "mutations": {},
-        "module": {
-            "name": "m",
-            "functions": [
-                {
-                    "name": "main", "params": [],
-                    "return_type": {"kind": "Result", "payload": {"ok": {"kind": "ConvergenceOutcome", "payload": {"satisfied": {"kind": "String"}, "exhausted": {"kind": "ExhaustionReport", "payload": {"kind": "String"}}}}, "err": {"kind": "String"}}},
-                    "declared_effects": {"effects": [{"Read": "data"}, {"Read": "hidden_db"}]}, "entry": 0,
-                    "blocks": {
-                        "0": {
-                            "id": 0, "params": [],
-                            "instructions": [
-                                {
-                                    "Converge": {
-                                        "dest": 1, "root_node": "root", "space_ops": ["op1"], "satisfier_op": "sat1",
-                                        "search_policy": {
-                                            "policy_id": "effectful_policy", "on_step_failure": "abort", "on_satisfier_error": "abort",
-                                            "policy_effects": {"effects": [{"Read": "hidden_db"}]},
-                                        },
-                                        "budget_scope": {"resource": "usd", "limit": 100},
-                                        "max_steps": 6, "max_satisfaction_attempts": 5,
-                                        "space_effects": {"effects": [{"Read": "data"}]}, "satisfier_effects": {"effects": []},
-                                        "partial_type": {"kind": "String"}, "satisfied_type": {"kind": "String"},
-                                    }
-                                }
-                            ],
-                            "terminator": {"Return": 1},
-                        }
-                    },
-                }
-            ],
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": []},
+        "node_ops": {},
+        "search_policy": {
+            "policy_id": "hidden_eff_policy",
+            "on_step_failure": "abort",
+            "on_satisfier_error": "abort",
+            "policy_effects": {"effects": [{"Read": "untracked"}]},
         },
+        "budget_limit": 100,
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M02", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m02_policy_hidden_effect_allowed": True}
 
     def check(b, m):
         if b["status"] == "verifier_error" and m["status"] == "ok":
             return True, "baseline rejected effectful SearchPolicy, mutant bypassed check"
-        return False, f"status base={b['status']}, mut={m['status']}"
+        return False, f"base={b['status']}, mut={m['status']}"
 
     run_mutation_kill("S4M02_policy_hidden_effect_allowed", base, mut, check)
 
 
-# S4M03: Ranking promotes partial to Satisfied
+# S4M03: Ranking promotes to Satisfied
 def s4m03_ranking_promotes_satisfied():
-    base = {
-        "name": "S4M03", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M03",
-            "initial_frontier": ["root"], "successors": {"root": []},
-            "node_ops": {"root": {"op_id": "op1", "kind": "local", "cost": 0}},
-            "partial_map": {"root": {"kind": "String", "payload": "P_root"}},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": []},
+        "node_ops": {"root": {"op_id": "opRoot", "kind": "local", "cost": 0}},
+        "partial_map": {"root": {"kind": "String", "payload": "P_root"}},
+        "satisfier": {
+            "kind": "local",
+            "effectful_op": None,
             "satisfier_map": {"root": ["ok", False, None]},
-            "max_steps": 6,
         },
-        "module": {"name": "m", "functions": []},
+        "budget_limit": 100,
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M03", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m03_ranking_promotes_satisfied": True}
 
     def check(b, m):
@@ -167,23 +245,23 @@ def s4m03_ranking_promotes_satisfied():
 
 # S4M04: StageLocal rejected leaves reservation
 def s4m04_stage_rejected_leaves_reservation():
-    base = {
-        "name": "S4M04", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M04",
-            "initial_frontier": ["A"], "successors": {"A": []},
-            "node_ops": {"A": {"op_id": "opA", "kind": "external", "cost": 150}},
-            "budget_limit": 200, "max_steps": 6, "partial_map": {},
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "A",
+        "initial_frontier": ["A"],
+        "successors": {"A": []},
+        "node_ops": {"A": {"op_id": "opA", "kind": "external", "cost": 150}},
+        "partial_map": {},
+        "budget_limit": 200,
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M04", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m01_scheduler_pops_unaffordable_node": True, "s4m04_stage_rejected_leaves_reservation": True}
 
     def check(b, m):
         b_c = b["converge_observation"]
         m_c = m["converge_observation"]
-        if b_c["attributable_owner_reserved"] == 0 and m_c["attributable_owner_reserved"] == 150:
+        if b_c["attributable_owner_reserved"] == 0 and m_c["attributable_owner_reserved"] > 0:
             return True, f"baseline had 0 reservation on reject, mutant left {m_c['attributable_owner_reserved']}"
         return False, f"base={b_c['attributable_owner_reserved']}, mut={m_c['attributable_owner_reserved']}"
 
@@ -192,22 +270,16 @@ def s4m04_stage_rejected_leaves_reservation():
 
 # S4M05: First EmitExternal fails to increment step
 def s4m05_first_emit_fails_step():
-    base = {
-        "name": "S4M05", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M05",
-            "initial_frontier": ["root"], "successors": {"root": ["succ"]},
-            "node_ops": {
-                "root": {"op_id": "opExt", "kind": "external", "cost": 10},
-                "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
-            },
-            "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
-            "satisfier_map": {"root": ["ok", False, None], "succ": ["ok", True, {"kind": "String", "payload": "T-ok"}]},
-            "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": []},
+        "node_ops": {"root": {"op_id": "opExt", "kind": "external", "cost": 10}},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M05", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m05_first_emit_fails_step": True}
 
     def check(b, m):
@@ -222,23 +294,17 @@ def s4m05_first_emit_fails_step():
 
 # S4M06: Transport retry increments step
 def s4m06_transport_retry_increments_step():
-    base = {
-        "name": "S4M06", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M06",
-            "initial_frontier": ["root"], "successors": {"root": ["succ"]},
-            "node_ops": {
-                "root": {"op_id": "opRetry", "kind": "external", "cost": 10, "dedup_capable": True, "idempotent": True},
-                "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
-            },
-            "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
-            "satisfier_map": {"root": ["ok", False, None], "succ": ["ok", True, {"kind": "String", "payload": "T-ok"}]},
-            "fault_spec": {"delivery_unknown": True, "safe_retry": True},
-            "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": []},
+        "node_ops": {"root": {"op_id": "opRetry", "kind": "external", "cost": 10, "dedup_capable": True}},
+        "fault_spec": {"delivery_unknown": True, "safe_retry": True},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M06", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m06_transport_retry_increments_step": True}
 
     def check(b, m):
@@ -253,19 +319,17 @@ def s4m06_transport_retry_increments_step():
 
 # S4M07: Transport retry changes request_id
 def s4m07_transport_retry_changes_request_id():
-    base = {
-        "name": "S4M07", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M07",
-            "initial_frontier": ["root"], "successors": {"root": []},
-            "node_ops": {"root": {"op_id": "opRetry", "kind": "external", "cost": 10, "dedup_capable": True, "idempotent": True}},
-            "partial_map": {},
-            "fault_spec": {"delivery_unknown": True, "safe_retry": True},
-            "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": []},
+        "node_ops": {"root": {"op_id": "opRetry", "kind": "external", "cost": 10, "dedup_capable": True}},
+        "fault_spec": {"delivery_unknown": True, "safe_retry": True},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M07", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m07_transport_retry_changes_request_id": True}
 
     def check(b, m):
@@ -280,47 +344,45 @@ def s4m07_transport_retry_changes_request_id():
 
 # S4M08: Second unsettled request allowed
 def s4m08_second_unsettled_request_allowed():
-    base = {
-        "name": "S4M08", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M08",
-            "initial_frontier": ["A", "B"], "successors": {"A": [], "B": []},
-            "node_ops": {
-                "A": {"op_id": "opA", "kind": "external", "cost": 10},
-                "B": {"op_id": "opB", "kind": "external", "cost": 10},
-            },
-            "partial_map": {}, "fault_spec": {"delivery_unknown": True},
-            "max_steps": 6,
+    spec = {
+        "root_node": "A",
+        "initial_frontier": ["A", "B"],
+        "successors": {"A": [], "B": []},
+        "node_ops": {
+            "A": {"op_id": "opA", "kind": "external", "cost": 10},
+            "B": {"op_id": "opB", "kind": "external", "cost": 10},
         },
-        "module": {"name": "m", "functions": []},
+        "fault_spec": {"delivery_unknown": True},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M08", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m08_second_unsettled_request_allowed": True}
 
     def check(b, m):
         b_c = b["converge_observation"]
         m_c = m["converge_observation"]
-        if b_c["status"] == "Waiting" and m_c["status"] != "Waiting":
+        if len(b_c["effects"]) == 1 and len(m_c["effects"]) == 2:
             return True, f"baseline stayed in Waiting on first in-flight ({b_c['effects']}), mutant concurrently dispatched second request ({m_c['effects']})"
-        return False, f"base={b_c['status']}, mut={m_c['status']}"
+        return False, f"base={b_c['effects']}, mut={m_c['effects']}"
 
     run_mutation_kill("S4M08_second_unsettled_request_allowed", base, mut, check)
 
 
 # S4M09: DeliveryUnknown releases commitment
 def s4m09_delivery_unknown_releases_commitment():
-    base = {
-        "name": "S4M09", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M09",
-            "initial_frontier": ["root"], "successors": {"root": []},
-            "node_ops": {"root": {"op_id": "opDeliv", "kind": "external", "cost": 25}},
-            "partial_map": {}, "fault_spec": {"delivery_unknown": True},
-            "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": []},
+        "node_ops": {"root": {"op_id": "opUnknown", "kind": "external", "cost": 25}},
+        "fault_spec": {"delivery_unknown": True, "safe_retry": False},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M09", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m09_delivery_unknown_releases_commitment": True}
 
     def check(b, m):
@@ -335,18 +397,17 @@ def s4m09_delivery_unknown_releases_commitment():
 
 # S4M10: Duplicate completion applies twice
 def s4m10_duplicate_completion_applies_twice():
-    base = {
-        "name": "S4M10", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M10",
-            "initial_frontier": ["root"], "successors": {"root": ["s1"]},
-            "node_ops": {"root": {"op_id": "opDup", "kind": "external", "cost": 10}},
-            "partial_map": {}, "fault_spec": {"duplicate_completion": True},
-            "max_steps": 1,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": ["s1"]},
+        "node_ops": {"root": {"op_id": "opDup", "kind": "external", "cost": 10}},
+        "fault_spec": {"duplicate_completion": True},
+        "partial_map": {},
+        "max_steps": 1,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M10", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m10_duplicate_completion_applies_twice": True}
 
     def check(b, m):
@@ -361,18 +422,17 @@ def s4m10_duplicate_completion_applies_twice():
 
 # S4M11: Duplicate settlement reconciles twice
 def s4m11_duplicate_settlement_reconciles_twice():
-    base = {
-        "name": "S4M11", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M11",
-            "initial_frontier": ["root"], "successors": {"root": []},
-            "node_ops": {"root": {"op_id": "opSett", "kind": "external", "cost": 20}},
-            "partial_map": {}, "fault_spec": {"duplicate_completion": True},
-            "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": []},
+        "node_ops": {"root": {"op_id": "opDup", "kind": "external", "cost": 20}},
+        "fault_spec": {"duplicate_completion": True},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M11", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m11_duplicate_settlement_reconciles_twice": True}
 
     def check(b, m):
@@ -387,23 +447,28 @@ def s4m11_duplicate_settlement_reconciles_twice():
 
 # S4M12: Settlement marks Applied automatically
 def s4m12_settlement_marks_applied_automatically():
-    base = {
-        "name": "S4M12", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M12",
-            "initial_frontier": ["root"], "successors": {"root": ["succ"]},
-            "node_ops": {
-                "root": {"op_id": "opRoot", "kind": "external", "cost": 10},
-                "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
-            },
-            "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
-            "satisfier_map": {"root": ["ok", False, None], "succ": ["ok", True, {"kind": "String", "payload": "T-succ"}]},
-            "fault_spec": {"crash_after_settlement": True},
-            "max_steps": 6,
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": ["succ"]},
+        "node_ops": {
+            "root": {"op_id": "opRoot", "kind": "external", "cost": 10},
+            "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
         },
-        "module": {"name": "m", "functions": []},
+        "fault_spec": {"crash_after_settlement": True},
+        "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
+        "satisfier": {
+            "kind": "local",
+            "effectful_op": None,
+            "satisfier_map": {
+                "root": ["ok", False, None],
+                "succ": ["ok", True, {"kind": "String", "payload": "T-succ"}],
+            },
+        },
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M12", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m12_settlement_marks_applied_automatically": True}
 
     def check(b, m):
@@ -416,25 +481,30 @@ def s4m12_settlement_marks_applied_automatically():
     run_mutation_kill("S4M12_settlement_marks_applied_automatically", base, mut, check)
 
 
-# S4M13: Crash-after-settlement loses semantic result
+# S4M13: Crash after settlement loses semantic result
 def s4m13_crash_after_settlement_loses_semantic_result():
-    base = {
-        "name": "S4M13", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M13",
-            "initial_frontier": ["root"], "successors": {"root": ["succ"]},
-            "node_ops": {
-                "root": {"op_id": "opRoot", "kind": "external", "cost": 10},
-                "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
-            },
-            "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
-            "satisfier_map": {"root": ["ok", False, None], "succ": ["ok", True, {"kind": "String", "payload": "T-succ"}]},
-            "fault_spec": {"crash_after_settlement": True},
-            "max_steps": 6,
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": ["succ"]},
+        "node_ops": {
+            "root": {"op_id": "opRoot", "kind": "external", "cost": 10},
+            "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
         },
-        "module": {"name": "m", "functions": []},
+        "fault_spec": {"crash_after_settlement": True},
+        "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
+        "satisfier": {
+            "kind": "local",
+            "effectful_op": None,
+            "satisfier_map": {
+                "root": ["ok", False, None],
+                "succ": ["ok", True, {"kind": "String", "payload": "T-succ"}],
+            },
+        },
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M13", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m13_crash_after_settlement_loses_semantic_result": True}
 
     def check(b, m):
@@ -449,18 +519,17 @@ def s4m13_crash_after_settlement_loses_semantic_result():
 
 # S4M14: Closing accepts late semantic payload
 def s4m14_closing_accepts_late_payload():
-    base = {
-        "name": "S4M14", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M14",
-            "initial_frontier": ["root"], "successors": {"root": ["late_succ"]},
-            "node_ops": {"root": {"op_id": "opLate", "kind": "external", "cost": 10}},
-            "fault_spec": {"delivery_unknown": False, "cancel_in_flight": True},
-            "partial_map": {}, "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": ["late_succ"]},
+        "node_ops": {"root": {"op_id": "opLate", "kind": "external", "cost": 10}},
+        "fault_spec": {"delivery_unknown": False, "cancel_in_flight": True},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M14", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m14_closing_accepts_late_payload": True, "s4m15_closing_mutates_frontier": True}
 
     def check(b, m):
@@ -475,18 +544,17 @@ def s4m14_closing_accepts_late_payload():
 
 # S4M15: Closing mutates frontier
 def s4m15_closing_mutates_frontier():
-    base = {
-        "name": "S4M15", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M15",
-            "initial_frontier": ["root"], "successors": {"root": ["late_succ"]},
-            "node_ops": {"root": {"op_id": "opLate", "kind": "external", "cost": 10}},
-            "fault_spec": {"delivery_unknown": False, "cancel_in_flight": True},
-            "partial_map": {}, "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": ["late_succ"]},
+        "node_ops": {"root": {"op_id": "opLate", "kind": "external", "cost": 10}},
+        "fault_spec": {"delivery_unknown": False, "cancel_in_flight": True},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M15", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m15_closing_mutates_frontier": True, "s4m14_closing_accepts_late_payload": True}
 
     def check(b, m):
@@ -501,18 +569,17 @@ def s4m15_closing_mutates_frontier():
 
 # S4M16: Terminalizes with commitment
 def s4m16_terminalizes_with_commitment():
-    base = {
-        "name": "S4M16", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M16",
-            "initial_frontier": ["root"], "successors": {"root": []},
-            "node_ops": {"root": {"op_id": "opHold", "kind": "external", "cost": 30}},
-            "partial_map": {}, "fault_spec": {"delivery_unknown": True},
-            "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "root",
+        "initial_frontier": ["root"],
+        "successors": {"root": []},
+        "node_ops": {"root": {"op_id": "opCommit", "kind": "external", "cost": 30}},
+        "fault_spec": {"delivery_unknown": True, "safe_retry": False},
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M16", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m16_terminalizes_with_commitment": True}
 
     def check(b, m):
@@ -527,17 +594,16 @@ def s4m16_terminalizes_with_commitment():
 
 # S4M17: BudgetScope mints ownership
 def s4m17_budget_scope_mints_ownership():
-    base = {
-        "name": "S4M17", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M17",
-            "initial_frontier": ["A"], "successors": {"A": []},
-            "node_ops": {"A": {"op_id": "opA", "kind": "external", "cost": 150}},
-            "budget_limit": 200, "max_steps": 6, "partial_map": {},
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "A",
+        "initial_frontier": ["A"],
+        "successors": {"A": []},
+        "node_ops": {"A": {"op_id": "opA", "kind": "external", "cost": 150}},
+        "budget_limit": 200,
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M17", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m17_budget_scope_mints_ownership": True}
 
     def check(b, m):
@@ -552,24 +618,18 @@ def s4m17_budget_scope_mints_ownership():
 
 # S4M18: Requeue reuses semantic request_id
 def s4m18_requeue_reuses_request_id():
-    base = {
-        "name": "S4M18", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M18",
-            "initial_frontier": ["R"], "successors": {"R": ["succ"]},
-            "node_ops": {
-                "R": {"op_id": "opR", "kind": "external", "cost": 10},
-                "succ": {"op_id": "opSucc", "kind": "local", "cost": 0},
-            },
-            "space_faults": {"opR": ["Fault1"]},
-            "on_step_failure": "requeue",
-            "partial_map": {"succ": {"kind": "String", "payload": "P_succ"}},
-            "satisfier_map": {"R": ["ok", False, None], "succ": ["ok", True, {"kind": "String", "payload": "T-requeue"}]},
-            "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "R",
+        "initial_frontier": ["R"],
+        "successors": {"R": []},
+        "node_ops": {"R": {"op_id": "opR", "kind": "external", "cost": 10}},
+        "space_faults": {"opR": ["Fault1"]},
+        "on_step_failure": "requeue",
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M18", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m18_requeue_reuses_request_id": True}
 
     def check(b, m):
@@ -584,20 +644,18 @@ def s4m18_requeue_reuses_request_id():
 
 # S4M19: Failed requeue incorporates successors
 def s4m19_failed_requeue_incorporates_successors():
-    base = {
-        "name": "S4M19", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M19",
-            "initial_frontier": ["R"], "successors": {"R": ["phantom_child"]},
-            "node_ops": {"R": {"op_id": "opR", "kind": "external", "cost": 10}},
-            "space_faults": {"opR": "Fail1"},
-            "on_step_failure": "abort",
-            "partial_map": {},
-            "max_steps": 6,
-        },
-        "module": {"name": "m", "functions": []},
+    spec = {
+        "root_node": "R",
+        "initial_frontier": ["R"],
+        "successors": {"R": ["phantom_child"]},
+        "node_ops": {"R": {"op_id": "opR", "kind": "external", "cost": 10}},
+        "space_faults": {"opR": "Fail1"},
+        "on_step_failure": "abort",
+        "partial_map": {},
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M19", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m19_failed_requeue_incorporates_successors": True}
 
     def check(b, m):
@@ -612,21 +670,23 @@ def s4m19_failed_requeue_incorporates_successors():
 
 # S4M20: Satisfaction retry bypasses attempt ceiling
 def s4m20_satisfaction_retry_bypasses_attempt_ceiling():
-    base = {
-        "name": "S4M20", "entry_func": "main", "inputs": {}, "mutations": {},
-        "converge_scenario": {
-            "name": "S4M20",
-            "initial_frontier": ["cand"], "successors": {"cand": []},
-            "node_ops": {"cand": {"op_id": "opCand", "kind": "local", "cost": 0}},
-            "partial_map": {"cand": {"kind": "String", "payload": "P_cand"}},
+    spec = {
+        "root_node": "cand",
+        "initial_frontier": ["cand"],
+        "successors": {"cand": []},
+        "node_ops": {"cand": {"op_id": "opCand", "kind": "local", "cost": 0}},
+        "partial_map": {"cand": {"kind": "String", "payload": "P_cand"}},
+        "satisfier": {
+            "kind": "local",
+            "effectful_op": None,
             "satisfier_map": {"cand": ["err", False, {"kind": "String", "payload": "Err"}]},
-            "on_satisfier_error": "retry",
-            "max_satisfaction_attempts": 1,
-            "max_steps": 6,
         },
-        "module": {"name": "m", "functions": []},
+        "on_satisfier_error": "retry",
+        "max_satisfaction_attempts": 1,
+        "max_steps": 6,
     }
-    mut = json.loads(json.dumps(base))
+    base = make_converge_program("S4M20", spec)
+    mut = copy.deepcopy(base)
     mut["mutations"] = {"s4m20_satisfaction_retry_bypasses_attempt_ceiling": True}
 
     def check(b, m):

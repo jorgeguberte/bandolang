@@ -17,6 +17,9 @@ Compares every frozen semantic observable established by Campaign 2:
 14. exhaustion_reason
 
 Exact canonical comparison between Python Semantic Oracle and Rust Toolchain.
+All programs are compiled and executed through the complete SOMA-IR compiler pipeline:
+Instruction::Converge -> HighLevelVerifier -> LoweringContext -> VmVerifier -> VmInterpreter.
+
 Includes all 33 Campaign 2 scenarios (D01–D06, D13–D29, D31–D34, D07–D12) + negative divergence probes.
 """
 
@@ -45,7 +48,7 @@ from scenarios import (
     D33_SPACE_STEP_FAILURE_PRUNE_CONTINUES,
     D34_SPACE_STEP_FAILURE_REQUEUE_RETRIES_WITH_NEW_REQUEST,
     D07, D08, D09, D10, D11, D12,
-    OpDef, ScenarioProgram,
+    ScenarioProgram,
 )
 from semantic_model import SemanticFrame
 
@@ -98,7 +101,6 @@ def convert_scenario_to_rust_json(prog: ScenarioProgram) -> dict:
     satisfier_map_json = {}
     for node, sat in prog.satisfier_map.items():
         if isinstance(sat, list):
-            # List of tuples for retries
             entries = []
             for item in sat:
                 tag, is_sat, val = item[0], item[1], item[2]
@@ -137,35 +139,89 @@ def convert_scenario_to_rust_json(prog: ScenarioProgram) -> dict:
             "idempotent": es.idempotent,
         }
 
+    ret_ty = {
+        "kind": "Result",
+        "payload": {
+            "ok": {
+                "kind": "ConvergenceOutcome",
+                "payload": {
+                    "satisfied": {"kind": "String"},
+                    "exhausted": {"kind": "ExhaustionReport", "payload": {"kind": "String"}},
+                },
+            },
+            "err": {"kind": "String"},
+        },
+    }
+
     return {
         "name": prog.name,
         "entry_func": "main",
         "inputs": {},
-        "converge_scenario": {
-            "name": prog.name,
-            "initial_frontier": list(prog.initial_frontier),
-            "successors": dict(prog.successors),
-            "node_ops": node_ops_json,
-            "satisfier_map": satisfier_map_json,
-            "on_satisfier_error": prog.on_satisfier_error,
-            "space_faults": dict(prog.space_faults),
-            "on_step_failure": prog.on_step_failure,
-            "max_steps": prog.max_steps,
-            "budget_limit": prog.budget_limit,
-            "fault_spec": {
-                "delivery_unknown": prog.fault_spec.delivery_unknown,
-                "delivery_unknown_ops": list(prog.fault_spec.delivery_unknown_ops),
-                "safe_retry": prog.fault_spec.safe_retry,
-                "double_delivery_unknown": prog.fault_spec.double_delivery_unknown,
-                "duplicate_completion": prog.fault_spec.duplicate_completion,
-                "crash_after_settlement": prog.fault_spec.crash_after_settlement,
-                "cancel_in_flight": prog.fault_spec.cancel_in_flight,
-            },
-            "effectful_satisfier": effectful_sat_json,
-            "partial_map": partial_map_json,
-            "max_satisfaction_attempts": prog.max_satisfaction_attempts,
+        "module": {
+            "name": "mod_" + prog.name,
+            "functions": [
+                {
+                    "name": "main",
+                    "params": [],
+                    "return_type": ret_ty,
+                    "declared_effects": {"effects": []},
+                    "entry": 0,
+                    "blocks": {
+                        "0": {
+                            "id": 0,
+                            "name": "entry",
+                            "params": [],
+                            "instructions": [
+                                {
+                                    "Converge": {
+                                        "dest": 1,
+                                        "root_node": prog.initial_frontier[0] if prog.initial_frontier else "root",
+                                        "initial_frontier": list(prog.initial_frontier),
+                                        "successors": dict(prog.successors),
+                                        "node_ops": node_ops_json,
+                                        "satisfier": {
+                                            "kind": "external" if prog.effectful_satisfier is not None else "local",
+                                            "effectful_op": effectful_sat_json,
+                                            "satisfier_map": satisfier_map_json,
+                                        },
+                                        "partial_map": partial_map_json,
+                                        "space_faults": dict(prog.space_faults),
+                                        "fault_spec": {
+                                            "delivery_unknown": prog.fault_spec.delivery_unknown,
+                                            "delivery_unknown_ops": list(prog.fault_spec.delivery_unknown_ops),
+                                            "safe_retry": prog.fault_spec.safe_retry,
+                                            "double_delivery_unknown": prog.fault_spec.double_delivery_unknown,
+                                            "duplicate_completion": prog.fault_spec.duplicate_completion,
+                                            "crash_after_settlement": prog.fault_spec.crash_after_settlement,
+                                            "cancel_in_flight": prog.fault_spec.cancel_in_flight,
+                                        },
+                                        "space_ops": [],
+                                        "satisfier_op": "local_satisfier",
+                                        "search_policy": {
+                                            "policy_id": "pure_policy",
+                                            "on_step_failure": prog.on_step_failure,
+                                            "on_satisfier_error": prog.on_satisfier_error,
+                                            "policy_effects": {"effects": []},
+                                        },
+                                        "budget_scope": {
+                                            "resource": "usd",
+                                            "limit": prog.budget_limit,
+                                        },
+                                        "max_steps": prog.max_steps,
+                                        "max_satisfaction_attempts": prog.max_satisfaction_attempts,
+                                        "space_effects": {"effects": []},
+                                        "satisfier_effects": {"effects": []},
+                                        "partial_type": {"kind": "String"},
+                                        "satisfied_type": {"kind": "String"},
+                                    }
+                                }
+                            ],
+                            "terminator": {"Return": 1},
+                        }
+                    },
+                }
+            ],
         },
-        "module": {"name": "m", "functions": []},
     }
 
 
@@ -202,7 +258,7 @@ def run_differential_scenario(prog: ScenarioProgram) -> None:
         sem.run_program(prog)
         oracle_obs = sem.observe()
 
-        # 2. Rust toolchain run
+        # 2. Rust toolchain run through full compiler pipeline
         rust_prog = convert_scenario_to_rust_json(prog)
         raw_rust_obs = invoke_rust_conformance(rust_prog)
         rust_obs = normalize_rust_observation(raw_rust_obs)

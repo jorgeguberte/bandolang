@@ -595,6 +595,13 @@ fn test_slice4_converge_pipeline() {
     entry.instructions.push(Instruction::Converge {
         dest: ValueId(1),
         root_node: "root".to_string(),
+        initial_frontier: vec!["root".to_string()],
+        successors: std::collections::BTreeMap::new(),
+        node_ops: std::collections::BTreeMap::new(),
+        satisfier: bando::ir::ops::SatisfierDef::default(),
+        partial_map: std::collections::BTreeMap::new(),
+        space_faults: std::collections::BTreeMap::new(),
+        fault_spec: bando::ir::ops::ConvergeFaultSpec::default(),
         space_ops: vec![bando::registry::OperationId("local_op".to_string())],
         satisfier_op: bando::registry::OperationId("local_satisfier".to_string()),
         search_policy: bando::ir::ops::SearchPolicyDescriptor {
@@ -644,6 +651,7 @@ fn test_slice4_converge_pipeline() {
     );
 
     assert_eq!(state.status, VmStatus::Terminated);
-    assert!(state.observable_effects.contains(&"read[data]".to_string()));
+    // R4: May-effects are not copied to observable_effects; only executed operations appear
+    assert_eq!(state.observable_effects.len(), 0);
     assert_eq!(state.converge_domains.len(), 1);
 }

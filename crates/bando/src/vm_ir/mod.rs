@@ -92,6 +92,7 @@ pub enum VmInstruction {
     VmConvergeInit {
         frame_var: VmValueId,
         root_node: String,
+        initial_frontier: Vec<String>,
         budget_resource: String,
         budget_limit: u64,
         max_steps: u64,
@@ -102,10 +103,16 @@ pub enum VmInstruction {
     VmConvergeStep {
         dest: VmValueId,
         frame_var: VmValueId,
-        space_ops: Vec<OperationId>,
-        satisfier_op: OperationId,
-        space_effects: EffectRow,
-        satisfier_effects: EffectRow,
+        successors: std::collections::BTreeMap<String, Vec<String>>,
+        node_ops: std::collections::BTreeMap<String, crate::ir::ops::SpaceOpDef>,
+        satisfier: crate::ir::ops::SatisfierDef,
+        partial_map: std::collections::BTreeMap<String, VmValue>,
+        space_faults: std::collections::BTreeMap<String, serde_json::Value>,
+        fault_spec: crate::ir::ops::ConvergeFaultSpec,
+    },
+    VmConvergeFinish {
+        dest: VmValueId,
+        frame_var: VmValueId,
         partial_type: Type,
         satisfied_type: Type,
     },
@@ -125,6 +132,7 @@ impl VmInstruction {
             VmInstruction::VmInternalize { dest, .. } => *dest,
             VmInstruction::VmConvergeInit { frame_var, .. } => *frame_var,
             VmInstruction::VmConvergeStep { dest, .. } => *dest,
+            VmInstruction::VmConvergeFinish { dest, .. } => *dest,
         }
     }
 
@@ -152,15 +160,8 @@ impl VmInstruction {
                 validation_effects, ..
             } => validation_effects.clone(),
             VmInstruction::VmConvergeInit { .. } => Vec::new(),
-            VmInstruction::VmConvergeStep {
-                space_effects,
-                satisfier_effects,
-                ..
-            } => {
-                let mut effs = space_effects.effects.clone();
-                effs.extend(satisfier_effects.effects.clone());
-                effs.into_iter().collect()
-            }
+            VmInstruction::VmConvergeStep { .. } => Vec::new(),
+            VmInstruction::VmConvergeFinish { .. } => Vec::new(),
         }
     }
 }

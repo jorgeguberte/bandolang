@@ -24,37 +24,6 @@ use crate::{
 };
 
 pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 {
-    // Check if running declarative converge scenario
-    if let Some(scen) = &prog.converge_scenario {
-        let (_d, converge_obs) =
-            crate::converge::runner::run_converge_scenario(scen, &prog.mutations);
-        let ret_val = converge_obs.value.clone();
-        let effs = converge_obs.effects.clone();
-        return ConformanceObservationV0 {
-            status: "ok".to_string(),
-            return_val: ret_val,
-            effects: effs,
-            active_facts: Vec::new(),
-            latent_facts: BTreeMap::new(),
-            types: BTreeMap::new(),
-            bindings: BTreeMap::new(),
-            lineage: BTreeMap::new(),
-            diagnostics: Vec::new(),
-            mutation_trace: Vec::new(),
-            final_world: None,
-            gate_resolutions: Vec::new(),
-            gate_trace: Vec::new(),
-            child_handles: BTreeMap::new(),
-            child_events: Vec::new(),
-            frame_ledgers: BTreeMap::new(),
-            child_effective_authority: BTreeMap::new(),
-            result_provenance: BTreeMap::new(),
-            beliefs: BTreeMap::new(),
-            internalization_trace: Vec::new(),
-            converge_observation: Some(converge_obs),
-        };
-    }
-
     let registry = prog.registry.clone().unwrap_or_else(RegistrySnapshot::new);
 
     // 1. High-level verifier (with trusted registry binding, P1, Q2, Q3, Q4)

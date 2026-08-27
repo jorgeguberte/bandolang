@@ -1235,6 +1235,7 @@ impl<'a> VmInterpreter<'a> {
             VmInstruction::VmConvergeInit {
                 frame_var,
                 root_node,
+                initial_frontier,
                 budget_resource,
                 budget_limit,
                 max_steps,
@@ -1244,30 +1245,34 @@ impl<'a> VmInterpreter<'a> {
             } => {
                 let frame_sym = format!("v{}", frame_var.0);
                 let mut domain = crate::converge::domain::ConvergeTransactionDomain::default();
-                domain.nodes.insert(
-                    root_node.clone(),
-                    crate::converge::domain::SearchNode::new(root_node.clone()),
-                );
-                domain.frontier.push(root_node.clone());
+                domain.on_step_failure = on_step_failure.clone();
+                domain.on_satisfier_error = on_satisfier_error.clone();
+                domain.max_steps = *max_steps;
+                domain.max_satisfaction_attempts = *max_satisfaction_attempts;
+
                 domain
                     .scope_limit
                     .insert(budget_resource.clone(), *budget_limit);
 
-                let current_avail = *state
-                    .frame_budget
-                    .available
-                    .get(budget_resource)
-                    .unwrap_or(budget_limit);
+                let initial_usd = 100;
                 domain
                     .intent_initial_total
-                    .insert(budget_resource.clone(), current_avail);
+                    .insert(budget_resource.clone(), initial_usd);
                 domain
                     .intent_available
-                    .insert(budget_resource.clone(), current_avail);
-                domain.max_steps = *max_steps;
-                domain.max_satisfaction_attempts = *max_satisfaction_attempts;
-                domain.on_step_failure = on_step_failure.clone();
-                domain.on_satisfier_error = on_satisfier_error.clone();
+                    .insert(budget_resource.clone(), initial_usd);
+
+                let init_front = if initial_frontier.is_empty() {
+                    vec![root_node.clone()]
+                } else {
+                    initial_frontier.clone()
+                };
+                let _ = crate::converge::engine::discover_successors(
+                    &mut domain,
+                    &init_front,
+                    self.mutations.s4m15_closing_mutates_frontier,
+                );
+
                 domain.frame_status = crate::converge::domain::SearchStatus::Searching;
 
                 state.converge_domains.insert(frame_sym.clone(), domain);
@@ -1277,12 +1282,12 @@ impl<'a> VmInterpreter<'a> {
             VmInstruction::VmConvergeStep {
                 dest,
                 frame_var,
-                space_ops,
-                satisfier_op,
-                space_effects,
-                satisfier_effects,
-                partial_type,
-                satisfied_type,
+                successors,
+                node_ops,
+                satisfier,
+                partial_map,
+                space_faults,
+                fault_spec,
             } => {
                 let frame_sym = format!("v{}", frame_var.0);
                 let dest_sym = format!("v{}", dest.0);
@@ -1290,105 +1295,645 @@ impl<'a> VmInterpreter<'a> {
                 let mut domain = state
                     .converge_domains
                     .remove(&frame_sym)
-                    .unwrap_or_else(|| {
-                        let mut d = crate::converge::domain::ConvergeTransactionDomain::default();
-                        d.nodes.insert(
-                            "root".to_string(),
-                            crate::converge::domain::SearchNode::new("root"),
-                        );
-                        d.frontier.push("root".to_string());
-                        d
-                    });
+                    .unwrap_or_default();
 
-                let mut node_ops = std::collections::BTreeMap::new();
-                for op in space_ops {
-                    node_ops.insert(
-                        op.0.clone(),
+                let _ = crate::converge::invariants::check_all_invariants(&domain);
+
+                if domain.frame_status != crate::converge::domain::SearchStatus::Searching
+                    && !(self.mutations.s4m08_second_unsettled_request_allowed && !domain.frontier.is_empty())
+                {
+                    state.env.insert(dest_sym.clone(), VmValue::Bool(false));
+                    state.types.insert(dest_sym, Type::Bool.display_name());
+                    state.converge_domains.insert(frame_sym, domain);
+                    return;
+                }
+
+                let mut sched_node_ops = std::collections::BTreeMap::new();
+                for (n, op) in node_ops {
+                    sched_node_ops.insert(
+                        n.clone(),
                         crate::converge::scheduler::SpaceOpInfo {
-                            op_id: op.0.clone(),
-                            kind: "local".to_string(),
-                            cost: 0,
+                            op_id: op.op_id.clone(),
+                            kind: op.kind.clone(),
+                            cost: op.cost,
                         },
                     );
                 }
 
-                let partial_map = std::collections::BTreeMap::new();
-                let effectful_sat =
-                    if !satisfier_op.0.is_empty() && satisfier_op.0 != "local_satisfier" {
-                        Some(crate::converge::scheduler::SatisfierOpInfo {
-                            op_id: satisfier_op.0.clone(),
-                            kind: "local".to_string(),
-                            cost: 0,
-                        })
-                    } else {
-                        None
-                    };
+                let effectful_sat = satisfier.effectful_op.as_ref().map(|es| {
+                    crate::converge::scheduler::SatisfierOpInfo {
+                        op_id: es.op_id.clone(),
+                        kind: es.kind.clone(),
+                        cost: es.cost,
+                    }
+                });
 
-                while domain.frame_status == crate::converge::domain::SearchStatus::Searching {
-                    let action = crate::converge::scheduler::scheduler_step(
-                        &mut domain,
-                        &node_ops,
-                        &partial_map,
-                        effectful_sat.as_ref(),
-                        self.mutations.s4m01_scheduler_pops_unaffordable_node,
-                        self.mutations.s4m17_budget_scope_mints_ownership,
-                        self.mutations
-                            .s4m20_satisfaction_retry_bypasses_attempt_ceiling,
-                        self.mutations.s4m08_second_unsettled_request_allowed,
-                    );
+                let action = crate::converge::scheduler::scheduler_step(
+                    &mut domain,
+                    &sched_node_ops,
+                    partial_map,
+                    effectful_sat.as_ref(),
+                    self.mutations.s4m01_scheduler_pops_unaffordable_node,
+                    self.mutations.s4m17_budget_scope_mints_ownership,
+                    self.mutations
+                        .s4m20_satisfaction_retry_bypasses_attempt_ceiling,
+                    self.mutations.s4m08_second_unsettled_request_allowed,
+                );
 
-                    match action {
-                        crate::converge::scheduler::SchedulerAction::Stop { reason } => {
-                            crate::converge::engine::exhaust(&mut domain, &reason);
-                            let _ = crate::converge::engine::terminalize(
-                                &mut domain,
-                                self.mutations.s4m16_terminalizes_with_commitment,
-                            );
-                            break;
-                        }
-                        crate::converge::scheduler::SchedulerAction::Wait { .. } => {
-                            break;
-                        }
-                        crate::converge::scheduler::SchedulerAction::Expand(act) => {
-                            if act.kind == "local" {
-                                let succs = Vec::new();
-                                if let Err(e) = crate::converge::engine::dispatch_local(
-                                    &mut domain,
-                                    &act.node_id,
-                                    &act.op_id,
-                                    &succs,
-                                ) {
-                                    crate::converge::engine::fatal_close(
-                                        &mut domain,
-                                        &format!("{}", e),
-                                    );
-                                    break;
-                                }
-                            }
-                        }
-                        crate::converge::scheduler::SchedulerAction::CheckSatisfaction(act) => {
-                            let _ = crate::converge::engine::check_satisfaction(
+                match action {
+                    crate::converge::scheduler::SchedulerAction::Stop { reason } => {
+                        crate::converge::engine::exhaust(&mut domain, &reason);
+                        let _ = crate::converge::engine::terminalize(
+                            &mut domain,
+                            self.mutations.s4m16_terminalizes_with_commitment,
+                        );
+                        state.env.insert(dest_sym.clone(), VmValue::Bool(false));
+                    }
+                    crate::converge::scheduler::SchedulerAction::Wait { .. } => {
+                        state.env.insert(dest_sym.clone(), VmValue::Bool(false));
+                    }
+                    crate::converge::scheduler::SchedulerAction::Expand(act) => {
+                        let attempt_no = domain
+                            .visited
+                            .iter()
+                            .filter(|v| v.node_id == act.node_id)
+                            .count() as u64
+                            + 1;
+                        let op_def = node_ops.get(&act.node_id);
+                        let succs = successors.get(&act.node_id).cloned().unwrap_or_default();
+                        let op_is_deliv_unknown = fault_spec.delivery_unknown
+                            || fault_spec
+                                .delivery_unknown_ops
+                                .contains(&act.op_id);
+
+                        if act.kind == "local" {
+                            let _ = crate::converge::engine::dispatch_local(
                                 &mut domain,
                                 &act.node_id,
                                 &act.op_id,
+                                &succs,
+                            );
+                        } else {
+                            let req_id = if self.mutations.s4m18_requeue_reuses_request_id && attempt_no > 1 {
+                                format!("req:{}:{}:1", act.op_id, act.node_id)
+                            } else {
+                                op_def
+                                    .and_then(|o| o.request_id.clone())
+                                    .unwrap_or_else(|| {
+                                        format!("req:{}:{}:{}", act.op_id, act.node_id, attempt_no)
+                                    })
+                            };
+                            let dedup = op_def.map(|o| o.dedup_capable).unwrap_or(true);
+                            let idemp = op_def.map(|o| o.idempotent).unwrap_or(true);
+
+                            let handle_res = crate::converge::engine::stage_local(
+                                &mut domain,
+                                &act.node_id,
+                                &act.op_id,
+                                &req_id,
+                                "usd",
+                                act.cost,
+                                dedup,
+                                idemp,
                                 false,
-                                None,
-                                None,
+                                true,
+                                self.mutations.s4m08_second_unsettled_request_allowed,
+                                self.mutations.s4m04_stage_rejected_leaves_reservation,
+                                self.mutations.s4m17_budget_scope_mints_ownership,
+                            );
+
+                            if let Ok(handle) = handle_res {
+                                let _ = crate::converge::engine::emit_external(
+                                    &mut domain,
+                                    &handle,
+                                    op_is_deliv_unknown,
+                                    self.mutations.s4m06_transport_retry_increments_step,
+                                    self.mutations.s4m05_first_emit_fails_step,
+                                    self.mutations.s4m07_transport_retry_changes_request_id,
+                                    self.mutations.s4m09_delivery_unknown_releases_commitment,
+                                );
+
+                                // R4: Real dynamic external effect recorded on emission
+                                state.observable_effects.push(format!("external({})", act.op_id));
+
+                                if op_is_deliv_unknown {
+                                    if fault_spec.cancel_in_flight {
+                                        crate::converge::engine::cancel(&mut domain);
+                                        let _ = crate::converge::engine::confirmed_not_delivered(
+                                            &mut domain,
+                                            &handle,
+                                        );
+                                        let _ = crate::converge::engine::finish_if_drained(&mut domain);
+                                    } else if fault_spec.safe_retry && (dedup || idemp) {
+                                        if fault_spec.double_delivery_unknown {
+                                            let _ = crate::converge::engine::emit_external(
+                                                &mut domain,
+                                                &handle,
+                                                true,
+                                                self.mutations
+                                                    .s4m06_transport_retry_increments_step,
+                                                self.mutations.s4m05_first_emit_fails_step,
+                                                self.mutations
+                                                    .s4m07_transport_retry_changes_request_id,
+                                                self.mutations
+                                                    .s4m09_delivery_unknown_releases_commitment,
+                                            );
+                                        } else {
+                                            let _ = crate::converge::engine::emit_external(
+                                                &mut domain,
+                                                &handle,
+                                                false,
+                                                self.mutations
+                                                    .s4m06_transport_retry_increments_step,
+                                                self.mutations.s4m05_first_emit_fails_step,
+                                                self.mutations
+                                                    .s4m07_transport_retry_changes_request_id,
+                                                self.mutations
+                                                    .s4m09_delivery_unknown_releases_commitment,
+                                            );
+                                        }
+                                    } else {
+                                        if self.mutations.s4m16_terminalizes_with_commitment {
+                                            crate::converge::engine::exhaust(
+                                                &mut domain,
+                                                "ForcedTerminal",
+                                            );
+                                            let _ = crate::converge::engine::terminalize(
+                                                &mut domain,
+                                                true,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                let is_space_fault = space_faults.get(&act.op_id);
+                                let (is_failure, fault_err) = if let Some(v) = is_space_fault {
+                                    if let Some(arr) = v.as_array() {
+                                        let idx = (attempt_no.saturating_sub(1) as usize)
+                                            .min(arr.len() - 1);
+                                        if arr[idx].is_null() || arr[idx].as_str() == Some("null") {
+                                            (false, None)
+                                        } else {
+                                            let msg = arr[idx]
+                                                .as_str()
+                                                .unwrap_or("SpaceFault")
+                                                .to_string();
+                                            (true, Some(msg))
+                                        }
+                                    } else if v.is_null() || v.as_str() == Some("null") {
+                                        (false, None)
+                                    } else if let Some(msg) = v.as_str() {
+                                        (true, Some(msg.to_string()))
+                                    } else {
+                                        (false, None)
+                                    }
+                                } else {
+                                    (false, None)
+                                };
+
+                                let space_payload = crate::converge::domain::SpaceOutcome {
+                                    successors: if is_failure
+                                        && !self
+                                            .mutations
+                                            .s4m19_failed_requeue_incorporates_successors
+                                    {
+                                        Vec::new()
+                                    } else {
+                                        succs
+                                    },
+                                    error: fault_err,
+                                    is_failure,
+                                };
+
+                                let receipt_id = format!("receipt-{}", req_id);
+                                let completion = crate::converge::domain::CompletionRecord {
+                                    handle_id: handle.clone(),
+                                    receipt_id: receipt_id.clone(),
+                                    digest: format!("digest-{}", req_id),
+                                    outcome: if is_failure {
+                                        "Failure".to_string()
+                                    } else {
+                                        "Success".to_string()
+                                    },
+                                    semantic_payload: Some(
+                                        crate::converge::domain::SemanticPayload::Space(space_payload),
+                                    ),
+                                    receipt: Some(crate::converge::domain::ExecutionReceipt {
+                                        request_id: req_id.clone(),
+                                        receipt_id: receipt_id.clone(),
+                                        resource: "usd".to_string(),
+                                        amount: op_def
+                                            .and_then(|o| o.actual_cost)
+                                            .unwrap_or(act.cost),
+                                    }),
+                                };
+
+                                if fault_spec.cancel_in_flight && !op_is_deliv_unknown {
+                                    let _ = crate::converge::engine::admit_completion(
+                                        &mut domain,
+                                        &handle,
+                                        completion.clone(),
+                                        self.mutations
+                                            .s4m09_delivery_unknown_releases_commitment,
+                                    );
+                                    crate::converge::engine::cancel(&mut domain);
+                                    let charge =
+                                        op_def.and_then(|o| o.actual_cost).unwrap_or(act.cost);
+                                    let receipt = crate::converge::domain::ExecutionReceipt {
+                                        request_id: req_id.clone(),
+                                        receipt_id: receipt_id.clone(),
+                                        resource: "usd".to_string(),
+                                        amount: charge,
+                                    };
+                                    let _ = crate::converge::engine::reconcile_settlement(
+                                        &mut domain,
+                                        &handle,
+                                        receipt,
+                                        self.mutations
+                                            .s4m11_duplicate_settlement_reconciles_twice,
+                                        self.mutations
+                                            .s4m12_settlement_marks_applied_automatically,
+                                    );
+                                    let _ = crate::converge::engine::apply_semantic(
+                                        &mut domain,
+                                        &handle,
+                                        self.mutations
+                                            .s4m10_duplicate_completion_applies_twice,
+                                        self.mutations
+                                            .s4m14_closing_accepts_late_payload,
+                                        self.mutations.s4m03_ranking_promotes_satisfied,
+                                        self.mutations.s4m15_closing_mutates_frontier,
+                                    );
+                                    let _ =
+                                        crate::converge::engine::finish_if_drained(&mut domain);
+                                } else if !op_is_deliv_unknown
+                                    || (fault_spec.safe_retry
+                                        && (dedup || idemp)
+                                        && !fault_spec.double_delivery_unknown)
+                                {
+                                    let _ = crate::converge::engine::admit_completion(
+                                        &mut domain,
+                                        &handle,
+                                        completion.clone(),
+                                        self.mutations
+                                            .s4m09_delivery_unknown_releases_commitment,
+                                    );
+                                    if fault_spec.duplicate_completion {
+                                        let _ = crate::converge::engine::admit_completion(
+                                            &mut domain,
+                                            &handle,
+                                            completion.clone(),
+                                            self.mutations
+                                                .s4m09_delivery_unknown_releases_commitment,
+                                        );
+                                    }
+
+                                    let charge =
+                                        op_def.and_then(|o| o.actual_cost).unwrap_or(act.cost);
+                                    let receipt = crate::converge::domain::ExecutionReceipt {
+                                        request_id: req_id.clone(),
+                                        receipt_id: receipt_id.clone(),
+                                        resource: "usd".to_string(),
+                                        amount: charge,
+                                    };
+                                    let _ = crate::converge::engine::reconcile_settlement(
+                                        &mut domain,
+                                        &handle,
+                                        receipt.clone(),
+                                        self.mutations
+                                            .s4m11_duplicate_settlement_reconciles_twice,
+                                        self.mutations
+                                            .s4m12_settlement_marks_applied_automatically,
+                                    );
+
+                                    if fault_spec.duplicate_completion {
+                                        let _ = crate::converge::engine::reconcile_settlement(
+                                            &mut domain,
+                                            &handle,
+                                            receipt,
+                                            self.mutations
+                                                .s4m11_duplicate_settlement_reconciles_twice,
+                                            self.mutations
+                                                .s4m12_settlement_marks_applied_automatically,
+                                        );
+                                    }
+
+                                    // R6: Real VM recovery
+                                    if fault_spec.crash_after_settlement {
+                                        if self
+                                            .mutations
+                                            .s4m13_crash_after_settlement_loses_semantic_result
+                                        {
+                                            if let Some(st) = domain.handles.get_mut(&handle) {
+                                                st.completion = None;
+                                            }
+                                        } else {
+                                            if let Ok(serialized) =
+                                                serde_json::to_string(&domain)
+                                            {
+                                                if let Ok(restored) = serde_json::from_str::<
+                                                    crate::converge::domain::ConvergeTransactionDomain,
+                                                >(
+                                                    &serialized
+                                                ) {
+                                                    domain = restored;
+                                                }
+                                            }
+                                        }
+                                    }
+
+                                    let _ = crate::converge::engine::apply_semantic(
+                                        &mut domain,
+                                        &handle,
+                                        self.mutations
+                                            .s4m10_duplicate_completion_applies_twice,
+                                        self.mutations
+                                            .s4m14_closing_accepts_late_payload,
+                                        self.mutations.s4m03_ranking_promotes_satisfied,
+                                        self.mutations.s4m15_closing_mutates_frontier,
+                                    );
+
+                                    if fault_spec.duplicate_completion
+                                        && self
+                                            .mutations
+                                            .s4m10_duplicate_completion_applies_twice
+                                    {
+                                        let _ = crate::converge::engine::apply_semantic(
+                                            &mut domain,
+                                            &handle,
+                                            true,
+                                            self.mutations
+                                                .s4m14_closing_accepts_late_payload,
+                                            self.mutations.s4m03_ranking_promotes_satisfied,
+                                            self.mutations.s4m15_closing_mutates_frontier,
+                                        );
+                                    }
+
+                                    if is_failure && domain.on_step_failure == "abort" {
+                                        let _ =
+                                            crate::converge::engine::finish_if_drained(&mut domain);
+                                    }
+                                }
+                            }
+                        }
+
+                        let is_still_searching = domain.frame_status
+                            == crate::converge::domain::SearchStatus::Searching
+                            || (self.mutations.s4m08_second_unsettled_request_allowed
+                                && !domain.frontier.is_empty());
+                        state.env.insert(dest_sym.clone(), VmValue::Bool(is_still_searching));
+                    }
+                    crate::converge::scheduler::SchedulerAction::CheckSatisfaction(act) => {
+                        let attempt_no = domain.satisfaction_attempts + 1;
+                        let sat_json = satisfier
+                            .satisfier_map
+                            .get(&act.node_id)
+                            .unwrap_or(&serde_json::Value::Null);
+                        let (status_tag, satisfied, sat_val_opt, err_opt) =
+                            crate::converge::engine::parse_sat_entry(sat_json, attempt_no);
+
+                        let op_is_deliv_unknown = fault_spec.delivery_unknown
+                            || fault_spec
+                                .delivery_unknown_ops
+                                .contains(&act.op_id);
+
+                        if act.kind == "local" {
+                            let res = crate::converge::engine::check_satisfaction(
+                                &mut domain,
+                                &act.node_id,
+                                &act.op_id,
+                                satisfied,
+                                sat_val_opt,
+                                err_opt,
                                 self.mutations.s4m03_ranking_promotes_satisfied,
                                 self.mutations
                                     .s4m20_satisfaction_retry_bypasses_attempt_ceiling,
                             );
+                            if let Ok(true) = res {
+                                crate::converge::engine::close_frame(
+                                    &mut domain,
+                                    crate::converge::domain::ClosingReason {
+                                        kind: "PendingSatisfied".to_string(),
+                                        error: None,
+                                    },
+                                );
+                                let _ = crate::converge::engine::terminalize(
+                                    &mut domain,
+                                    self.mutations.s4m16_terminalizes_with_commitment,
+                                );
+                            }
+                            if domain.frame_status == crate::converge::domain::SearchStatus::Closing {
+                                let _ = crate::converge::engine::finish_if_drained(&mut domain);
+                            }
+                        } else {
+                            let es_def = satisfier.effectful_op.as_ref();
+                            let req_id = es_def
+                                .and_then(|o| o.request_id.clone())
+                                .unwrap_or_else(|| {
+                                    format!("req:{}:{}:{}", act.op_id, act.node_id, attempt_no)
+                                });
+                            let dedup = es_def.map(|o| o.dedup_capable).unwrap_or(true);
+                            let idemp = es_def.map(|o| o.idempotent).unwrap_or(true);
+
+                            let handle_res = crate::converge::engine::stage_local(
+                                &mut domain,
+                                &act.node_id,
+                                &act.op_id,
+                                &req_id,
+                                "usd",
+                                act.cost,
+                                dedup,
+                                idemp,
+                                false,
+                                false,
+                                self.mutations.s4m08_second_unsettled_request_allowed,
+                                self.mutations.s4m04_stage_rejected_leaves_reservation,
+                                self.mutations.s4m17_budget_scope_mints_ownership,
+                            );
+
+                            if let Ok(handle) = handle_res {
+                                let _ = crate::converge::engine::emit_external(
+                                    &mut domain,
+                                    &handle,
+                                    op_is_deliv_unknown,
+                                    self.mutations.s4m06_transport_retry_increments_step,
+                                    self.mutations.s4m05_first_emit_fails_step,
+                                    self.mutations.s4m07_transport_retry_changes_request_id,
+                                    self.mutations.s4m09_delivery_unknown_releases_commitment,
+                                );
+
+                                // R4: Real dynamic external effect recorded on emission
+                                state.observable_effects.push(format!("external({})", act.op_id));
+
+                                if op_is_deliv_unknown {
+                                    if fault_spec.cancel_in_flight {
+                                        crate::converge::engine::cancel(&mut domain);
+                                        let _ = crate::converge::engine::confirmed_not_delivered(
+                                            &mut domain,
+                                            &handle,
+                                        );
+                                        let _ = crate::converge::engine::finish_if_drained(&mut domain);
+                                    } else if fault_spec.safe_retry && (dedup || idemp) {
+                                        if fault_spec.double_delivery_unknown {
+                                            let _ = crate::converge::engine::emit_external(
+                                                &mut domain,
+                                                &handle,
+                                                true,
+                                                self.mutations
+                                                    .s4m06_transport_retry_increments_step,
+                                                self.mutations.s4m05_first_emit_fails_step,
+                                                self.mutations
+                                                    .s4m07_transport_retry_changes_request_id,
+                                                self.mutations
+                                                    .s4m09_delivery_unknown_releases_commitment,
+                                            );
+                                        } else {
+                                            let _ = crate::converge::engine::emit_external(
+                                                &mut domain,
+                                                &handle,
+                                                false,
+                                                self.mutations
+                                                    .s4m06_transport_retry_increments_step,
+                                                self.mutations.s4m05_first_emit_fails_step,
+                                                self.mutations
+                                                    .s4m07_transport_retry_changes_request_id,
+                                                self.mutations
+                                                    .s4m09_delivery_unknown_releases_commitment,
+                                            );
+                                        }
+                                    } else {
+                                        if self.mutations.s4m16_terminalizes_with_commitment {
+                                            crate::converge::engine::exhaust(
+                                                &mut domain,
+                                                "ForcedTerminal",
+                                            );
+                                            let _ = crate::converge::engine::terminalize(
+                                                &mut domain,
+                                                true,
+                                            );
+                                        }
+                                    }
+                                }
+
+                                if !op_is_deliv_unknown
+                                    || (fault_spec.safe_retry
+                                        && (dedup || idemp)
+                                        && !fault_spec.double_delivery_unknown)
+                                {
+                                    let sat_payload = crate::converge::domain::SatisfierOutcome {
+                                        node_id: act.node_id.clone(),
+                                        op_id: act.op_id.clone(),
+                                        satisfied,
+                                        value: sat_val_opt,
+                                        error: err_opt,
+                                    };
+
+                                    let receipt_id = format!("receipt-{}", req_id);
+                                    let completion = crate::converge::domain::CompletionRecord {
+                                        handle_id: handle.clone(),
+                                        receipt_id: receipt_id.clone(),
+                                        digest: format!("digest-{}", req_id),
+                                        outcome: if status_tag == "ok" {
+                                            "Success".to_string()
+                                        } else {
+                                            "Failure".to_string()
+                                        },
+                                        semantic_payload: Some(
+                                            crate::converge::domain::SemanticPayload::Satisfier(sat_payload),
+                                        ),
+                                        receipt: Some(crate::converge::domain::ExecutionReceipt {
+                                            request_id: req_id.clone(),
+                                            receipt_id: receipt_id.clone(),
+                                            resource: "usd".to_string(),
+                                            amount: es_def
+                                                .and_then(|o| o.actual_cost)
+                                                .unwrap_or(act.cost),
+                                        }),
+                                    };
+
+                                    let _ = crate::converge::engine::admit_completion(
+                                        &mut domain,
+                                        &handle,
+                                        completion.clone(),
+                                        self.mutations
+                                            .s4m09_delivery_unknown_releases_commitment,
+                                    );
+                                    let charge =
+                                        es_def.and_then(|o| o.actual_cost).unwrap_or(act.cost);
+                                    let receipt = crate::converge::domain::ExecutionReceipt {
+                                        request_id: req_id.clone(),
+                                        receipt_id: receipt_id.clone(),
+                                        resource: "usd".to_string(),
+                                        amount: charge,
+                                    };
+                                    let _ = crate::converge::engine::reconcile_settlement(
+                                        &mut domain,
+                                        &handle,
+                                        receipt,
+                                        self.mutations
+                                            .s4m11_duplicate_settlement_reconciles_twice,
+                                        self.mutations
+                                            .s4m12_settlement_marks_applied_automatically,
+                                    );
+
+                                    let _ = crate::converge::engine::apply_semantic(
+                                        &mut domain,
+                                        &handle,
+                                        self.mutations
+                                            .s4m10_duplicate_completion_applies_twice,
+                                        self.mutations
+                                            .s4m14_closing_accepts_late_payload,
+                                        self.mutations.s4m03_ranking_promotes_satisfied,
+                                        self.mutations.s4m15_closing_mutates_frontier,
+                                    );
+
+                                    if domain.frame_status
+                                        == crate::converge::domain::SearchStatus::Satisfied
+                                    {
+                                        crate::converge::engine::close_frame(
+                                            &mut domain,
+                                            crate::converge::domain::ClosingReason {
+                                                kind: "PendingSatisfied".to_string(),
+                                                error: None,
+                                            },
+                                        );
+                                        let _ = crate::converge::engine::terminalize(
+                                            &mut domain,
+                                            self.mutations.s4m16_terminalizes_with_commitment,
+                                        );
+                                    }
+                                    if domain.frame_status == crate::converge::domain::SearchStatus::Closing {
+                                        let _ = crate::converge::engine::finish_if_drained(&mut domain);
+                                    }
+                                }
+                            }
                         }
+
+                        let is_still_searching = domain.frame_status
+                            == crate::converge::domain::SearchStatus::Searching
+                            || (self.mutations.s4m08_second_unsettled_request_allowed
+                                && !domain.frontier.is_empty());
+                        state.env.insert(dest_sym.clone(), VmValue::Bool(is_still_searching));
                     }
                 }
 
-                // Materialize observable effects
-                for eff in &space_effects.effects {
-                    state.observable_effects.push(eff.to_string());
-                }
-                for eff in &satisfier_effects.effects {
-                    state.observable_effects.push(eff.to_string());
-                }
+                state.types.insert(dest_sym, Type::Bool.display_name());
+                state.converge_domains.insert(frame_sym, domain);
+            }
+            VmInstruction::VmConvergeFinish {
+                dest,
+                frame_var,
+                partial_type,
+                satisfied_type,
+            } => {
+                let frame_sym = format!("v{}", frame_var.0);
+                let dest_sym = format!("v{}", dest.0);
+
+                let domain = state
+                    .converge_domains
+                    .get(&frame_sym)
+                    .cloned()
+                    .unwrap_or_default();
 
                 let res_val = match domain.frame_status {
                     crate::converge::domain::SearchStatus::Satisfied => {
@@ -1435,7 +1980,6 @@ impl<'a> VmInterpreter<'a> {
                     Type::result(outcome_ty, Type::String).display_name(),
                 );
                 state.env.insert(dest_sym, res_val);
-                state.converge_domains.insert(frame_sym, domain);
             }
         }
     }

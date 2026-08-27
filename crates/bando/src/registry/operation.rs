@@ -3,7 +3,7 @@ use std::collections::BTreeSet;
 
 use crate::ir::effects::EffectRow;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct OperationId(pub String);
 
 impl OperationId {

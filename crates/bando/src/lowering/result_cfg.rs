@@ -398,6 +398,107 @@ impl LoweringContext {
                 }
             }
 
+            if let Some(pos) = block
+                .instructions
+                .iter()
+                .position(|i| matches!(i, Instruction::Converge { .. }))
+            {
+                // Lower instructions before Converge into current block
+                self.lower_instruction_sequence(
+                    &block.instructions[..pos],
+                    &mut vm_block.instructions,
+                );
+
+                if let Instruction::Converge {
+                    dest,
+                    root_node,
+                    initial_frontier,
+                    successors,
+                    node_ops,
+                    satisfier,
+                    partial_map,
+                    space_faults,
+                    fault_spec,
+                    search_policy,
+                    budget_scope,
+                    max_steps,
+                    max_satisfaction_attempts,
+                    partial_type,
+                    satisfied_type,
+                    ..
+                } = &block.instructions[pos]
+                {
+                    let vm_dest = self.map_value(*dest);
+                    let frame_var = self.alloc_value();
+                    let step_status_var = self.alloc_value();
+                    let loop_header_id = self.alloc_block();
+                    let exit_block_id = self.alloc_block();
+
+                    vm_block.instructions.push(VmInstruction::VmConvergeInit {
+                        frame_var,
+                        root_node: root_node.clone(),
+                        initial_frontier: if initial_frontier.is_empty() {
+                            vec![root_node.clone()]
+                        } else {
+                            initial_frontier.clone()
+                        },
+                        budget_resource: budget_scope.resource.clone(),
+                        budget_limit: budget_scope.limit,
+                        max_steps: *max_steps,
+                        max_satisfaction_attempts: *max_satisfaction_attempts,
+                        on_step_failure: search_policy.on_step_failure.clone(),
+                        on_satisfier_error: search_policy.on_satisfier_error.clone(),
+                    });
+                    vm_block.terminator = VmTerminator::Br {
+                        target: loop_header_id,
+                        args: Vec::new(),
+                    };
+                    generated_blocks.insert(vm_block_id, vm_block);
+
+                    // Loop Header Block
+                    let mut loop_block = VmBlock::new(loop_header_id, VmTerminator::Unreachable);
+                    loop_block.name = Some("converge_step_loop".to_string());
+                    loop_block.instructions.push(VmInstruction::VmConvergeStep {
+                        dest: step_status_var,
+                        frame_var,
+                        successors: successors.clone(),
+                        node_ops: node_ops.clone(),
+                        satisfier: satisfier.clone(),
+                        partial_map: partial_map
+                            .iter()
+                            .map(|(k, v)| (k.clone(), v.clone()))
+                            .collect(),
+                        space_faults: space_faults.clone(),
+                        fault_spec: fault_spec.clone(),
+                    });
+                    loop_block.terminator = VmTerminator::CondBr {
+                        cond: step_status_var,
+                        true_target: loop_header_id,
+                        true_args: Vec::new(),
+                        false_target: exit_block_id,
+                        false_args: Vec::new(),
+                    };
+                    generated_blocks.insert(loop_header_id, loop_block);
+
+                    // Exit Block
+                    let mut exit_block = VmBlock::new(exit_block_id, VmTerminator::Unreachable);
+                    exit_block.name = Some("converge_exit".to_string());
+                    exit_block.instructions.push(VmInstruction::VmConvergeFinish {
+                        dest: vm_dest,
+                        frame_var,
+                        partial_type: partial_type.clone(),
+                        satisfied_type: satisfied_type.clone(),
+                    });
+                    self.lower_instruction_sequence(
+                        &block.instructions[pos + 1..],
+                        &mut exit_block.instructions,
+                    );
+                    exit_block.terminator = self.lower_terminator(&block.terminator);
+                    generated_blocks.insert(exit_block_id, exit_block);
+                    continue;
+                }
+            }
+
             self.lower_instruction_sequence(&block.instructions, &mut vm_block.instructions);
 
             match &block.terminator {
@@ -551,44 +652,7 @@ impl LoweringContext {
         target_vec: &mut Vec<VmInstruction>,
     ) {
         for inst in instructions {
-            if let Instruction::Converge {
-                dest,
-                root_node,
-                space_ops,
-                satisfier_op,
-                search_policy,
-                budget_scope,
-                max_steps,
-                max_satisfaction_attempts,
-                space_effects,
-                satisfier_effects,
-                partial_type,
-                satisfied_type,
-            } = inst
-            {
-                let vm_dest = self.map_value(*dest);
-                let frame_var = self.alloc_value();
-                target_vec.push(VmInstruction::VmConvergeInit {
-                    frame_var,
-                    root_node: root_node.clone(),
-                    budget_resource: budget_scope.resource.clone(),
-                    budget_limit: budget_scope.limit,
-                    max_steps: *max_steps,
-                    max_satisfaction_attempts: *max_satisfaction_attempts,
-                    on_step_failure: search_policy.on_step_failure.clone(),
-                    on_satisfier_error: search_policy.on_satisfier_error.clone(),
-                });
-                target_vec.push(VmInstruction::VmConvergeStep {
-                    dest: vm_dest,
-                    frame_var,
-                    space_ops: space_ops.clone(),
-                    satisfier_op: satisfier_op.clone(),
-                    space_effects: space_effects.clone(),
-                    satisfier_effects: satisfier_effects.clone(),
-                    partial_type: partial_type.clone(),
-                    satisfied_type: satisfied_type.clone(),
-                });
-            } else {
+            if !matches!(inst, Instruction::Converge { .. }) {
                 target_vec.push(self.lower_instruction(inst));
             }
         }
@@ -872,24 +936,29 @@ impl LoweringContext {
             }
             Instruction::Converge {
                 dest,
-                space_ops,
-                satisfier_op,
-                space_effects,
-                satisfier_effects,
-                partial_type,
-                satisfied_type,
+                root_node,
+                initial_frontier,
+                budget_scope,
+                max_steps,
+                max_satisfaction_attempts,
+                search_policy,
                 ..
             } => {
                 let vm_dest = self.map_value(*dest);
-                VmInstruction::VmConvergeStep {
-                    dest: vm_dest,
+                VmInstruction::VmConvergeInit {
                     frame_var: vm_dest,
-                    space_ops: space_ops.clone(),
-                    satisfier_op: satisfier_op.clone(),
-                    space_effects: space_effects.clone(),
-                    satisfier_effects: satisfier_effects.clone(),
-                    partial_type: partial_type.clone(),
-                    satisfied_type: satisfied_type.clone(),
+                    root_node: root_node.clone(),
+                    initial_frontier: if initial_frontier.is_empty() {
+                        vec![root_node.clone()]
+                    } else {
+                        initial_frontier.clone()
+                    },
+                    budget_resource: budget_scope.resource.clone(),
+                    budget_limit: budget_scope.limit,
+                    max_steps: *max_steps,
+                    max_satisfaction_attempts: *max_satisfaction_attempts,
+                    on_step_failure: search_policy.on_step_failure.clone(),
+                    on_satisfier_error: search_policy.on_satisfier_error.clone(),
                 }
             }
         }
