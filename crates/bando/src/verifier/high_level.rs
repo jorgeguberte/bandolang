@@ -5,12 +5,12 @@ use crate::{
     conformance::schema::GateResolutionObservation,
     diagnostics::{Diagnostic, DiagnosticCode},
     ir::{
-        effects::Effect,
+        effects::{Effect, EffectRow},
         ops::{Instruction, Region, RegionTerminator, Terminator},
         types::Type,
         BlockId, Function, Module, ValueId,
     },
-    registry::RegistrySnapshot,
+    registry::{AgentId, ClaimContract, IntentId, RegistrySnapshot},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,6 +20,10 @@ pub enum ValueOrigin {
         predicate: String,
         subject_val_id: ValueId,
         subject_literal: Option<String>,
+    },
+    DelegatedHandle {
+        intent_id: IntentId,
+        target_agent_id: AgentId,
     },
     Other(ValueId),
 }
@@ -73,7 +77,8 @@ impl<'a> HighLevelVerifier<'a> {
     pub fn verify_module_with_registry(
         module: &Module,
         registry: &RegistrySnapshot,
-    ) -> Result<Vec<GateResolutionObservation>, (Vec<Diagnostic>, Vec<GateResolutionObservation>)> {
+    ) -> Result<Vec<GateResolutionObservation>, (Vec<Diagnostic>, Vec<GateResolutionObservation>)>
+    {
         let mut all_diags = Vec::new();
         let mut all_resolutions = Vec::new();
         for func in &module.functions {
@@ -93,7 +98,8 @@ impl<'a> HighLevelVerifier<'a> {
         // Collect function parameter definitions
         for (param_id, param_ty) in &self.func.params {
             self.all_defined_values.insert(*param_id, param_ty.clone());
-            self.value_origins.insert(*param_id, ValueOrigin::Other(*param_id));
+            self.value_origins
+                .insert(*param_id, ValueOrigin::Other(*param_id));
         }
 
         // Collect block parameter definitions
@@ -113,7 +119,10 @@ impl<'a> HighLevelVerifier<'a> {
                 if let Some(existing) = self.all_defined_values.insert(dest, ty.clone()) {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::SsaDuplicateDef,
-                        format!("SSA value {:?} defined multiple times with types {:?} and {:?}", dest, existing, ty),
+                        format!(
+                            "SSA value {:?} defined multiple times with types {:?} and {:?}",
+                            dest, existing, ty
+                        ),
                     ));
                 }
             }
@@ -166,9 +175,7 @@ impl<'a> HighLevelVerifier<'a> {
                     }
                 }
                 Terminator::MatchResult {
-                    ok_body,
-                    err_body,
-                    ..
+                    ok_body, err_body, ..
                 } => {
                     if let RegionTerminator::Br { target: ok_t, .. } = &ok_body.terminator {
                         if ok_t == &target {
@@ -272,14 +279,51 @@ impl<'a> HighLevelVerifier<'a> {
                 *dest,
                 Type::act_outcome(success_type.clone(), failure_type.clone()),
             ),
+            Instruction::Delegate {
+                dest, intent_id, ..
+            } => {
+                if let Some(reg) = self.registry {
+                    if let Some(desc) = reg.intents.get(intent_id) {
+                        return (
+                            *dest,
+                            Type::child_handle(
+                                desc.output_type.clone(),
+                                desc.error_type.clone(),
+                                desc.child_effects.clone(),
+                            ),
+                        );
+                    }
+                }
+                (
+                    *dest,
+                    Type::child_handle(Type::String, Type::String, EffectRow::empty()),
+                )
+            }
+            Instruction::Await { dest, handle } => {
+                if let Some(Type::ChildHandle { ok, err, .. }) = self.all_defined_values.get(handle)
+                {
+                    (*dest, Type::result((**ok).clone(), (**err).clone()))
+                } else {
+                    (*dest, Type::result(Type::String, Type::String))
+                }
+            }
+            Instruction::Internalize { dest, claim, .. } => {
+                if let Some(Type::Claim(payload)) = self.all_defined_values.get(claim) {
+                    (
+                        *dest,
+                        Type::result(Type::belief((**payload).clone()), Type::String),
+                    )
+                } else {
+                    (
+                        *dest,
+                        Type::result(Type::belief(Type::String), Type::String),
+                    )
+                }
+            }
         }
     }
 
-    fn check_visible(
-        &mut self,
-        val_id: ValueId,
-        visible: &BTreeSet<ValueId>,
-    ) -> Option<Type> {
+    fn check_visible(&mut self, val_id: ValueId, visible: &BTreeSet<ValueId>) -> Option<Type> {
         if !visible.contains(&val_id) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::SsaUseBeforeDef,
@@ -298,17 +342,24 @@ impl<'a> HighLevelVerifier<'a> {
         match inst {
             Instruction::Pure { dest, val, .. } => {
                 if let crate::ir::values::Value::String(s) = val {
-                    self.value_origins.insert(*dest, ValueOrigin::Literal(s.clone()));
+                    self.value_origins
+                        .insert(*dest, ValueOrigin::Literal(s.clone()));
                 } else {
                     self.value_origins.insert(*dest, ValueOrigin::Other(*dest));
                 }
             }
-            Instruction::Verify { dest, verifier_id, subject, .. } => {
-                let subj_lit = if let Some(ValueOrigin::Literal(s)) = self.value_origins.get(subject) {
-                    Some(s.clone())
-                } else {
-                    None
-                };
+            Instruction::Verify {
+                dest,
+                verifier_id,
+                subject,
+                ..
+            } => {
+                let subj_lit =
+                    if let Some(ValueOrigin::Literal(s)) = self.value_origins.get(subject) {
+                        Some(s.clone())
+                    } else {
+                        None
+                    };
                 let pred = if let Some(reg) = self.registry {
                     if let Some(desc) = reg.verifiers.get(verifier_id) {
                         desc.output_predicate.clone()
@@ -318,25 +369,36 @@ impl<'a> HighLevelVerifier<'a> {
                 } else {
                     "UnknownPredicate".to_string()
                 };
-                self.value_origins.insert(*dest, ValueOrigin::VerifySubject {
-                    predicate: pred,
-                    subject_val_id: *subject,
-                    subject_literal: subj_lit,
-                });
+                self.value_origins.insert(
+                    *dest,
+                    ValueOrigin::VerifySubject {
+                        predicate: pred,
+                        subject_val_id: *subject,
+                        subject_literal: subj_lit,
+                    },
+                );
             }
             _ => {}
         }
 
         // Q1 & Q2: Check required effects and fail-closed authorities
         let required_effects = match inst {
-            Instruction::Verify { verifier_id, verifier_effects, subject, .. } => {
+            Instruction::Verify {
+                verifier_id,
+                verifier_effects,
+                subject,
+                ..
+            } => {
                 if let Some(reg) = self.registry {
                     if let Some(desc) = reg.verifiers.get(verifier_id) {
                         if let Some(subj_ty) = self.check_visible(*subject, visible) {
                             if subj_ty != desc.subject_type {
                                 self.diagnostics.push(Diagnostic::error(
                                     DiagnosticCode::TypeMismatch,
-                                    format!("Verify subject type mismatch: expected {:?}, got {:?}", desc.subject_type, subj_ty),
+                                    format!(
+                                        "Verify subject type mismatch: expected {:?}, got {:?}",
+                                        desc.subject_type, subj_ty
+                                    ),
                                 ));
                             }
                         }
@@ -358,7 +420,10 @@ impl<'a> HighLevelVerifier<'a> {
                             if !ca.covers(&effs) {
                                 self.diagnostics.push(Diagnostic::error(
                                     DiagnosticCode::AuthorityInsufficient,
-                                    format!("Caller authority insufficient for verifier {:?}", verifier_id),
+                                    format!(
+                                        "Caller authority insufficient for verifier {:?}",
+                                        verifier_id
+                                    ),
                                 ));
                             }
                         } else {
@@ -380,7 +445,14 @@ impl<'a> HighLevelVerifier<'a> {
                     verifier_effects.clone()
                 }
             }
-            Instruction::Act { op_id, target_domain, gate_effects, args, evidence, .. } => {
+            Instruction::Act {
+                op_id,
+                target_domain,
+                gate_effects,
+                args,
+                evidence,
+                ..
+            } => {
                 for a in args {
                     self.check_visible(*a, visible);
                 }
@@ -397,7 +469,10 @@ impl<'a> HighLevelVerifier<'a> {
                             if !ca.contains(&act_eff) {
                                 self.diagnostics.push(Diagnostic::error(
                                     DiagnosticCode::AuthorityInsufficient,
-                                    format!("Caller authority lacks target capability {:?}", act_eff),
+                                    format!(
+                                        "Caller authority lacks target capability {:?}",
+                                        act_eff
+                                    ),
                                 ));
                             }
                         } else {
@@ -419,7 +494,10 @@ impl<'a> HighLevelVerifier<'a> {
                                 if !ra.contains(g_eff) {
                                     self.diagnostics.push(Diagnostic::error(
                                         DiagnosticCode::AuthorityInsufficient,
-                                        format!("Runtime authority lacks gate capability {:?}", g_eff),
+                                        format!(
+                                            "Runtime authority lacks gate capability {:?}",
+                                            g_eff
+                                        ),
                                     ));
                                 }
                             } else {
@@ -456,13 +534,24 @@ impl<'a> HighLevelVerifier<'a> {
                         // 6. Static requirement resolution over SSA subject identity (Q3)
                         for req in &op_desc.requirements {
                             match req {
-                                crate::registry::PolicyRequirement::RequiresStaticProof { predicate, subject_arg_idx } => {
+                                crate::registry::PolicyRequirement::RequiresStaticProof {
+                                    predicate,
+                                    subject_arg_idx,
+                                } => {
                                     let mut matching_ev = None;
                                     for e in evidence {
                                         if let Some(origin) = self.value_origins.get(e) {
-                                            if let ValueOrigin::VerifySubject { predicate: p, subject_val_id, subject_literal } = origin {
+                                            if let ValueOrigin::VerifySubject {
+                                                predicate: p,
+                                                subject_val_id,
+                                                subject_literal,
+                                            } = origin
+                                            {
                                                 if p == predicate {
-                                                    matching_ev = Some((*subject_val_id, subject_literal.clone()));
+                                                    matching_ev = Some((
+                                                        *subject_val_id,
+                                                        subject_literal.clone(),
+                                                    ));
                                                     break;
                                                 }
                                             }
@@ -473,7 +562,9 @@ impl<'a> HighLevelVerifier<'a> {
                                         Some((sub_val_id, sub_lit)) => {
                                             let arg_val_id = args.get(*subject_arg_idx).cloned();
                                             let arg_lit = arg_val_id.and_then(|id| {
-                                                if let Some(ValueOrigin::Literal(s)) = self.value_origins.get(&id) {
+                                                if let Some(ValueOrigin::Literal(s)) =
+                                                    self.value_origins.get(&id)
+                                                {
                                                     Some(s.clone())
                                                 } else {
                                                     None
@@ -482,23 +573,29 @@ impl<'a> HighLevelVerifier<'a> {
 
                                             if arg_val_id == Some(sub_val_id) {
                                                 // Statically Proved by identical SSA ValueId!
-                                                self.static_gate_resolutions.push(GateResolutionObservation {
-                                                    op_id: op_id.0.clone(),
-                                                    resolution: "Proved".to_string(),
-                                                });
+                                                self.static_gate_resolutions.push(
+                                                    GateResolutionObservation {
+                                                        op_id: op_id.0.clone(),
+                                                        resolution: "Proved".to_string(),
+                                                    },
+                                                );
                                             } else if sub_lit.is_some() && arg_lit.is_some() {
                                                 if sub_lit == arg_lit {
                                                     // Statically Proved by identical compile-time literal!
-                                                    self.static_gate_resolutions.push(GateResolutionObservation {
-                                                        op_id: op_id.0.clone(),
-                                                        resolution: "Proved".to_string(),
-                                                    });
+                                                    self.static_gate_resolutions.push(
+                                                        GateResolutionObservation {
+                                                            op_id: op_id.0.clone(),
+                                                            resolution: "Proved".to_string(),
+                                                        },
+                                                    );
                                                 } else {
                                                     // Statically Refuted by distinct compile-time literal! (Q3, S2C09)
-                                                    self.static_gate_resolutions.push(GateResolutionObservation {
-                                                        op_id: op_id.0.clone(),
-                                                        resolution: "Refuted".to_string(),
-                                                    });
+                                                    self.static_gate_resolutions.push(
+                                                        GateResolutionObservation {
+                                                            op_id: op_id.0.clone(),
+                                                            resolution: "Refuted".to_string(),
+                                                        },
+                                                    );
                                                     self.diagnostics.push(Diagnostic::error(
                                                         DiagnosticCode::RefutedRequirement,
                                                         format!("Requirement statically refuted for operation {:?}: expected subject literal {:?}, got {:?}", op_id, arg_lit, sub_lit),
@@ -506,17 +603,21 @@ impl<'a> HighLevelVerifier<'a> {
                                                 }
                                             } else {
                                                 // Deferred dynamic check
-                                                self.static_gate_resolutions.push(GateResolutionObservation {
-                                                    op_id: op_id.0.clone(),
-                                                    resolution: "Deferred".to_string(),
-                                                });
+                                                self.static_gate_resolutions.push(
+                                                    GateResolutionObservation {
+                                                        op_id: op_id.0.clone(),
+                                                        resolution: "Deferred".to_string(),
+                                                    },
+                                                );
                                             }
                                         }
                                         None => {
-                                            self.static_gate_resolutions.push(GateResolutionObservation {
-                                                op_id: op_id.0.clone(),
-                                                resolution: "Uncovered".to_string(),
-                                            });
+                                            self.static_gate_resolutions.push(
+                                                GateResolutionObservation {
+                                                    op_id: op_id.0.clone(),
+                                                    resolution: "Uncovered".to_string(),
+                                                },
+                                            );
                                             self.diagnostics.push(Diagnostic::error(
                                                 DiagnosticCode::UncoveredRequirement,
                                                 format!("Static proof requirement for predicate '{}' uncovered for operation {:?}", predicate, op_id),
@@ -524,11 +625,17 @@ impl<'a> HighLevelVerifier<'a> {
                                         }
                                     }
                                 }
-                                crate::registry::PolicyRequirement::RequiresAttestation { predicate, .. } => {
+                                crate::registry::PolicyRequirement::RequiresAttestation {
+                                    predicate,
+                                    ..
+                                } => {
                                     let mut matching_ev = false;
                                     for e in evidence {
                                         if let Some(origin) = self.value_origins.get(e) {
-                                            if let ValueOrigin::VerifySubject { predicate: p, .. } = origin {
+                                            if let ValueOrigin::VerifySubject {
+                                                predicate: p, ..
+                                            } = origin
+                                            {
                                                 if p == predicate {
                                                     matching_ev = true;
                                                     break;
@@ -538,26 +645,33 @@ impl<'a> HighLevelVerifier<'a> {
                                     }
 
                                     if matching_ev {
-                                        self.static_gate_resolutions.push(GateResolutionObservation {
-                                            op_id: op_id.0.clone(),
-                                            resolution: "Deferred".to_string(),
-                                        });
+                                        self.static_gate_resolutions.push(
+                                            GateResolutionObservation {
+                                                op_id: op_id.0.clone(),
+                                                resolution: "Deferred".to_string(),
+                                            },
+                                        );
                                     } else {
-                                        self.static_gate_resolutions.push(GateResolutionObservation {
-                                            op_id: op_id.0.clone(),
-                                            resolution: "Uncovered".to_string(),
-                                        });
+                                        self.static_gate_resolutions.push(
+                                            GateResolutionObservation {
+                                                op_id: op_id.0.clone(),
+                                                resolution: "Uncovered".to_string(),
+                                            },
+                                        );
                                         self.diagnostics.push(Diagnostic::error(
                                             DiagnosticCode::UncoveredRequirement,
                                             format!("Attestation requirement for predicate '{}' uncovered for operation {:?}", predicate, op_id),
                                         ));
                                     }
                                 }
-                                crate::registry::PolicyRequirement::RequiresStateBase { .. } => {
-                                    self.static_gate_resolutions.push(GateResolutionObservation {
-                                        op_id: op_id.0.clone(),
-                                        resolution: "Deferred".to_string(),
-                                    });
+                                crate::registry::PolicyRequirement::RequiresStateBase {
+                                    ..
+                                } => {
+                                    self.static_gate_resolutions
+                                        .push(GateResolutionObservation {
+                                            op_id: op_id.0.clone(),
+                                            resolution: "Deferred".to_string(),
+                                        });
                                 }
                             }
                         }
@@ -576,6 +690,194 @@ impl<'a> HighLevelVerifier<'a> {
                     effs
                 }
             }
+            // Slice 3: Delegate
+            Instruction::Delegate {
+                intent_id,
+                args,
+                requested_effects,
+                authority_grant,
+                ..
+            } => {
+                for a in args {
+                    self.check_visible(*a, visible);
+                }
+
+                if let Some(reg) = self.registry {
+                    if let Some(desc) = reg.intents.get(intent_id) {
+                        // 1. Input type match
+                        if args.len() != desc.input_types.len() {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::DelegateInputTypeMismatch,
+                                format!(
+                                    "Delegate argument count mismatch: expected {}, got {}",
+                                    desc.input_types.len(),
+                                    args.len()
+                                ),
+                            ));
+                        } else {
+                            for (i, a_id) in args.iter().enumerate() {
+                                if let Some(arg_ty) = self.check_visible(*a_id, visible) {
+                                    if arg_ty != desc.input_types[i] {
+                                        self.diagnostics.push(Diagnostic::error(
+                                            DiagnosticCode::DelegateInputTypeMismatch,
+                                            format!("Delegate argument {} type mismatch: expected {:?}, got {:?}", i, desc.input_types[i], arg_ty),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+
+                        // 2. Ceiling checks: Σ_child ⊆ Σ_requested ⊆ Σ_exported
+                        let req_row = EffectRow {
+                            effects: requested_effects.iter().cloned().collect(),
+                        };
+
+                        if !desc.child_effects.is_subset(&req_row) {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::InvocationCeilingBelowChild,
+                                format!("Invocation ceiling {:?} is below child effect requirement {:?}", req_row, desc.child_effects),
+                            ));
+                        }
+
+                        if !req_row.is_subset(&desc.exported_envelope) {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::InvocationCeilingAboveExported,
+                                format!(
+                                    "Invocation ceiling {:?} exceeds exported envelope {:?}",
+                                    req_row, desc.exported_envelope
+                                ),
+                            ));
+                        }
+
+                        // 3. Grant checks: grant ⊆ CallerAuthority && grant ⊆ Σ_requested
+                        if let Some(ca) = &reg.caller_authority {
+                            for g in authority_grant {
+                                if !ca.contains(g) {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        DiagnosticCode::GrantExceedsCallerAuthority,
+                                        format!(
+                                            "Authority grant {:?} exceeds caller authority {:?}",
+                                            g, ca
+                                        ),
+                                    ));
+                                }
+                                if !req_row.contains(g) {
+                                    self.diagnostics.push(Diagnostic::error(
+                                        DiagnosticCode::GrantExceedsRequestedCeiling,
+                                        format!("Authority grant {:?} exceeds requested invocation ceiling {:?}", g, req_row),
+                                    ));
+                                }
+                            }
+                        } else {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::AuthorityInsufficient,
+                                "Caller authority absent for delegate",
+                            ));
+                        }
+
+                        // 4. Function declared effects must contain child effects (Section 8)
+                        for eff in &desc.child_effects.effects {
+                            if !self.func.declared_effects.contains(eff) {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::EffectUndeclared,
+                                    format!("Delegate child effect {:?} not declared in function effects", eff),
+                                ));
+                            }
+                        }
+
+                        desc.child_effects.effects.iter().cloned().collect()
+                    } else {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::UnknownIntent,
+                            format!("IntentId {:?} not found in trusted registry", intent_id),
+                        ));
+                        return;
+                    }
+                } else {
+                    requested_effects.clone()
+                }
+            }
+            // Slice 3: Await
+            Instruction::Await { handle, .. } => {
+                if let Some(ty) = self.check_visible(*handle, visible) {
+                    if !matches!(ty, Type::ChildHandle { .. }) {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::AwaitNonChildHandle,
+                            format!("Await expects ChildHandle type, got {:?}", ty),
+                        ));
+                    }
+                }
+                Vec::new()
+            }
+            // Slice 3: Internalize
+            Instruction::Internalize {
+                policy_id, claim, ..
+            } => {
+                if let Some(ty) = self.check_visible(*claim, visible) {
+                    if !matches!(ty, Type::Claim { .. }) {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::InternalizeNonClaim,
+                            format!("Internalize expects Claim type, got {:?}", ty),
+                        ));
+                    }
+                }
+
+                if let Some(reg) = self.registry {
+                    if let Some(policy_desc) = reg.internalization_policies.get(policy_id) {
+                        if matches!(
+                            policy_desc.accepted_claim_contract,
+                            ClaimContract::RejectAll
+                        ) {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::RefutedRequirement,
+                                format!("Claim rejected by internalization policy {:?}", policy_id),
+                            ));
+                        }
+
+                        let val_effs: Vec<_> = policy_desc
+                            .validation_effect_envelope
+                            .effects
+                            .iter()
+                            .cloned()
+                            .collect();
+
+                        // 1. Function declared effects must contain validation effects
+                        for eff in &val_effs {
+                            if !self.func.declared_effects.contains(eff) {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::EffectUndeclared,
+                                    format!("Internalize validation effect {:?} not declared in function effects", eff),
+                                ));
+                            }
+                        }
+
+                        // 2. Section 45: Caller authority must cover validation effects
+                        if let Some(ca) = &reg.caller_authority {
+                            if !ca.covers(&val_effs) {
+                                self.diagnostics.push(Diagnostic::error(
+                                    DiagnosticCode::ValidationAuthorityInsufficient,
+                                    format!("Caller authority insufficient for internalization validation {:?}", val_effs),
+                                ));
+                            }
+                        } else {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::ValidationAuthorityInsufficient,
+                                "Caller authority absent for internalization validation",
+                            ));
+                        }
+
+                        val_effs
+                    } else {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::UnknownInternalizationPolicy,
+                            format!("PolicyId {:?} not found in trusted registry", policy_id),
+                        ));
+                        return;
+                    }
+                } else {
+                    Vec::new()
+                }
+            }
             Instruction::Read { domain, .. } => vec![Effect::Read(domain.clone())],
             Instruction::Infer { .. } => vec![Effect::Infer],
             Instruction::Pure { .. } => Vec::new(),
@@ -590,7 +892,10 @@ impl<'a> HighLevelVerifier<'a> {
             if !self.func.declared_effects.contains(eff) {
                 self.diagnostics.push(Diagnostic::error(
                     DiagnosticCode::EffectUndeclared,
-                    format!("Instruction requires effect {:?} not declared in function signature", eff),
+                    format!(
+                        "Instruction requires effect {:?} not declared in function signature",
+                        eff
+                    ),
                 ));
             }
         }
@@ -605,15 +910,17 @@ impl<'a> HighLevelVerifier<'a> {
         match term {
             Terminator::Return(val_opt) => {
                 let ret_ty = if let Some(val_id) = val_opt {
-                    self.check_visible(*val_id, visible)
-                        .unwrap_or(Type::String)
+                    self.check_visible(*val_id, visible).unwrap_or(Type::String)
                 } else {
                     Type::String
                 };
                 if ret_ty != self.func.return_type {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::TypeMismatch,
-                        format!("Return type mismatch in block {:?}: expected {:?}, got {:?}", block_id, self.func.return_type, ret_ty),
+                        format!(
+                            "Return type mismatch in block {:?}: expected {:?}, got {:?}",
+                            block_id, self.func.return_type, ret_ty
+                        ),
                     ));
                 }
             }
@@ -631,7 +938,10 @@ impl<'a> HighLevelVerifier<'a> {
                     if cond_ty != Type::Bool {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::TypeMismatch,
-                            format!("CondBr condition {:?} must have type Bool, got {:?}", cond, cond_ty),
+                            format!(
+                                "CondBr condition {:?} must have type Bool, got {:?}",
+                                cond, cond_ty
+                            ),
                         ));
                     }
                 }
@@ -685,7 +995,13 @@ impl<'a> HighLevelVerifier<'a> {
 
                 self.verify_region(success_body, *success_arg, &succ_ty, block_id, visible);
                 self.verify_region(failure_body, *failure_arg, &fail_ty, block_id, visible);
-                self.verify_region(partial_body, *partial_arg, &Type::PartialReport, block_id, visible);
+                self.verify_region(
+                    partial_body,
+                    *partial_arg,
+                    &Type::PartialReport,
+                    block_id,
+                    visible,
+                );
                 self.verify_region(unknown_body, *unknown_arg, &Type::String, block_id, visible);
             }
             Terminator::Unreachable => {}
@@ -720,7 +1036,10 @@ impl<'a> HighLevelVerifier<'a> {
                 if ret_ty != self.func.return_type {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::TypeMismatch,
-                        format!("Region return type mismatch: expected {:?}, got {:?}", self.func.return_type, ret_ty),
+                        format!(
+                            "Region return type mismatch: expected {:?}, got {:?}",
+                            self.func.return_type, ret_ty
+                        ),
                     ));
                 }
             }
@@ -743,7 +1062,10 @@ impl<'a> HighLevelVerifier<'a> {
             None => {
                 self.diagnostics.push(Diagnostic::error(
                     DiagnosticCode::CfgBadTarget,
-                    format!("Branch from block {:?} to non-existent target block {:?}", source_block, target),
+                    format!(
+                        "Branch from block {:?} to non-existent target block {:?}",
+                        source_block, target
+                    ),
                 ));
                 return;
             }
@@ -752,7 +1074,12 @@ impl<'a> HighLevelVerifier<'a> {
         if target_block.params.len() != args.len() {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::BlockArgArity,
-                format!("Block {:?} expects {} arguments, but branch provided {}", target, target_block.params.len(), args.len()),
+                format!(
+                    "Block {:?} expects {} arguments, but branch provided {}",
+                    target,
+                    target_block.params.len(),
+                    args.len()
+                ),
             ));
             return;
         }
@@ -760,10 +1087,46 @@ impl<'a> HighLevelVerifier<'a> {
         for (i, (param_id, expected_ty)) in target_block.params.iter().enumerate() {
             let arg_id = args[i];
             if let Some(arg_ty) = self.check_visible(arg_id, visible) {
-                if &arg_ty != expected_ty {
+                // Section 32 & 34: Handle Joins in CFG
+                if let Type::ChildHandle {
+                    ok: exp_ok,
+                    err: exp_err,
+                    effects: exp_effs,
+                } = expected_ty
+                {
+                    if let Type::ChildHandle {
+                        ok: arg_ok,
+                        err: arg_err,
+                        effects: arg_effs,
+                    } = &arg_ty
+                    {
+                        if exp_ok != arg_ok || exp_err != arg_err {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::IncompatibleHandleJoin,
+                                format!("Handle join type mismatch: expected ok={:?}, err={:?}, got ok={:?}, err={:?}", exp_ok, exp_err, arg_ok, arg_err),
+                            ));
+                        } else if !arg_effs.is_subset(exp_effs) {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::IncompatibleHandleJoin,
+                                format!("Handle join effect loss: incoming effects {:?} not covered by merged handle effects {:?}", arg_effs, exp_effs),
+                            ));
+                        }
+                    } else {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::BlockArgType,
+                            format!(
+                                "Block {:?} parameter {} ({:?}) expects type {:?}, got {:?}",
+                                target, i, param_id, expected_ty, arg_ty
+                            ),
+                        ));
+                    }
+                } else if &arg_ty != expected_ty {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::BlockArgType,
-                        format!("Block {:?} parameter {} ({:?}) expects type {:?}, got {:?}", target, i, param_id, expected_ty, arg_ty),
+                        format!(
+                            "Block {:?} parameter {} ({:?}) expects type {:?}, got {:?}",
+                            target, i, param_id, expected_ty, arg_ty
+                        ),
                     ));
                 }
             }

@@ -1,12 +1,13 @@
 use serde::{Deserialize, Serialize};
 
-use crate::registry::{OperationId, VerifierId};
-
-use super::{
-    effects::Effect,
-    facts::{ActLatentPostconditions, LatentPostconditions},
-    types::Type,
-    values::{BlockId, Value, ValueId},
+use crate::{
+    ir::{
+        effects::Effect,
+        facts::{ActLatentPostconditions, LatentPostconditions},
+        types::Type,
+        values::{BlockId, Value, ValueId},
+    },
+    registry::{IntentId, OperationId, PolicyId, VerifierId},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -27,10 +28,7 @@ impl Region {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RegionTerminator {
     Return(Option<ValueId>),
-    Br {
-        target: BlockId,
-        args: Vec<ValueId>,
-    },
+    Br { target: BlockId, args: Vec<ValueId> },
     Unreachable,
 }
 
@@ -85,6 +83,27 @@ pub enum Instruction {
         #[serde(default)]
         latent: ActLatentPostconditions,
     },
+    // Slice 3 Instructions
+    Delegate {
+        dest: ValueId,
+        intent_id: IntentId,
+        args: Vec<ValueId>,
+        #[serde(default)]
+        requested_effects: Vec<Effect>,
+        #[serde(default)]
+        authority_grant: Vec<Effect>,
+        #[serde(default)]
+        budget_grant: u64,
+    },
+    Await {
+        dest: ValueId,
+        handle: ValueId,
+    },
+    Internalize {
+        dest: ValueId,
+        policy_id: PolicyId,
+        claim: ValueId,
+    },
 }
 
 fn default_subject_type() -> Type {
@@ -100,6 +119,9 @@ impl Instruction {
             Instruction::Assign { dest, .. } => *dest,
             Instruction::Verify { dest, .. } => *dest,
             Instruction::Act { dest, .. } => *dest,
+            Instruction::Delegate { dest, .. } => *dest,
+            Instruction::Await { dest, .. } => *dest,
+            Instruction::Internalize { dest, .. } => *dest,
         }
     }
 
@@ -109,14 +131,26 @@ impl Instruction {
             Instruction::Read { domain, .. } => vec![Effect::Read(domain.clone())],
             Instruction::Infer { .. } => vec![Effect::Infer],
             Instruction::Assign { .. } => Vec::new(),
-            // Rule #1: verify inherits exactly the verifier's effect envelope (NO phantom Effect::Verify)
-            Instruction::Verify { verifier_effects, .. } => verifier_effects.clone(),
-            // Rule #9: Σ_act = { act[D] } ∪ Σ_gate
-            Instruction::Act { target_domain, gate_effects, .. } => {
+            Instruction::Verify {
+                verifier_effects, ..
+            } => verifier_effects.clone(),
+            Instruction::Act {
+                target_domain,
+                gate_effects,
+                ..
+            } => {
                 let mut effs = vec![Effect::Act(target_domain.clone())];
                 effs.extend(gate_effects.iter().cloned());
                 effs
             }
+            // Section 8: delegate carries Σ_child (requested_effects as IR placeholder)
+            Instruction::Delegate {
+                requested_effects, ..
+            } => requested_effects.clone(),
+            // Section 24: Σ_await = ∅
+            Instruction::Await { .. } => Vec::new(),
+            // Section 46: Σ_internalize = Σ_validation
+            Instruction::Internalize { .. } => Vec::new(),
         }
     }
 }

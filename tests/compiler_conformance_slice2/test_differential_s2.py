@@ -232,7 +232,12 @@ def test_diff_gated_act_success():
                 ("IsSuccess", ("sym(v3)",)),
                 ("SuccessFact", ("sym(v4)",)),
             },
-            "latent_facts": {},
+            "latent_facts": {
+                "v3": {
+                    "on_ok": [{"predicate": "SuccessFact", "args": [{"Symbol": "$value"}]}],
+                    "on_err": []
+                }
+            },
             "types": {
                 "v1": "string",
                 "v2": "Result<Attestation<PassesAudit, string>, string>",

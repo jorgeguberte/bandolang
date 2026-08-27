@@ -1,15 +1,16 @@
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
-use crate::{
-    ir::values::Value,
-    registry::MutationFootprint,
-};
+use crate::{ir::values::Value, registry::MutationFootprint};
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorldError {
     FootprintViolation(String),
-    ToctouViolation { key: String, expected: u64, actual: u64 },
+    ToctouViolation {
+        key: String,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -67,7 +68,8 @@ impl WorldState {
         for (key, val) in writes {
             let next_ver = self.storage.get(key).map(|(_, ver)| ver + 1).unwrap_or(1);
             self.storage.insert(key.clone(), (val.clone(), next_ver));
-            self.mutation_trace.push((key.clone(), val.clone(), next_ver));
+            self.mutation_trace
+                .push((key.clone(), val.clone(), next_ver));
         }
 
         Ok(())

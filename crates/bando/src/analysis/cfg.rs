@@ -37,7 +37,10 @@ impl<B: Copy + Ord> DominanceTree<B> {
                 let new_dom = if reachable_preds.is_empty() {
                     BTreeSet::from([b])
                 } else {
-                    let mut inter = dominators.get(&reachable_preds[0]).cloned().unwrap_or_default();
+                    let mut inter = dominators
+                        .get(&reachable_preds[0])
+                        .cloned()
+                        .unwrap_or_default();
                     for next_pred in &reachable_preds[1..] {
                         if let Some(pred_dom) = dominators.get(next_pred) {
                             inter = inter.intersection(pred_dom).copied().collect();

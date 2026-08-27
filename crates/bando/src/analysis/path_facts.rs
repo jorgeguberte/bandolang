@@ -134,7 +134,9 @@ impl<'a> PathFactAnalyzer<'a> {
                 let changed = block_in_facts.get(&succ_id) != Some(&new_succ_in);
                 block_in_facts.insert(succ_id, new_succ_in);
 
-                if !visited.contains(&succ_id) || (changed && !self.mutations.m10_single_pass_loop_analysis) {
+                if !visited.contains(&succ_id)
+                    || (changed && !self.mutations.m10_single_pass_loop_analysis)
+                {
                     if !worklist.contains(&succ_id) {
                         worklist.push_back(succ_id);
                     }
@@ -205,7 +207,8 @@ impl<'a> PathFactAnalyzer<'a> {
                     return edges;
                 };
                 let renaming = self.build_renaming(args, &target_block.params);
-                let renamed: BTreeSet<Fact> = base_facts.iter().map(|f| f.rename(&renaming)).collect();
+                let renamed: BTreeSet<Fact> =
+                    base_facts.iter().map(|f| f.rename(&renaming)).collect();
                 edges.push((*target, renamed));
             }
             VmTerminator::CondBr {
@@ -217,7 +220,10 @@ impl<'a> PathFactAnalyzer<'a> {
             } => {
                 if let Some(t_block) = self.func.blocks.get(true_target) {
                     let mut t_facts = base_facts.clone();
-                    t_facts.insert(Fact::new("IsTrue", vec![FactArg::Symbol(format!("v{}", cond.0))]));
+                    t_facts.insert(Fact::new(
+                        "IsTrue",
+                        vec![FactArg::Symbol(format!("v{}", cond.0))],
+                    ));
                     let renaming = self.build_renaming(true_args, &t_block.params);
                     let renamed = t_facts.iter().map(|f| f.rename(&renaming)).collect();
                     edges.push((*true_target, renamed));
@@ -225,7 +231,10 @@ impl<'a> PathFactAnalyzer<'a> {
 
                 if let Some(f_block) = self.func.blocks.get(false_target) {
                     let mut f_facts = base_facts.clone();
-                    f_facts.insert(Fact::new("IsFalse", vec![FactArg::Symbol(format!("v{}", cond.0))]));
+                    f_facts.insert(Fact::new(
+                        "IsFalse",
+                        vec![FactArg::Symbol(format!("v{}", cond.0))],
+                    ));
                     let renaming = self.build_renaming(false_args, &f_block.params);
                     let renamed = f_facts.iter().map(|f| f.rename(&renaming)).collect();
                     edges.push((*false_target, renamed));
@@ -242,7 +251,10 @@ impl<'a> PathFactAnalyzer<'a> {
 
                 if let Some(ok_block) = self.func.blocks.get(ok_target) {
                     let mut ok_facts = base_facts.clone();
-                    ok_facts.insert(Fact::new("IsOk", vec![FactArg::Symbol(format!("v{}", result_val.0))]));
+                    ok_facts.insert(Fact::new(
+                        "IsOk",
+                        vec![FactArg::Symbol(format!("v{}", result_val.0))],
+                    ));
                     for f in latent.instantiate_ok(&format!("v{}", ok_arg.0)) {
                         ok_facts.insert(f);
                     }
@@ -253,7 +265,10 @@ impl<'a> PathFactAnalyzer<'a> {
 
                 if let Some(err_block) = self.func.blocks.get(err_target) {
                     let mut err_facts = base_facts.clone();
-                    err_facts.insert(Fact::new("IsErr", vec![FactArg::Symbol(format!("v{}", result_val.0))]));
+                    err_facts.insert(Fact::new(
+                        "IsErr",
+                        vec![FactArg::Symbol(format!("v{}", result_val.0))],
+                    ));
                     for f in latent.instantiate_err(&format!("v{}", err_arg.0)) {
                         err_facts.insert(f);
                     }
@@ -277,7 +292,10 @@ impl<'a> PathFactAnalyzer<'a> {
 
                 if let Some(succ_block) = self.func.blocks.get(success_target) {
                     let mut succ_facts = base_facts.clone();
-                    succ_facts.insert(Fact::new("IsSuccess", vec![FactArg::Symbol(format!("v{}", outcome_val.0))]));
+                    succ_facts.insert(Fact::new(
+                        "IsSuccess",
+                        vec![FactArg::Symbol(format!("v{}", outcome_val.0))],
+                    ));
                     for f in latent.instantiate_success(&format!("v{}", success_arg.0)) {
                         succ_facts.insert(f);
                     }
@@ -288,7 +306,10 @@ impl<'a> PathFactAnalyzer<'a> {
 
                 if let Some(fail_block) = self.func.blocks.get(failure_target) {
                     let mut fail_facts = base_facts.clone();
-                    fail_facts.insert(Fact::new("IsFailure", vec![FactArg::Symbol(format!("v{}", outcome_val.0))]));
+                    fail_facts.insert(Fact::new(
+                        "IsFailure",
+                        vec![FactArg::Symbol(format!("v{}", outcome_val.0))],
+                    ));
                     for f in latent.instantiate_failure(&format!("v{}", failure_arg.0)) {
                         fail_facts.insert(f);
                     }
@@ -299,7 +320,10 @@ impl<'a> PathFactAnalyzer<'a> {
 
                 if let Some(part_block) = self.func.blocks.get(partial_target) {
                     let mut part_facts = base_facts.clone();
-                    part_facts.insert(Fact::new("IsPartial", vec![FactArg::Symbol(format!("v{}", outcome_val.0))]));
+                    part_facts.insert(Fact::new(
+                        "IsPartial",
+                        vec![FactArg::Symbol(format!("v{}", outcome_val.0))],
+                    ));
                     for f in latent.instantiate_partial(&format!("v{}", partial_arg.0)) {
                         part_facts.insert(f);
                     }
@@ -315,7 +339,10 @@ impl<'a> PathFactAnalyzer<'a> {
 
                 if let Some(unk_block) = self.func.blocks.get(unknown_target) {
                     let mut unk_facts = base_facts.clone();
-                    unk_facts.insert(Fact::new("IsUnknown", vec![FactArg::Symbol(format!("v{}", outcome_val.0))]));
+                    unk_facts.insert(Fact::new(
+                        "IsUnknown",
+                        vec![FactArg::Symbol(format!("v{}", outcome_val.0))],
+                    ));
                     let renaming = self.build_renaming(&[*unknown_arg], &unk_block.params);
                     let renamed = unk_facts.iter().map(|f| f.rename(&renaming)).collect();
                     edges.push((*unknown_target, renamed));

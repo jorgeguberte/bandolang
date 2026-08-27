@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub enum FactArg {
@@ -86,13 +86,19 @@ impl LatentPostconditions {
     pub fn instantiate_ok(&self, bound_var: &str) -> Vec<Fact> {
         let mut binding = BTreeMap::new();
         binding.insert("$value".to_string(), bound_var.to_string());
-        self.on_ok.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
+        self.on_ok
+            .iter()
+            .map(|tmpl| tmpl.instantiate(&binding))
+            .collect()
     }
 
     pub fn instantiate_err(&self, bound_var: &str) -> Vec<Fact> {
         let mut binding = BTreeMap::new();
         binding.insert("$error".to_string(), bound_var.to_string());
-        self.on_err.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
+        self.on_err
+            .iter()
+            .map(|tmpl| tmpl.instantiate(&binding))
+            .collect()
     }
 }
 
@@ -107,18 +113,27 @@ impl ActLatentPostconditions {
     pub fn instantiate_success(&self, bound_var: &str) -> Vec<Fact> {
         let mut binding = BTreeMap::new();
         binding.insert("$value".to_string(), bound_var.to_string());
-        self.on_success.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
+        self.on_success
+            .iter()
+            .map(|tmpl| tmpl.instantiate(&binding))
+            .collect()
     }
 
     pub fn instantiate_failure(&self, bound_var: &str) -> Vec<Fact> {
         let mut binding = BTreeMap::new();
         binding.insert("$error".to_string(), bound_var.to_string());
-        self.on_failure.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
+        self.on_failure
+            .iter()
+            .map(|tmpl| tmpl.instantiate(&binding))
+            .collect()
     }
 
     pub fn instantiate_partial(&self, bound_var: &str) -> Vec<Fact> {
         let mut binding = BTreeMap::new();
         binding.insert("$report".to_string(), bound_var.to_string());
-        self.on_partial.iter().map(|tmpl| tmpl.instantiate(&binding)).collect()
+        self.on_partial
+            .iter()
+            .map(|tmpl| tmpl.instantiate(&binding))
+            .collect()
     }
 }

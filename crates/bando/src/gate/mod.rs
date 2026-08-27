@@ -3,7 +3,10 @@ use serde::{Deserialize, Serialize};
 use crate::{
     conformance::schema::GateCheckObservation,
     ir::{effects::Effect, values::Value},
-    registry::{AuthoritySource, CallerAuthority, PolicyRequirement, TrustPolicy, TrustedRuntimeAuthority, VerifierId},
+    registry::{
+        AuthoritySource, CallerAuthority, PolicyRequirement, TrustPolicy, TrustedRuntimeAuthority,
+        VerifierId,
+    },
     world::WorldState,
 };
 
@@ -36,7 +39,9 @@ impl DeferredCheck {
         match self {
             DeferredCheck::CheckSubjectBinding { .. } => Vec::new(),
             DeferredCheck::CheckTrustPolicy { .. } => vec![Effect::Read("trust_store".to_string())],
-            DeferredCheck::CheckStateBaseVersion { .. } => vec![Effect::Read("state_base".to_string())],
+            DeferredCheck::CheckStateBaseVersion { .. } => {
+                vec![Effect::Read("state_base".to_string())]
+            }
         }
     }
 
@@ -86,9 +91,16 @@ impl GateEngine {
 
         for req in requirements {
             match req {
-                PolicyRequirement::RequiresStaticProof { predicate, subject_arg_idx } => {
+                PolicyRequirement::RequiresStaticProof {
+                    predicate,
+                    subject_arg_idx,
+                } => {
                     let matching_evidence = evidence.iter().find_map(|v| match v {
-                        Value::Attestation { predicate: p, subject, .. } => {
+                        Value::Attestation {
+                            predicate: p,
+                            subject,
+                            ..
+                        } => {
                             if p == predicate {
                                 Some(subject.clone())
                             } else {
@@ -96,7 +108,11 @@ impl GateEngine {
                             }
                         }
                         Value::Ok(inner) => match inner.as_ref() {
-                            Value::Attestation { predicate: p, subject, .. } => {
+                            Value::Attestation {
+                                predicate: p,
+                                subject,
+                                ..
+                            } => {
                                 if p == predicate {
                                     Some(subject.clone())
                                 } else {
@@ -110,7 +126,8 @@ impl GateEngine {
 
                     match matching_evidence {
                         Some(subject) => {
-                            let subject_val = args.get(*subject_arg_idx).cloned().unwrap_or(Value::Unit);
+                            let subject_val =
+                                args.get(*subject_arg_idx).cloned().unwrap_or(Value::Unit);
                             if subject.as_ref() == &subject_val {
                                 // Statically proved!
                                 continue;
@@ -122,9 +139,17 @@ impl GateEngine {
                         None => return RequirementResolution::Uncovered,
                     }
                 }
-                PolicyRequirement::RequiresAttestation { predicate, subject_arg_idx } => {
+                PolicyRequirement::RequiresAttestation {
+                    predicate,
+                    subject_arg_idx,
+                } => {
                     let matching_attestation = evidence.iter().find_map(|v| match v {
-                        Value::Attestation { predicate: p, subject, issuer, .. } => {
+                        Value::Attestation {
+                            predicate: p,
+                            subject,
+                            issuer,
+                            ..
+                        } => {
                             if p == predicate {
                                 Some((p.clone(), subject.clone(), issuer.clone()))
                             } else {
@@ -132,7 +157,12 @@ impl GateEngine {
                             }
                         }
                         Value::Ok(inner) => match inner.as_ref() {
-                            Value::Attestation { predicate: p, subject, issuer, .. } => {
+                            Value::Attestation {
+                                predicate: p,
+                                subject,
+                                issuer,
+                                ..
+                            } => {
                                 if p == predicate {
                                     Some((p.clone(), subject.clone(), issuer.clone()))
                                 } else {
@@ -146,7 +176,8 @@ impl GateEngine {
 
                     match matching_attestation {
                         Some((p, subject, issuer)) => {
-                            let subject_val = args.get(*subject_arg_idx).cloned().unwrap_or(Value::Unit);
+                            let subject_val =
+                                args.get(*subject_arg_idx).cloned().unwrap_or(Value::Unit);
                             if subject.as_ref() == &subject_val {
                                 deferred.push(DeferredCheck::CheckTrustPolicy {
                                     predicate: p,
@@ -166,7 +197,10 @@ impl GateEngine {
                         None => return RequirementResolution::Uncovered,
                     }
                 }
-                PolicyRequirement::RequiresStateBase { key, expected_version } => {
+                PolicyRequirement::RequiresStateBase {
+                    key,
+                    expected_version,
+                } => {
                     deferred.push(DeferredCheck::CheckStateBaseVersion {
                         key: key.clone(),
                         expected_version: *expected_version,
@@ -222,7 +256,9 @@ impl GateEngine {
                                 result: "Fail".to_string(),
                             });
                             return GateEvaluationOutput {
-                                witness: Err(GateError::AuthorityInsufficient("Caller lacks authority for check".to_string())),
+                                witness: Err(GateError::AuthorityInsufficient(
+                                    "Caller lacks authority for check".to_string(),
+                                )),
                                 trace,
                             };
                         }
@@ -234,7 +270,9 @@ impl GateEngine {
                             result: "Fail".to_string(),
                         });
                         return GateEvaluationOutput {
-                            witness: Err(GateError::AuthorityInsufficient("Caller authority absent".to_string())),
+                            witness: Err(GateError::AuthorityInsufficient(
+                                "Caller authority absent".to_string(),
+                            )),
                             trace,
                         };
                     }
@@ -251,7 +289,10 @@ impl GateEngine {
                                     result: "Fail".to_string(),
                                 });
                                 return GateEvaluationOutput {
-                                    witness: Err(GateError::AuthorityInsufficient("S2M07: Caller lacks authority for trusted check".to_string())),
+                                    witness: Err(GateError::AuthorityInsufficient(
+                                        "S2M07: Caller lacks authority for trusted check"
+                                            .to_string(),
+                                    )),
                                     trace,
                                 };
                             }
@@ -263,7 +304,9 @@ impl GateEngine {
                                 result: "Fail".to_string(),
                             });
                             return GateEvaluationOutput {
-                                witness: Err(GateError::AuthorityInsufficient("Caller authority absent for S2M07 check".to_string())),
+                                witness: Err(GateError::AuthorityInsufficient(
+                                    "Caller authority absent for S2M07 check".to_string(),
+                                )),
                                 trace,
                             };
                         }
@@ -278,7 +321,9 @@ impl GateEngine {
                                     result: "Fail".to_string(),
                                 });
                                 return GateEvaluationOutput {
-                                    witness: Err(GateError::AuthorityInsufficient("Runtime lacks authority for check".to_string())),
+                                    witness: Err(GateError::AuthorityInsufficient(
+                                        "Runtime lacks authority for check".to_string(),
+                                    )),
                                     trace,
                                 };
                             }
@@ -290,7 +335,9 @@ impl GateEngine {
                                 result: "Fail".to_string(),
                             });
                             return GateEvaluationOutput {
-                                witness: Err(GateError::AuthorityInsufficient("Runtime authority absent".to_string())),
+                                witness: Err(GateError::AuthorityInsufficient(
+                                    "Runtime authority absent".to_string(),
+                                )),
                                 trace,
                             };
                         }
@@ -299,7 +346,10 @@ impl GateEngine {
             }
 
             match check {
-                DeferredCheck::CheckSubjectBinding { expected_subject, attestation_subject } => {
+                DeferredCheck::CheckSubjectBinding {
+                    expected_subject,
+                    attestation_subject,
+                } => {
                     if expected_subject != attestation_subject {
                         trace.push(GateCheckObservation {
                             check_kind: check_name.to_string(),
@@ -327,7 +377,10 @@ impl GateEngine {
                         };
                     }
                 }
-                DeferredCheck::CheckStateBaseVersion { key, expected_version } => {
+                DeferredCheck::CheckStateBaseVersion {
+                    key,
+                    expected_version,
+                } => {
                     let actual_ver = world.get(key).map(|(_, v)| v).unwrap_or(0);
                     if actual_ver != *expected_version {
                         trace.push(GateCheckObservation {

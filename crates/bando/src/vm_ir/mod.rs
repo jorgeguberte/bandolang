@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::{
     ir::{
@@ -8,7 +8,7 @@ use crate::{
         types::Type,
         values::Value as VmValue,
     },
-    registry::{OperationId, VerifierId},
+    registry::{IntentId, OperationId, PolicyId, VerifierId},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -62,6 +62,31 @@ pub enum VmInstruction {
         gate_effects: Vec<Effect>,
         latent: ActLatentPostconditions,
     },
+    // Slice 3 VM Instructions
+    VmSpawnChild {
+        dest: VmValueId,
+        intent_id: IntentId,
+        args: Vec<VmValueId>,
+        requested_effects: Vec<Effect>,
+        authority_grant: Vec<Effect>,
+        budget_grant: u64,
+        child_effects: Vec<Effect>,
+        ok_type: Type,
+        err_type: Type,
+    },
+    VmAwaitChild {
+        dest: VmValueId,
+        handle: VmValueId,
+        ok_type: Type,
+        err_type: Type,
+    },
+    VmInternalize {
+        dest: VmValueId,
+        policy_id: PolicyId,
+        claim: VmValueId,
+        validation_effects: Vec<Effect>,
+        payload_type: Type,
+    },
 }
 
 impl VmInstruction {
@@ -73,6 +98,9 @@ impl VmInstruction {
             VmInstruction::VmAssign { dest, .. } => *dest,
             VmInstruction::VmVerify { dest, .. } => *dest,
             VmInstruction::VmAct { dest, .. } => *dest,
+            VmInstruction::VmSpawnChild { dest, .. } => *dest,
+            VmInstruction::VmAwaitChild { dest, .. } => *dest,
+            VmInstruction::VmInternalize { dest, .. } => *dest,
         }
     }
 
@@ -82,12 +110,23 @@ impl VmInstruction {
             VmInstruction::VmRead { domain, .. } => vec![Effect::Read(domain.clone())],
             VmInstruction::VmInfer { .. } => vec![Effect::Infer],
             VmInstruction::VmAssign { .. } => Vec::new(),
-            VmInstruction::VmVerify { verifier_effects, .. } => verifier_effects.clone(),
-            VmInstruction::VmAct { target_domain, gate_effects, .. } => {
+            VmInstruction::VmVerify {
+                verifier_effects, ..
+            } => verifier_effects.clone(),
+            VmInstruction::VmAct {
+                target_domain,
+                gate_effects,
+                ..
+            } => {
                 let mut effs = vec![Effect::Act(target_domain.clone())];
                 effs.extend(gate_effects.iter().cloned());
                 effs
             }
+            VmInstruction::VmSpawnChild { child_effects, .. } => child_effects.clone(),
+            VmInstruction::VmAwaitChild { .. } => Vec::new(),
+            VmInstruction::VmInternalize {
+                validation_effects, ..
+            } => validation_effects.clone(),
         }
     }
 }

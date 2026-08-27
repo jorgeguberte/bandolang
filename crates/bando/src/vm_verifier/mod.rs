@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use crate::{
     analysis::DominanceTree,
     diagnostics::{Diagnostic, DiagnosticCode},
-    ir::types::Type,
+    ir::{effects::EffectRow, types::Type},
     vm_ir::{VmBlockId, VmFunction, VmInstruction, VmModule, VmTerminator, VmValueId},
 };
 
@@ -49,7 +49,10 @@ impl<'a> VmVerifier<'a> {
         if !self.func.blocks.contains_key(&self.func.entry) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::CfgBadTarget,
-                format!("VM Entry block {:?} does not exist in function", self.func.entry),
+                format!(
+                    "VM Entry block {:?} does not exist in function",
+                    self.func.entry
+                ),
             ));
         }
 
@@ -65,15 +68,44 @@ impl<'a> VmVerifier<'a> {
                 let dest = inst.dest();
                 let ty = match inst {
                     VmInstruction::VmPure { ty, .. } => ty.clone(),
-                    VmInstruction::VmRead { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
-                    VmInstruction::VmInfer { ok_type, err_type, .. } => Type::result(ok_type.clone(), err_type.clone()),
+                    VmInstruction::VmRead {
+                        ok_type, err_type, ..
+                    } => Type::result(ok_type.clone(), err_type.clone()),
+                    VmInstruction::VmInfer {
+                        ok_type, err_type, ..
+                    } => Type::result(ok_type.clone(), err_type.clone()),
                     VmInstruction::VmAssign { ty, .. } => ty.clone(),
-                    VmInstruction::VmVerify { output_predicate, subject_type, .. } => {
-                        let att_ty = Type::attestation(output_predicate.clone(), subject_type.clone());
+                    VmInstruction::VmVerify {
+                        output_predicate,
+                        subject_type,
+                        ..
+                    } => {
+                        let att_ty =
+                            Type::attestation(output_predicate.clone(), subject_type.clone());
                         Type::result(att_ty, Type::String)
                     }
-                    VmInstruction::VmAct { success_type, failure_type, .. } => {
-                        Type::act_outcome(success_type.clone(), failure_type.clone())
+                    VmInstruction::VmAct {
+                        success_type,
+                        failure_type,
+                        ..
+                    } => Type::act_outcome(success_type.clone(), failure_type.clone()),
+                    VmInstruction::VmSpawnChild {
+                        ok_type,
+                        err_type,
+                        child_effects,
+                        ..
+                    } => Type::child_handle(
+                        ok_type.clone(),
+                        err_type.clone(),
+                        EffectRow {
+                            effects: child_effects.iter().cloned().collect(),
+                        },
+                    ),
+                    VmInstruction::VmAwaitChild {
+                        ok_type, err_type, ..
+                    } => Type::result(ok_type.clone(), err_type.clone()),
+                    VmInstruction::VmInternalize { payload_type, .. } => {
+                        Type::result(Type::belief(payload_type.clone()), Type::String)
                     }
                 };
                 self.register_def(dest, ty);
@@ -85,7 +117,8 @@ impl<'a> VmVerifier<'a> {
 
         // 4. Compute dominance tree (R3)
         let block_ids: Vec<VmBlockId> = self.func.blocks.keys().copied().collect();
-        let dom_tree = DominanceTree::compute(self.func.entry, &block_ids, |b| self.find_predecessors(b));
+        let dom_tree =
+            DominanceTree::compute(self.func.entry, &block_ids, |b| self.find_predecessors(b));
 
         // 5. Verify instructions & terminators with SSA dominance / visibility
         for (block_id, block) in &self.func.blocks {
@@ -135,12 +168,20 @@ impl<'a> VmVerifier<'a> {
                         preds.push(*b_id);
                     }
                 }
-                VmTerminator::CondBr { true_target, false_target, .. } => {
+                VmTerminator::CondBr {
+                    true_target,
+                    false_target,
+                    ..
+                } => {
                     if true_target == &target || false_target == &target {
                         preds.push(*b_id);
                     }
                 }
-                VmTerminator::SwitchResult { ok_target, err_target, .. } => {
+                VmTerminator::SwitchResult {
+                    ok_target,
+                    err_target,
+                    ..
+                } => {
                     if ok_target == &target || err_target == &target {
                         preds.push(*b_id);
                     }
@@ -181,7 +222,10 @@ impl<'a> VmVerifier<'a> {
         if !visible.contains(&val_id) {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::SsaUseBeforeDef,
-                format!("Use of VM SSA value {:?} outside its dominating scope", val_id),
+                format!(
+                    "Use of VM SSA value {:?} outside its dominating scope",
+                    val_id
+                ),
             ));
             return None;
         }
@@ -193,29 +237,44 @@ impl<'a> VmVerifier<'a> {
             if !self.func.declared_effects.contains(&eff) {
                 self.diagnostics.push(Diagnostic::error(
                     DiagnosticCode::EffectUndeclared,
-                    format!("VM Instruction requires effect {:?} not declared in function effects {:?}", eff, self.func.declared_effects),
+                    format!(
+                        "VM Instruction requires effect {:?} not declared in function effects {:?}",
+                        eff, self.func.declared_effects
+                    ),
                 ));
             }
         }
 
         match inst {
-            VmInstruction::VmPure { .. } | VmInstruction::VmRead { .. } | VmInstruction::VmInfer { .. } => {}
+            VmInstruction::VmPure { .. }
+            | VmInstruction::VmRead { .. }
+            | VmInstruction::VmInfer { .. } => {}
             VmInstruction::VmAssign { source, ty, .. } => {
                 if let Some(src_ty) = self.check_visible(*source, visible) {
                     if &src_ty != ty {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::TypeMismatch,
-                            format!("VM Assign type mismatch: source is {:?}, dest is {:?}", src_ty, ty),
+                            format!(
+                                "VM Assign type mismatch: source is {:?}, dest is {:?}",
+                                src_ty, ty
+                            ),
                         ));
                     }
                 }
             }
-            VmInstruction::VmVerify { subject, subject_type, .. } => {
+            VmInstruction::VmVerify {
+                subject,
+                subject_type,
+                ..
+            } => {
                 if let Some(sub_ty) = self.check_visible(*subject, visible) {
                     if &sub_ty != subject_type {
                         self.diagnostics.push(Diagnostic::error(
                             DiagnosticCode::TypeMismatch,
-                            format!("VM Verify subject type mismatch: expected {:?}, got {:?}", subject_type, sub_ty),
+                            format!(
+                                "VM Verify subject type mismatch: expected {:?}, got {:?}",
+                                subject_type, sub_ty
+                            ),
                         ));
                     }
                 }
@@ -228,10 +287,26 @@ impl<'a> VmVerifier<'a> {
                     self.check_visible(*ev, visible);
                 }
             }
+            VmInstruction::VmSpawnChild { args, .. } => {
+                for arg in args {
+                    self.check_visible(*arg, visible);
+                }
+            }
+            VmInstruction::VmAwaitChild { handle, .. } => {
+                self.check_visible(*handle, visible);
+            }
+            VmInstruction::VmInternalize { claim, .. } => {
+                self.check_visible(*claim, visible);
+            }
         }
     }
 
-    fn verify_terminator(&mut self, term: &VmTerminator, _current_block: VmBlockId, visible: &BTreeSet<VmValueId>) {
+    fn verify_terminator(
+        &mut self,
+        term: &VmTerminator,
+        _current_block: VmBlockId,
+        visible: &BTreeSet<VmValueId>,
+    ) {
         match term {
             VmTerminator::Return(val_opt) => {
                 if let Some(val_id) = val_opt {
@@ -239,14 +314,20 @@ impl<'a> VmVerifier<'a> {
                         if val_ty != self.func.return_type {
                             self.diagnostics.push(Diagnostic::error(
                                 DiagnosticCode::TypeMismatch,
-                                format!("VM Return type mismatch: function returns {:?}, got {:?}", self.func.return_type, val_ty),
+                                format!(
+                                    "VM Return type mismatch: function returns {:?}, got {:?}",
+                                    self.func.return_type, val_ty
+                                ),
                             ));
                         }
                     }
                 } else if self.func.return_type != Type::Unit {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::TypeMismatch,
-                        format!("VM Return without value in function expecting {:?}", self.func.return_type),
+                        format!(
+                            "VM Return without value in function expecting {:?}",
+                            self.func.return_type
+                        ),
                     ));
                 }
             }
@@ -309,13 +390,20 @@ impl<'a> VmVerifier<'a> {
                         Type::ActOutcome { success, failure } => {
                             self.verify_match_branch(*success_target, *success_arg, &success);
                             self.verify_match_branch(*failure_target, *failure_arg, &failure);
-                            self.verify_match_branch(*partial_target, *partial_arg, &Type::PartialReport);
+                            self.verify_match_branch(
+                                *partial_target,
+                                *partial_arg,
+                                &Type::PartialReport,
+                            );
                             self.verify_match_branch(*unknown_target, *unknown_arg, &Type::String);
                         }
                         other => {
                             self.diagnostics.push(Diagnostic::error(
                                 DiagnosticCode::TypeMismatch,
-                                format!("VM SwitchActOutcome expects ActOutcome<T,E>, got {:?}", other),
+                                format!(
+                                    "VM SwitchActOutcome expects ActOutcome<T,E>, got {:?}",
+                                    other
+                                ),
                             ));
                         }
                     }
@@ -325,7 +413,12 @@ impl<'a> VmVerifier<'a> {
         }
     }
 
-    fn verify_branch_target(&mut self, target: VmBlockId, args: &[VmValueId], visible: &BTreeSet<VmValueId>) {
+    fn verify_branch_target(
+        &mut self,
+        target: VmBlockId,
+        args: &[VmValueId],
+        visible: &BTreeSet<VmValueId>,
+    ) {
         let block = if let Some(b) = self.func.blocks.get(&target) {
             b
         } else {
@@ -339,7 +432,12 @@ impl<'a> VmVerifier<'a> {
         if block.params.len() != args.len() {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::BlockArgArity,
-                format!("VM Block {:?} expects {} arguments, got {}", target, block.params.len(), args.len()),
+                format!(
+                    "VM Block {:?} expects {} arguments, got {}",
+                    target,
+                    block.params.len(),
+                    args.len()
+                ),
             ));
             return;
         }
@@ -347,10 +445,45 @@ impl<'a> VmVerifier<'a> {
         let expected_types: Vec<_> = block.params.iter().map(|(_, t)| t.clone()).collect();
         for (i, (arg_id, expected_ty)) in args.iter().zip(expected_types.iter()).enumerate() {
             if let Some(arg_ty) = self.check_visible(*arg_id, visible) {
-                if &arg_ty != expected_ty {
+                if let Type::ChildHandle {
+                    ok: exp_ok,
+                    err: exp_err,
+                    effects: exp_effs,
+                } = expected_ty
+                {
+                    if let Type::ChildHandle {
+                        ok: arg_ok,
+                        err: arg_err,
+                        effects: arg_effs,
+                    } = &arg_ty
+                    {
+                        if exp_ok != arg_ok || exp_err != arg_err {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::IncompatibleHandleJoin,
+                                format!("VM Handle join type mismatch: expected ok={:?}, err={:?}, got ok={:?}, err={:?}", exp_ok, exp_err, arg_ok, arg_err),
+                            ));
+                        } else if !arg_effs.is_subset(exp_effs) {
+                            self.diagnostics.push(Diagnostic::error(
+                                DiagnosticCode::IncompatibleHandleJoin,
+                                format!("VM Handle join effect loss: incoming effects {:?} not covered by merged handle effects {:?}", arg_effs, exp_effs),
+                            ));
+                        }
+                    } else {
+                        self.diagnostics.push(Diagnostic::error(
+                            DiagnosticCode::BlockArgType,
+                            format!(
+                                "VM Block {:?} arg {} type mismatch: expected {:?}, got {:?}",
+                                target, i, expected_ty, arg_ty
+                            ),
+                        ));
+                    }
+                } else if &arg_ty != expected_ty {
                     self.diagnostics.push(Diagnostic::error(
                         DiagnosticCode::BlockArgType,
-                        format!("VM Block {:?} arg {} type mismatch: expected {:?}, got {:?}", target, i, expected_ty, arg_ty),
+                        format!(
+                            "VM Block {:?} arg {} type mismatch: expected {:?}, got {:?}",
+                            target, i, expected_ty, arg_ty
+                        ),
                     ));
                 }
             }
@@ -371,7 +504,11 @@ impl<'a> VmVerifier<'a> {
         if block.params.len() != 1 {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::BlockArgArity,
-                format!("VM Match target block {:?} must take exactly 1 argument, takes {}", target, block.params.len()),
+                format!(
+                    "VM Match target block {:?} must take exactly 1 argument, takes {}",
+                    target,
+                    block.params.len()
+                ),
             ));
             return;
         }
@@ -380,13 +517,19 @@ impl<'a> VmVerifier<'a> {
         if param_id != &arg_id {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::SsaUseBeforeDef,
-                format!("VM Match target block {:?} parameter {:?} does not match branch arg {:?}", target, param_id, arg_id),
+                format!(
+                    "VM Match target block {:?} parameter {:?} does not match branch arg {:?}",
+                    target, param_id, arg_id
+                ),
             ));
         }
         if param_ty != expected_ty {
             self.diagnostics.push(Diagnostic::error(
                 DiagnosticCode::ResultPayloadType,
-                format!("VM Match target block {:?} payload type mismatch: expected {:?}, got {:?}", target, expected_ty, param_ty),
+                format!(
+                    "VM Match target block {:?} payload type mismatch: expected {:?}, got {:?}",
+                    target, expected_ty, param_ty
+                ),
             ));
         }
     }

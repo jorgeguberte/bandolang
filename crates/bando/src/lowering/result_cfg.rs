@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 
 use crate::{
     ir::{
@@ -69,6 +69,56 @@ pub struct CompilerMutations {
     pub s2m15_historical_facts_invalidated: bool,
     #[serde(default)]
     pub s2m16_untrusted_attestation_accepted: bool,
+
+    // Slice 3 mutations (S3M01–S3M24)
+    #[serde(default)]
+    pub s3m01_drop_delegate_child_effect: bool,
+    #[serde(default)]
+    pub s3m02_allow_requested_below_child: bool,
+    #[serde(default)]
+    pub s3m03_allow_requested_above_exported: bool,
+    #[serde(default)]
+    pub s3m04_native_authority_unattenuated: bool,
+    #[serde(default)]
+    pub s3m05_granted_authority_unattenuated: bool,
+    #[serde(default)]
+    pub s3m06_child_runtime_allows_out_of_ceiling: bool,
+    #[serde(default)]
+    pub s3m07_delegation_shadow_reservation: bool,
+    #[serde(default)]
+    pub s3m08_spawn_failure_budget_debited: bool,
+    #[serde(default)]
+    pub s3m09_duplicate_settlement_refunds_twice: bool,
+    #[serde(default)]
+    pub s3m10_settlement_with_commitments_allowed: bool,
+    #[serde(default)]
+    pub s3m11_child_spent_copied_to_parent: bool,
+    #[serde(default)]
+    pub s3m12_nested_delegation_breaks_conservation: bool,
+    #[serde(default)]
+    pub s3m13_await_reattributes_child_effects: bool,
+    #[serde(default)]
+    pub s3m14_await_returns_result_on_settlement_unknown: bool,
+    #[serde(default)]
+    pub s3m15_parent_generation_validation_omitted: bool,
+    #[serde(default)]
+    pub s3m16_handle_join_drops_effect: bool,
+    #[serde(default)]
+    pub s3m17_handle_join_invents_provenance: bool,
+    #[serde(default)]
+    pub s3m18_duplicate_await_duplicate_settlement: bool,
+    #[serde(default)]
+    pub s3m19_internalize_uses_runtime_authority: bool,
+    #[serde(default)]
+    pub s3m20_failed_validation_constructs_belief: bool,
+    #[serde(default)]
+    pub s3m21_failed_internalize_materializes_fact: bool,
+    #[serde(default)]
+    pub s3m22_received_belief_reowned: bool,
+    #[serde(default)]
+    pub s3m23_delegated_provenance_removed_on_internalize: bool,
+    #[serde(default)]
+    pub s3m24_effect_summary_used_as_clean_provenance: bool,
 }
 
 pub struct LoweringContext {
@@ -208,6 +258,44 @@ impl LoweringContext {
                             Type::act_outcome(success_type.clone(), failure_type.clone()),
                         );
                     }
+                    Instruction::Delegate {
+                        dest, intent_id, ..
+                    } => {
+                        let reg = self
+                            .registry
+                            .as_ref()
+                            .expect("Lowering Delegate requires RegistrySnapshot");
+                        let desc = reg.intents.get(intent_id).expect("Unknown intent");
+                        self.value_types.insert(
+                            *dest,
+                            Type::child_handle(
+                                desc.output_type.clone(),
+                                desc.error_type.clone(),
+                                desc.child_effects.clone(),
+                            ),
+                        );
+                    }
+                    Instruction::Await { dest, handle } => {
+                        let handle_ty = self.value_types.get(handle).cloned();
+                        if let Some(Type::ChildHandle { ok, err, .. }) = handle_ty {
+                            self.value_types.insert(*dest, Type::result(*ok, *err));
+                        } else {
+                            self.value_types
+                                .insert(*dest, Type::result(Type::String, Type::String));
+                        }
+                    }
+                    Instruction::Internalize { dest, claim, .. } => {
+                        let claim_ty = self.value_types.get(claim).cloned();
+                        if let Some(Type::Claim(payload)) = claim_ty {
+                            self.value_types
+                                .insert(*dest, Type::result(Type::belief(*payload), Type::String));
+                        } else {
+                            self.value_types.insert(
+                                *dest,
+                                Type::result(Type::belief(Type::String), Type::String),
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -286,9 +374,7 @@ impl LoweringContext {
                         err_ty
                     };
 
-                    err_vm_block
-                        .params
-                        .push((vm_err_arg, err_block_param_ty));
+                    err_vm_block.params.push((vm_err_arg, err_block_param_ty));
                     for inst in &err_body.instructions {
                         err_vm_block.instructions.push(self.lower_instruction(inst));
                     }
@@ -367,9 +453,7 @@ impl LoweringContext {
                     // 3. Partial region
                     let mut part_block = VmBlock::new(part_block_id, VmTerminator::Unreachable);
                     part_block.name = Some("partial_branch".to_string());
-                    part_block
-                        .params
-                        .push((vm_part_arg, Type::PartialReport));
+                    part_block.params.push((vm_part_arg, Type::PartialReport));
                     for inst in &partial_body.instructions {
                         part_block.instructions.push(self.lower_instruction(inst));
                     }
@@ -482,7 +566,11 @@ impl LoweringContext {
                     (
                         desc.output_predicate.clone(),
                         desc.subject_type.clone(),
-                        desc.effect_envelope.effects.iter().cloned().collect::<Vec<_>>(),
+                        desc.effect_envelope
+                            .effects
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
                     )
                 };
 
@@ -553,14 +641,124 @@ impl LoweringContext {
                     latent: latent.clone(),
                 }
             }
+            // Slice 3: Delegate
+            Instruction::Delegate {
+                dest,
+                intent_id,
+                args,
+                requested_effects,
+                authority_grant,
+                budget_grant,
+                ..
+            } => {
+                let (ok_ty, err_ty, mut c_effs) = {
+                    let reg = self.registry.as_ref().expect(
+                        "Lowering Instruction::Delegate requires an authenticated RegistrySnapshot",
+                    );
+                    let desc = reg.intents.get(intent_id).unwrap_or_else(|| {
+                        panic!(
+                            "Lowering failed: IntentId {:?} not found in trusted registry",
+                            intent_id
+                        )
+                    });
+                    (
+                        desc.output_type.clone(),
+                        desc.error_type.clone(),
+                        desc.child_effects
+                            .effects
+                            .iter()
+                            .cloned()
+                            .collect::<Vec<_>>(),
+                    )
+                };
+
+                // Mutation S3M01: delegate drops child effect from semantic requirement
+                if self.mutations.s3m01_drop_delegate_child_effect && !c_effs.is_empty() {
+                    c_effs.pop();
+                }
+
+                let vm_dest = self.map_value(*dest);
+                let vm_args = args.iter().map(|a| self.map_value(*a)).collect();
+
+                VmInstruction::VmSpawnChild {
+                    dest: vm_dest,
+                    intent_id: intent_id.clone(),
+                    args: vm_args,
+                    requested_effects: requested_effects.clone(),
+                    authority_grant: authority_grant.clone(),
+                    budget_grant: *budget_grant,
+                    child_effects: c_effs,
+                    ok_type: ok_ty,
+                    err_type: err_ty,
+                }
+            }
+            // Slice 3: Await
+            Instruction::Await { dest, handle } => {
+                let (ok_ty, err_ty) = match self.value_types.get(handle) {
+                    Some(Type::ChildHandle { ok, err, .. }) => ((**ok).clone(), (**err).clone()),
+                    _ => (Type::String, Type::String),
+                };
+
+                let vm_dest = self.map_value(*dest);
+                let vm_handle = self.map_value(*handle);
+
+                VmInstruction::VmAwaitChild {
+                    dest: vm_dest,
+                    handle: vm_handle,
+                    ok_type: ok_ty,
+                    err_type: err_ty,
+                }
+            }
+            // Slice 3: Internalize
+            Instruction::Internalize {
+                dest,
+                policy_id,
+                claim,
+                ..
+            } => {
+                let val_effs = {
+                    let reg = self.registry.as_ref().expect(
+                        "Lowering Instruction::Internalize requires an authenticated RegistrySnapshot",
+                    );
+                    let policy_desc =
+                        reg.internalization_policies
+                            .get(policy_id)
+                            .unwrap_or_else(|| {
+                                panic!(
+                                    "Lowering failed: PolicyId {:?} not found in trusted registry",
+                                    policy_id
+                                )
+                            });
+                    policy_desc
+                        .validation_effect_envelope
+                        .effects
+                        .iter()
+                        .cloned()
+                        .collect::<Vec<_>>()
+                };
+
+                let payload_ty = match self.value_types.get(claim) {
+                    Some(Type::Claim(payload)) => (**payload).clone(),
+                    _ => Type::String,
+                };
+
+                let vm_dest = self.map_value(*dest);
+                let vm_claim = self.map_value(*claim);
+
+                VmInstruction::VmInternalize {
+                    dest: vm_dest,
+                    policy_id: policy_id.clone(),
+                    claim: vm_claim,
+                    validation_effects: val_effs,
+                    payload_type: payload_ty,
+                }
+            }
         }
     }
 
     fn lower_terminator(&mut self, term: &Terminator) -> VmTerminator {
         match term {
-            Terminator::Return(val_opt) => {
-                VmTerminator::Return(val_opt.map(|v| self.map_value(v)))
-            }
+            Terminator::Return(val_opt) => VmTerminator::Return(val_opt.map(|v| self.map_value(v))),
             Terminator::Br { target, args } => VmTerminator::Br {
                 target: self.map_block(*target),
                 args: args.iter().map(|a| self.map_value(*a)).collect(),

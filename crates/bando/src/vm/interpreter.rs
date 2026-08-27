@@ -1,18 +1,23 @@
-use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::{
     analysis::PathFactAnalyzer,
+    child::{
+        budget::FrameBudget,
+        handle::{ChildHandleRecord, ChildSettlementState},
+        provenance::ChildResultProvenance,
+    },
     conformance::schema::{GateCheckObservation, GateResolutionObservation},
     gate::{DeferredCheck, GateEngine, RequirementResolution},
     ir::{
-        effects::Effect,
+        effects::{Effect, EffectRow},
         facts::{Fact, FactArg, LatentPostconditions},
         types::Type,
-        values::Value as VmValue,
+        values::{BeliefValue, Value as VmValue},
     },
     lowering::CompilerMutations,
-    registry::{MutationFootprint, RegistrySnapshot},
+    registry::{ClaimContract, MutationFootprint, RegistrySnapshot},
     vm_ir::{VmBlockId, VmFunction, VmInstruction, VmTerminator, VmValueId},
     world::WorldState,
 };
@@ -23,6 +28,7 @@ use super::adapters::RuntimeAdapters;
 pub enum VmStatus {
     Running,
     Terminated,
+    WaitingOnChild(String),
     Error(String),
     ProtocolViolation(String),
 }
@@ -42,11 +48,21 @@ pub struct VmExecutionState {
     pub invalidated_keys: BTreeSet<String>,
     pub gate_resolutions: Vec<GateResolutionObservation>,
     pub gate_trace: Vec<GateCheckObservation>,
+    // Slice 3 additions
+    pub current_agent_id: String,
+    pub frame_budget: FrameBudget,
+    pub child_handles: BTreeMap<String, ChildHandleRecord>,
+    pub child_events: Vec<String>,
+    pub frame_ledgers: BTreeMap<String, FrameBudget>,
+    pub child_effective_authority: BTreeMap<String, Vec<String>>,
+    pub result_provenance: BTreeMap<String, ChildResultProvenance>,
+    pub beliefs: BTreeMap<String, BeliefValue>,
+    pub internalization_trace: Vec<GateCheckObservation>,
 }
 
 pub struct VmInterpreter<'a> {
     pub func: &'a VmFunction,
-    pub adapters: &'a RuntimeAdapters,
+    pub adapters: &'a mut RuntimeAdapters,
     pub registry: &'a RegistrySnapshot,
     pub mutations: CompilerMutations,
 }
@@ -54,7 +70,7 @@ pub struct VmInterpreter<'a> {
 impl<'a> VmInterpreter<'a> {
     pub fn new(
         func: &'a VmFunction,
-        adapters: &'a RuntimeAdapters,
+        adapters: &'a mut RuntimeAdapters,
         registry: &'a RegistrySnapshot,
     ) -> Self {
         Self {
@@ -67,7 +83,7 @@ impl<'a> VmInterpreter<'a> {
 
     pub fn with_mutations(
         func: &'a VmFunction,
-        adapters: &'a RuntimeAdapters,
+        adapters: &'a mut RuntimeAdapters,
         registry: &'a RegistrySnapshot,
         mutations: CompilerMutations,
     ) -> Self {
@@ -80,12 +96,17 @@ impl<'a> VmInterpreter<'a> {
     }
 
     pub fn execute(
-        &self,
+        &mut self,
         inputs: BTreeMap<String, VmValue>,
         initial_world: WorldState,
         initial_facts: BTreeSet<Fact>,
+        initial_budget: Option<FrameBudget>,
+        current_agent_id: Option<String>,
         max_steps: usize,
     ) -> VmExecutionState {
+        let agent_id = current_agent_id.unwrap_or_else(|| "agent_root".to_string());
+        let budget = initial_budget.unwrap_or_else(|| FrameBudget::with_initial("compute", 100));
+
         let mut state = VmExecutionState {
             current_block: self.func.entry,
             env: inputs.clone(),
@@ -100,39 +121,47 @@ impl<'a> VmInterpreter<'a> {
             invalidated_keys: BTreeSet::new(),
             gate_resolutions: Vec::new(),
             gate_trace: Vec::new(),
+            current_agent_id: agent_id,
+            frame_budget: budget,
+            child_handles: BTreeMap::new(),
+            child_events: Vec::new(),
+            frame_ledgers: BTreeMap::new(),
+            child_effective_authority: BTreeMap::new(),
+            result_provenance: BTreeMap::new(),
+            beliefs: BTreeMap::new(),
+            internalization_trace: Vec::new(),
         };
 
         // Static path fact analysis
-        let analysis = PathFactAnalyzer::with_mutations(self.func, self.mutations.clone()).analyze();
+        let analysis =
+            PathFactAnalyzer::with_mutations(self.func, self.mutations.clone()).analyze();
 
         // Populate parameter types into state
         if let Some(entry_block) = self.func.blocks.get(&self.func.entry) {
             for (val_id, ty) in &entry_block.params {
-                state.types.insert(format!("v{}", val_id.0), ty.display_name());
+                state
+                    .types
+                    .insert(format!("v{}", val_id.0), ty.display_name());
             }
         }
 
         let mut steps = 0;
 
-        while state.status == VmStatus::Running {
-            if steps >= max_steps {
-                state.status = VmStatus::Error("Maximum execution steps exceeded".to_string());
-                break;
-            }
+        while state.status == VmStatus::Running && steps < max_steps {
             steps += 1;
 
             let block = match self.func.blocks.get(&state.current_block) {
-                Some(b) => b,
+                Some(b) => b.clone(),
                 None => {
                     state.status = VmStatus::Error(format!(
-                        "Block {:?} not found during execution",
+                        "Current block {:?} not found in function",
                         state.current_block
                     ));
                     break;
                 }
             };
 
-            // Active path facts for current block
+            // Set active path facts for the current block from static analysis
             let block_facts = analysis
                 .block_in_facts
                 .get(&state.current_block)
@@ -141,6 +170,7 @@ impl<'a> VmInterpreter<'a> {
             let mut facts = initial_facts.clone();
             facts.extend(block_facts);
 
+            // Filter out invalidated keys from active facts
             if !self.mutations.s2m14_current_facts_not_invalidated {
                 facts.retain(|f| {
                     if f.predicate == "CurrentState" {
@@ -151,12 +181,14 @@ impl<'a> VmInterpreter<'a> {
                     true
                 });
             }
-            if self.mutations.s2m15_historical_facts_invalidated && !state.invalidated_keys.is_empty() {
+            if self.mutations.s2m15_historical_facts_invalidated
+                && !state.invalidated_keys.is_empty()
+            {
                 facts.retain(|f| f.predicate != "Historical");
             }
             state.active_facts = facts;
 
-            // Execute instructions in block
+            // Execute instructions
             for inst in &block.instructions {
                 self.execute_instruction(inst, &mut state);
                 if state.status != VmStatus::Running {
@@ -172,10 +204,14 @@ impl<'a> VmInterpreter<'a> {
             self.execute_terminator(&block.terminator, &mut state);
         }
 
+        if steps >= max_steps && state.status == VmStatus::Running {
+            state.status = VmStatus::Error("Execution step limit exceeded".to_string());
+        }
+
         state
     }
 
-    fn execute_instruction(&self, inst: &VmInstruction, state: &mut VmExecutionState) {
+    fn execute_instruction(&mut self, inst: &VmInstruction, state: &mut VmExecutionState) {
         match inst {
             VmInstruction::VmPure { dest, val, ty } => {
                 let sym = format!("v{}", dest.0);
@@ -194,9 +230,7 @@ impl<'a> VmInterpreter<'a> {
 
                 // Mutation M07: drop read effect
                 if !self.mutations.m07_drop_read_effect {
-                    state
-                        .observable_effects
-                        .push(format!("read[{}]", domain));
+                    state.observable_effects.push(format!("read[{}]", domain));
                 }
 
                 let out_val = match res {
@@ -205,22 +239,21 @@ impl<'a> VmInterpreter<'a> {
                 };
 
                 state.env.insert(sym.clone(), out_val);
-                state.lineage.insert(sym.clone(), vec![format!("read({})", domain)]);
+                state
+                    .lineage
+                    .insert(sym.clone(), vec![format!("read({})", domain)]);
                 state.types.insert(
                     sym.clone(),
                     Type::result(ok_type.clone(), err_type.clone()).display_name(),
                 );
 
-                // Mutation M04: drop latent postcondition
                 if !self.mutations.m04_drop_latent_metadata {
-                    state.latent.insert(sym, latent.clone());
+                    state.latent.insert(sym.clone(), latent.clone());
                 }
 
-                // Mutation M05: eager instantiation of on_ok
                 if self.mutations.m05_eager_on_ok_materialization {
-                    for f in latent.instantiate_ok(&format!("v{}", dest.0)) {
-                        state.active_facts.insert(f);
-                    }
+                    let facts = latent.instantiate_ok(&sym);
+                    state.active_facts.extend(facts);
                 }
             }
             VmInstruction::VmInfer {
@@ -244,24 +277,27 @@ impl<'a> VmInterpreter<'a> {
                 };
 
                 state.env.insert(sym.clone(), out_val);
-                state.lineage.insert(sym.clone(), vec![format!("infer({})", prompt)]);
+                state
+                    .lineage
+                    .insert(sym.clone(), vec![format!("infer({})", prompt)]);
                 state.types.insert(
                     sym.clone(),
                     Type::result(ok_type.clone(), err_type.clone()).display_name(),
                 );
 
                 if !self.mutations.m04_drop_latent_metadata {
-                    state.latent.insert(sym, latent.clone());
+                    state.latent.insert(sym.clone(), latent.clone());
+                }
+
+                if self.mutations.m05_eager_on_ok_materialization {
+                    let facts = latent.instantiate_ok(&sym);
+                    state.active_facts.extend(facts);
                 }
             }
             VmInstruction::VmAssign { dest, source, ty } => {
-                let src_sym = if self.mutations.m09_stale_source_value_id {
-                    format!("v{}", dest.0) // Corrupted source
-                } else {
-                    format!("v{}", source.0)
-                };
-                let val = state.env.get(&src_sym).cloned().unwrap_or(VmValue::Unit);
                 let dest_sym = format!("v{}", dest.0);
+                let src_sym = format!("v{}", source.0);
+                let val = state.env.get(&src_sym).cloned().unwrap_or(VmValue::Unit);
                 state.env.insert(dest_sym.clone(), val);
                 state.types.insert(dest_sym, ty.display_name());
             }
@@ -273,22 +309,26 @@ impl<'a> VmInterpreter<'a> {
                 subject_type: _,
                 verifier_effects: _,
             } => {
-                let dest_sym = format!("v{}", dest.0);
-                let sub_sym = format!("v{}", subject.0);
-                let subject_val = state.env.get(&sub_sym).cloned().unwrap_or(VmValue::Unit);
+                let sym = format!("v{}", dest.0);
+                let subj_sym = format!("v{}", subject.0);
+                let subject_val = state
+                    .env
+                    .get(&subj_sym)
+                    .cloned()
+                    .unwrap_or(VmValue::String(subj_sym.clone()));
 
+                // Section 3: Authoritative descriptor lookup in registry
                 let desc = match self.registry.verifiers.get(verifier_id) {
                     Some(d) => d,
                     None => {
-                        state.status = VmStatus::Error(format!(
-                            "Unknown verifier {:?} in trusted registry",
-                            verifier_id
-                        ));
+                        state.status =
+                            VmStatus::Error(format!("Unknown verifier {:?}", verifier_id));
                         return;
                     }
                 };
 
-                let verifier_effects: Vec<_> = desc.effect_envelope.effects.iter().cloned().collect();
+                let verifier_effects: Vec<_> =
+                    desc.effect_envelope.effects.iter().cloned().collect();
 
                 // Caller authority check for Verify (Rule #5, S2C04)
                 if let Some(ca) = &self.registry.caller_authority {
@@ -301,39 +341,40 @@ impl<'a> VmInterpreter<'a> {
                     }
                 }
 
-                // S2M02: drop verifier effect from execution
-                if !self.mutations.s2m02_drop_verifier_effect {
-                    for eff in &verifier_effects {
-                        match eff {
-                            crate::ir::effects::Effect::Read(d) => {
-                                state.observable_effects.push(format!("read[{}]", d))
-                            }
-                            crate::ir::effects::Effect::Infer => {
-                                state.observable_effects.push("infer".to_string())
-                            }
-                            crate::ir::effects::Effect::Act(d) => {
-                                state.observable_effects.push(format!("act[{}]", d))
-                            }
-                        }
-                    }
+                let mut effs_to_record: Vec<String> = verifier_effects
+                    .iter()
+                    .map(|e| match e {
+                        crate::ir::effects::Effect::Read(d) => format!("read[{}]", d),
+                        crate::ir::effects::Effect::Infer => "infer".to_string(),
+                        crate::ir::effects::Effect::Act(d) => format!("act[{}]", d),
+                    })
+                    .collect();
+
+                // Mutation S2M02: drop verifier effect
+                if self.mutations.s2m02_drop_verifier_effect && !effs_to_record.is_empty() {
+                    effs_to_record.pop();
                 }
 
-                let verify_res = self
-                    .adapters
-                    .verifier
-                    .verify(desc, &subject_val, &desc.effect_envelope);
+                state.observable_effects.extend(effs_to_record);
+
+                let verify_res =
+                    self.adapters
+                        .verifier
+                        .verify(desc, &subject_val, &desc.effect_envelope);
                 let out_val = match verify_res {
                     Ok(att) => VmValue::ok(att),
                     Err(e) => VmValue::err(VmValue::String(e)),
                 };
 
-                let ret_ty = Type::result(
-                    Type::attestation(desc.output_predicate.clone(), desc.subject_type.clone()),
-                    Type::String,
+                state.env.insert(sym.clone(), out_val);
+                state.types.insert(
+                    sym.clone(),
+                    Type::result(
+                        Type::attestation(desc.output_predicate.clone(), desc.subject_type.clone()),
+                        Type::String,
+                    )
+                    .display_name(),
                 );
-
-                state.env.insert(dest_sym.clone(), out_val);
-                state.types.insert(dest_sym, ret_ty.display_name());
             }
             VmInstruction::VmAct {
                 dest,
@@ -344,42 +385,57 @@ impl<'a> VmInterpreter<'a> {
                 args,
                 evidence,
                 gate_effects: _,
-                latent: _,
+                latent,
             } => {
                 let dest_sym = format!("v{}", dest.0);
-                let ret_ty = Type::act_outcome(success_type.clone(), failure_type.clone());
-                state.types.insert(dest_sym.clone(), ret_ty.display_name());
 
-                // Look up operation descriptor (Fail-closed, P1)
+                state.types.insert(
+                    dest_sym.clone(),
+                    Type::act_outcome(success_type.clone(), failure_type.clone()).display_name(),
+                );
+
+                if !self.mutations.m04_drop_latent_metadata
+                    && (!latent.on_success.is_empty() || !latent.on_failure.is_empty())
+                {
+                    state.latent.insert(
+                        dest_sym.clone(),
+                        LatentPostconditions {
+                            on_ok: latent.on_success.clone(),
+                            on_err: latent.on_failure.clone(),
+                        },
+                    );
+                }
+
+                // Section 4: Authoritative operation descriptor lookup in registry
                 let op_desc = match self.registry.operations.get(op_id) {
-                    Some(d) => d.clone(),
+                    Some(d) => d,
                     None => {
-                        state.status = VmStatus::Error(format!(
-                            "Unknown operation {:?} in trusted registry",
-                            op_id
-                        ));
+                        state.status = VmStatus::Error(format!("Unknown operation {:?}", op_id));
                         return;
                     }
                 };
 
-                // Caller authority check for target domain (Rule #9, S2C11)
+                // 1. Caller authority check for target act[domain] (Rule #9, S2C11)
                 if let Some(ca) = &self.registry.caller_authority {
-                    let target_eff = Effect::Act(op_desc.target_domain.clone());
-                    if !ca.contains(&target_eff) {
+                    if !ca.contains(&crate::ir::effects::Effect::Act(
+                        op_desc.target_domain.clone(),
+                    )) {
                         state.status = VmStatus::Error(format!(
-                            "Caller authority lacks target capability {:?}",
-                            target_eff
+                            "Caller authority lacks target capability Act({:?})",
+                            op_desc.target_domain
                         ));
                         return;
                     }
                 }
 
-                // 1. Resolve requirements against args and evidence
+                // Resolve requirements against evidence
                 let mut arg_values = Vec::new();
+                let mut arg_id_values = Vec::new();
                 for arg_id in args {
                     let arg_sym = format!("v{}", arg_id.0);
                     if let Some(v) = state.env.get(&arg_sym) {
                         arg_values.push(v.clone());
+                        arg_id_values.push(v.clone());
                     }
                 }
 
@@ -498,15 +554,22 @@ impl<'a> VmInterpreter<'a> {
                 state
                     .observable_effects
                     .push(format!("act[{}]", op_desc.target_domain));
+                state.types.insert(
+                    dest_sym.clone(),
+                    Type::act_outcome(success_type.clone(), failure_type.clone()).display_name(),
+                );
+
+                if !self.mutations.m04_drop_latent_metadata {
+                    state.latent.insert(
+                        dest_sym.clone(),
+                        LatentPostconditions {
+                            on_ok: latent.on_success.clone(),
+                            on_err: latent.on_failure.clone(),
+                        },
+                    );
+                }
 
                 let prior_trace_len = state.world.mutation_trace.len();
-
-                let mut arg_id_values = Vec::new();
-                for arg_id in args {
-                    let arg_sym = format!("v{}", arg_id.0);
-                    let val = state.env.get(&arg_sym).cloned().unwrap_or(VmValue::Unit);
-                    arg_id_values.push(val);
-                }
 
                 let footprint = if self.mutations.s2m09_footprint_enforcement_disabled {
                     MutationFootprint::Unknown(op_desc.target_domain.clone())
@@ -522,6 +585,15 @@ impl<'a> VmInterpreter<'a> {
                     op_desc.atomicity,
                     witness_version,
                 );
+
+                if let VmValue::String(s) = &raw_outcome {
+                    if s == "PROTOCOL_VIOLATION_ATOMIC_PARTIAL" {
+                        state.status = VmStatus::ProtocolViolation(
+                            "Atomic adapter returned partial outcome".to_string(),
+                        );
+                        return;
+                    }
+                }
 
                 if self.mutations.s2m10_partial_collapsed_to_failure {
                     if let VmValue::ActPartial(rep) = raw_outcome {
@@ -548,6 +620,406 @@ impl<'a> VmInterpreter<'a> {
 
                 state.env.insert(dest_sym, raw_outcome);
             }
+            // Slice 3: VmSpawnChild
+            VmInstruction::VmSpawnChild {
+                dest,
+                intent_id,
+                args,
+                requested_effects,
+                authority_grant,
+                budget_grant,
+                child_effects: _,
+                ok_type,
+                err_type,
+            } => {
+                let dest_sym = format!("v{}", dest.0);
+
+                let desc = match self.registry.intents.get(intent_id) {
+                    Some(d) => d,
+                    None => {
+                        state.status = VmStatus::Error(format!("Unknown intent {:?}", intent_id));
+                        return;
+                    }
+                };
+
+                let target_agent = self.registry.agents.get(&desc.target_agent_id);
+                let native_auth = target_agent
+                    .map(|a| a.native_authority.clone())
+                    .unwrap_or_default();
+                let requested_set: BTreeSet<Effect> = requested_effects.iter().cloned().collect();
+
+                // Section 9: Attenuate native authority to Σ_requested
+                let c_native = if self.mutations.s3m04_native_authority_unattenuated {
+                    native_auth
+                } else {
+                    native_auth
+                        .intersection(&requested_set)
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                };
+
+                // Section 9 & 10: Attenuate granted authority to Σ_requested
+                let grant_set: BTreeSet<Effect> = authority_grant.iter().cloned().collect();
+                let c_granted = if self.mutations.s3m05_granted_authority_unattenuated {
+                    grant_set
+                } else {
+                    grant_set
+                        .intersection(&requested_set)
+                        .cloned()
+                        .collect::<BTreeSet<_>>()
+                };
+
+                let c_child_effective: BTreeSet<Effect> =
+                    c_native.union(&c_granted).cloned().collect();
+
+                // Section 18: Atomic budget transfer
+                let mut child_budget = FrameBudget::new();
+                if *budget_grant > 0 {
+                    if self.mutations.s3m07_delegation_shadow_reservation {
+                        let _ = state.frame_budget.reserve("compute", *budget_grant);
+                        child_budget
+                            .available
+                            .insert("compute".to_string(), *budget_grant);
+                    } else if let Err(e) = state.frame_budget.transfer_to_child(
+                        "compute",
+                        *budget_grant,
+                        &mut child_budget,
+                    ) {
+                        state.status = VmStatus::Error(format!("BudgetTransferFailed: {}", e));
+                        return;
+                    }
+                }
+
+                let mut arg_vals = Vec::new();
+                for a in args {
+                    let a_sym = format!("v{}", a.0);
+                    let val = state.env.get(&a_sym).cloned().unwrap_or(VmValue::Unit);
+                    arg_vals.push(val);
+                }
+
+                let spawn_res = self.adapters.child.spawn_child(
+                    desc,
+                    &c_child_effective,
+                    &EffectRow {
+                        effects: requested_set.clone(),
+                    },
+                    child_budget.clone(),
+                    &arg_vals,
+                    &state.current_agent_id,
+                    "gen_1",
+                );
+
+                match spawn_res {
+                    Ok(rec) => {
+                        let handle_id = rec.handle_id.clone();
+                        let handle_val = VmValue::child_handle(
+                            handle_id.clone(),
+                            rec.child_id.clone(),
+                            rec.parent_id.clone(),
+                            rec.generation_token.clone(),
+                            desc.child_effects.clone(),
+                            "Unsettled",
+                        );
+
+                        // Section 8: delegate carries child effects in execution trace
+                        if !self.mutations.s3m01_drop_delegate_child_effect {
+                            for eff in &desc.child_effects.effects {
+                                state.observable_effects.push(eff.to_string());
+                            }
+                        }
+
+                        let auth_strings: Vec<String> =
+                            c_child_effective.iter().map(|e| e.to_string()).collect();
+                        state
+                            .child_effective_authority
+                            .insert(handle_id.clone(), auth_strings);
+                        state.child_events.push(format!("Spawned({})", intent_id));
+                        state.child_handles.insert(handle_id.clone(), rec);
+                        state.frame_ledgers.insert(handle_id.clone(), child_budget);
+
+                        state.types.insert(
+                            dest_sym.clone(),
+                            Type::child_handle(
+                                ok_type.clone(),
+                                err_type.clone(),
+                                desc.child_effects.clone(),
+                            )
+                            .display_name(),
+                        );
+                        state.env.insert(dest_sym, handle_val);
+                    }
+                    Err(e) => {
+                        if !self.mutations.s3m08_spawn_failure_budget_debited && *budget_grant > 0 {
+                            // Atomic rollback of budget transfer on spawn failure
+                            let avail = state.frame_budget.get_available("compute");
+                            state
+                                .frame_budget
+                                .available
+                                .insert("compute".to_string(), avail + *budget_grant);
+                        }
+                        state.status = VmStatus::Error(format!("SpawnFailed: {}", e));
+                    }
+                }
+            }
+            // Slice 3: VmAwaitChild
+            VmInstruction::VmAwaitChild {
+                dest,
+                handle,
+                ok_type,
+                err_type,
+            } => {
+                let dest_sym = format!("v{}", dest.0);
+                let handle_sym = format!("v{}", handle.0);
+
+                let handle_val = match state.env.get(&handle_sym) {
+                    Some(VmValue::ChildHandle(h)) => h.clone(),
+                    other => {
+                        state.status = VmStatus::Error(format!("Await on non-handle {:?}", other));
+                        return;
+                    }
+                };
+
+                // Section 28: Parent and generation binding
+                if !self.mutations.s3m15_parent_generation_validation_omitted {
+                    if handle_val.parent_id != state.current_agent_id {
+                        state.status = VmStatus::Error(format!(
+                            "ForeignParentHandle: handle parent is {}, current is {}",
+                            handle_val.parent_id, state.current_agent_id
+                        ));
+                        return;
+                    }
+                    if handle_val.generation_token == "stale" {
+                        state.status = VmStatus::Error("StaleGenerationHandle".to_string());
+                        return;
+                    }
+                }
+
+                // Settle if not settled yet
+                let mut rec = match state.child_handles.get(&handle_val.handle_id).cloned() {
+                    Some(r) => r,
+                    None => {
+                        state.status = VmStatus::Error(format!(
+                            "Handle record {} not found",
+                            handle_val.handle_id
+                        ));
+                        return;
+                    }
+                };
+
+                if rec.settlement_state == ChildSettlementState::SettlementUnknown {
+                    // Section 23: SettlementUnknown suspends (does not produce Result::Err!)
+                    state
+                        .child_events
+                        .push(format!("AwaitSuspended({})", rec.handle_id));
+                    if self
+                        .mutations
+                        .s3m14_await_returns_result_on_settlement_unknown
+                    {
+                        state.env.insert(
+                            dest_sym,
+                            VmValue::err(VmValue::String("SettlementUnknown".to_string())),
+                        );
+                    } else {
+                        state.status = VmStatus::WaitingOnChild(rec.handle_id.clone());
+                    }
+                    return;
+                }
+
+                if rec.settlement_state != ChildSettlementState::Settled {
+                    match self
+                        .adapters
+                        .child
+                        .settle(&mut rec, &mut state.frame_budget)
+                    {
+                        Ok(_) => {
+                            state
+                                .child_events
+                                .push(format!("Settled({})", rec.handle_id));
+                            state
+                                .child_handles
+                                .insert(rec.handle_id.clone(), rec.clone());
+                            state
+                                .frame_ledgers
+                                .insert(rec.handle_id.clone(), rec.budget.clone());
+                        }
+                        Err(e) => {
+                            if !self.mutations.s3m10_settlement_with_commitments_allowed {
+                                state.status = VmStatus::Error(format!("SettlementFailed: {}", e));
+                                return;
+                            }
+                        }
+                    }
+                }
+
+                let poll_res = self.adapters.child.poll_await(&mut rec);
+                match poll_res {
+                    Ok(Some(Ok(mut v))) => {
+                        if self.mutations.s3m22_received_belief_reowned {
+                            if let VmValue::Belief(ref mut b) = v {
+                                b.owner_agent_id = state.current_agent_id.clone();
+                            }
+                        }
+                        if self.mutations.s3m13_await_reattributes_child_effects {
+                            for eff in &handle_val.effects.effects {
+                                state.observable_effects.push(eff.to_string());
+                            }
+                        }
+                        state
+                            .result_provenance
+                            .insert(dest_sym.clone(), rec.provenance.clone());
+                        state
+                            .child_events
+                            .push(format!("AwaitResumed({})", rec.handle_id));
+                        state.types.insert(
+                            dest_sym.clone(),
+                            Type::result(ok_type.clone(), err_type.clone()).display_name(),
+                        );
+                        state.env.insert(dest_sym, VmValue::ok(v));
+                    }
+                    Ok(Some(Err(e))) => {
+                        if self.mutations.s3m13_await_reattributes_child_effects {
+                            for eff in &handle_val.effects.effects {
+                                state.observable_effects.push(eff.to_string());
+                            }
+                        }
+                        state
+                            .result_provenance
+                            .insert(dest_sym.clone(), rec.provenance.clone());
+                        state
+                            .child_events
+                            .push(format!("AwaitResumed({})", rec.handle_id));
+                        state.types.insert(
+                            dest_sym.clone(),
+                            Type::result(ok_type.clone(), err_type.clone()).display_name(),
+                        );
+                        state.env.insert(dest_sym, VmValue::err(e));
+                    }
+                    Ok(None) => {
+                        // Section 23: SettlementUnknown suspends
+                        state
+                            .child_events
+                            .push(format!("AwaitSuspended({})", rec.handle_id));
+                        if self
+                            .mutations
+                            .s3m14_await_returns_result_on_settlement_unknown
+                        {
+                            state.env.insert(
+                                dest_sym,
+                                VmValue::err(VmValue::String("SettlementUnknown".to_string())),
+                            );
+                        } else {
+                            state.status = VmStatus::WaitingOnChild(rec.handle_id.clone());
+                        }
+                    }
+                    Err(e) => {
+                        state.status = VmStatus::Error(format!("AwaitError: {}", e));
+                    }
+                }
+            }
+            // Slice 3: VmInternalize
+            VmInstruction::VmInternalize {
+                dest,
+                policy_id,
+                claim,
+                validation_effects,
+                payload_type,
+            } => {
+                let dest_sym = format!("v{}", dest.0);
+                let claim_sym = format!("v{}", claim.0);
+
+                let claim_val = match state.env.get(&claim_sym) {
+                    Some(VmValue::Claim(inner)) => (**inner).clone(),
+                    other => {
+                        state.status =
+                            VmStatus::Error(format!("Internalize on non-claim {:?}", other));
+                        return;
+                    }
+                };
+
+                let policy_desc = match self.registry.internalization_policies.get(policy_id) {
+                    Some(p) => p,
+                    None => {
+                        state.status = VmStatus::Error(format!("Unknown policy {:?}", policy_id));
+                        return;
+                    }
+                };
+
+                // Section 45: Authority check using CALLER authority
+                let val_eff_strings: Vec<String> =
+                    validation_effects.iter().map(|e| e.to_string()).collect();
+                if let Some(ca) = &self.registry.caller_authority {
+                    if !ca.covers(validation_effects)
+                        && !self.mutations.s3m19_internalize_uses_runtime_authority
+                    {
+                        state.status =
+                            VmStatus::Error("ValidationAuthorityInsufficient".to_string());
+                        return;
+                    }
+                } else if !self.mutations.s3m19_internalize_uses_runtime_authority {
+                    state.status = VmStatus::Error("ValidationAuthorityInsufficient".to_string());
+                    return;
+                }
+
+                // Check contract
+                let contract_pass = match &policy_desc.accepted_claim_contract {
+                    ClaimContract::AcceptAll => true,
+                    ClaimContract::AcceptPredicate(_) => true,
+                    ClaimContract::AcceptSubjectLiteral(lit) => {
+                        if let VmValue::String(s) = &claim_val {
+                            s == lit
+                        } else {
+                            false
+                        }
+                    }
+                    ClaimContract::RejectAll => false,
+                };
+
+                if !contract_pass && !self.mutations.s3m20_failed_validation_constructs_belief {
+                    state.internalization_trace.push(GateCheckObservation {
+                        check_kind: "ValidateClaimContract".to_string(),
+                        authority_source: "Caller".to_string(),
+                        effects: val_eff_strings,
+                        result: "Fail".to_string(),
+                    });
+                    state.env.insert(
+                        dest_sym,
+                        VmValue::err(VmValue::String("InternalizationRejected".to_string())),
+                    );
+                    return;
+                }
+
+                state.internalization_trace.push(GateCheckObservation {
+                    check_kind: "ValidateClaimContract".to_string(),
+                    authority_source: "Caller".to_string(),
+                    effects: val_eff_strings.clone(),
+                    result: "Pass".to_string(),
+                });
+                state.observable_effects.extend(val_eff_strings);
+
+                let owner = state.current_agent_id.clone();
+                let prov = vec![
+                    format!("claim_from({})", claim_sym),
+                    format!("internalize({})", policy_id),
+                ];
+                let belief_val =
+                    VmValue::belief(claim_val.clone(), owner.clone(), prov, policy_id.0.clone());
+
+                state.beliefs.insert(
+                    dest_sym.clone(),
+                    BeliefValue {
+                        payload: Box::new(claim_val),
+                        owner_agent_id: owner,
+                        provenance: vec![format!("internalize({})", policy_id)],
+                        policy_binding: policy_id.0.clone(),
+                    },
+                );
+
+                state.types.insert(
+                    dest_sym.clone(),
+                    Type::result(Type::belief(payload_type.clone()), Type::String).display_name(),
+                );
+                state.env.insert(dest_sym, VmValue::ok(belief_val));
+            }
         }
     }
 
@@ -573,7 +1045,11 @@ impl<'a> VmInterpreter<'a> {
                 false_args,
             } => {
                 let cond_sym = format!("v{}", cond.0);
-                let cond_val = state.env.get(&cond_sym).cloned().unwrap_or(VmValue::Bool(false));
+                let cond_val = state
+                    .env
+                    .get(&cond_sym)
+                    .cloned()
+                    .unwrap_or(VmValue::Bool(false));
                 match cond_val {
                     VmValue::Bool(true) => {
                         self.transfer_control(*true_target, true_args, state);
@@ -582,10 +1058,8 @@ impl<'a> VmInterpreter<'a> {
                         self.transfer_control(*false_target, false_args, state);
                     }
                     _ => {
-                        state.status = VmStatus::Error(format!(
-                            "CondBr on non-boolean value {:?}",
-                            cond_val
-                        ));
+                        state.status =
+                            VmStatus::Error(format!("CondBr on non-boolean value {:?}", cond_val));
                     }
                 }
             }
@@ -705,21 +1179,16 @@ impl<'a> VmInterpreter<'a> {
                         }
                         state.current_block = *unknown_target;
                     }
-                    VmValue::String(ref s) if s == "PROTOCOL_VIOLATION_ATOMIC_PARTIAL" => {
-                        state.status = VmStatus::ProtocolViolation(
-                            "Atomic adapter returned partial outcome".to_string(),
-                        );
-                    }
                     _ => {
                         state.status = VmStatus::Error(format!(
-                            "SwitchActOutcome on non-outcome value {:?}",
+                            "SwitchActOutcome on non-act-outcome value {:?}",
                             out_val
                         ));
                     }
                 }
             }
             VmTerminator::Unreachable => {
-                state.status = VmStatus::Error("Reached Unreachable terminator".to_string());
+                state.status = VmStatus::Error("Reached unreachable terminator".to_string());
             }
         }
     }
@@ -731,12 +1200,13 @@ impl<'a> VmInterpreter<'a> {
         state: &mut VmExecutionState,
     ) {
         if let Some(target_block) = self.func.blocks.get(&target) {
-            for (i, (param_id, _)) in target_block.params.iter().enumerate() {
+            for (i, (param_id, ty)) in target_block.params.iter().enumerate() {
                 if let Some(arg_id) = args.get(i) {
                     let arg_sym = format!("v{}", arg_id.0);
                     let val = state.env.get(&arg_sym).cloned().unwrap_or(VmValue::Unit);
                     let param_sym = format!("v{}", param_id.0);
-                    state.env.insert(param_sym, val);
+                    state.env.insert(param_sym.clone(), val);
+                    state.types.insert(param_sym, ty.display_name());
                 }
             }
         }

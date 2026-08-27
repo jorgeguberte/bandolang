@@ -1,5 +1,5 @@
-use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 
 use super::verifier::VerifierId;
 

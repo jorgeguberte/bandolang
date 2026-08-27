@@ -1,5 +1,5 @@
-use std::io::{self, Read};
 use bando::{run_conformance, ConformanceProgramV0};
+use std::io::{self, Read};
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -13,8 +13,10 @@ fn main() {
         buffer
     };
 
-    let prog: ConformanceProgramV0 = serde_json::from_str(&input_str).expect("Failed to parse ConformanceProgramV0 JSON");
+    let prog: ConformanceProgramV0 =
+        serde_json::from_str(&input_str).expect("Failed to parse ConformanceProgramV0 JSON");
     let obs = run_conformance(&prog);
-    let output_json = serde_json::to_string_pretty(&obs).expect("Failed to serialize ConformanceObservationV0");
+    let output_json =
+        serde_json::to_string_pretty(&obs).expect("Failed to serialize ConformanceObservationV0");
     println!("{}", output_json);
 }

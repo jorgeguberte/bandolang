@@ -20,6 +20,20 @@ pub enum DiagnosticCode {
     UncoveredRequirement,
     EnvelopeExceeded,
     AuthorityInsufficient,
+    // Slice 3 Diagnostic Codes
+    UnknownIntent,
+    DelegateInputTypeMismatch,
+    InvocationCeilingBelowChild,
+    InvocationCeilingAboveExported,
+    GrantExceedsCallerAuthority,
+    GrantExceedsRequestedCeiling,
+    AwaitNonChildHandle,
+    IncompatibleHandleJoin,
+    ForeignParentHandle,
+    StaleGenerationHandle,
+    UnknownInternalizationPolicy,
+    InternalizeNonClaim,
+    ValidationAuthorityInsufficient,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

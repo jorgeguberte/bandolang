@@ -1,3 +1,4 @@
+use crate::ir::effects::EffectRow;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -16,6 +17,24 @@ pub struct PartialEffectReport {
     pub confirmed_not_applied: Vec<String>,
     pub receipt_id: String,
     pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChildHandleValue {
+    pub handle_id: String,
+    pub child_id: String,
+    pub parent_id: String,
+    pub generation_token: String,
+    pub effects: EffectRow,
+    pub settlement_state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BeliefValue {
+    pub payload: Box<Value>,
+    pub owner_agent_id: String,
+    pub provenance: Vec<String>,
+    pub policy_binding: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -39,6 +58,9 @@ pub enum Value {
     ActPartial(PartialEffectReport),
     DeliveryUnknown(String),
     SettlementUnknown(String),
+    ChildHandle(ChildHandleValue),
+    Claim(Box<Value>),
+    Belief(BeliefValue),
 }
 
 impl Value {
@@ -72,5 +94,41 @@ impl Value {
             verifier_build: verifier_build.into(),
             token: token.into(),
         }
+    }
+
+    pub fn child_handle(
+        handle_id: impl Into<String>,
+        child_id: impl Into<String>,
+        parent_id: impl Into<String>,
+        generation_token: impl Into<String>,
+        effects: EffectRow,
+        settlement_state: impl Into<String>,
+    ) -> Self {
+        Value::ChildHandle(ChildHandleValue {
+            handle_id: handle_id.into(),
+            child_id: child_id.into(),
+            parent_id: parent_id.into(),
+            generation_token: generation_token.into(),
+            effects,
+            settlement_state: settlement_state.into(),
+        })
+    }
+
+    pub fn claim(payload: Value) -> Self {
+        Value::Claim(Box::new(payload))
+    }
+
+    pub fn belief(
+        payload: Value,
+        owner_agent_id: impl Into<String>,
+        provenance: Vec<String>,
+        policy_binding: impl Into<String>,
+    ) -> Self {
+        Value::Belief(BeliefValue {
+            payload: Box::new(payload),
+            owner_agent_id: owner_agent_id.into(),
+            provenance,
+            policy_binding: policy_binding.into(),
+        })
     }
 }

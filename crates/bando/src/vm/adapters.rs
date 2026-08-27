@@ -1,5 +1,5 @@
-use std::collections::BTreeMap;
 use crate::{
+    child::{ChildExecutor, DefaultTestChildExecutor},
     ir::{
         effects::EffectRow,
         values::{PartialEffectReport, Value as VmValue},
@@ -7,6 +7,7 @@ use crate::{
     registry::{AtomicityGuarantee, MutationFootprint, OperationId, VerifierDescriptor},
     world::WorldState,
 };
+use std::collections::BTreeMap;
 
 pub trait ReadAdapter: Send + Sync {
     fn read(&self, domain: &str) -> Result<VmValue, VmValue>;
@@ -218,6 +219,7 @@ pub struct RuntimeAdapters {
     pub infer: Box<dyn InferAdapter>,
     pub verifier: Box<dyn VerifierAdapter>,
     pub act: Box<dyn ActAdapter>,
+    pub child: Box<dyn ChildExecutor>,
 }
 
 impl Default for RuntimeAdapters {
@@ -227,6 +229,7 @@ impl Default for RuntimeAdapters {
             infer: Box::new(DefaultTestInferAdapter::default()),
             verifier: Box::new(DefaultTestVerifierAdapter::default()),
             act: Box::new(DefaultTestActAdapter::default()),
+            child: Box::new(DefaultTestChildExecutor::default()),
         }
     }
 }
