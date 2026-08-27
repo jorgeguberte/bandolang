@@ -1,4 +1,4 @@
-"""test_negative_s2.py — Negative Verifier Tests S2V01–S2V14 for Compiler Conformance v0 (Slice 2).
+"""test_negative_s2.py — Negative Verifier Tests S2V01–S2V10 for Compiler Conformance v0 (Slice 2).
 
 Validates that the Rust High-Level Verifier and VM Verifier correctly reject invalid programs
 with structured DiagnosticCode.
@@ -49,6 +49,16 @@ def s2v01_verify_subject_type_mismatch():
     prog = {
         "name": "S2V01_subject_type_mismatch",
         "entry_func": "main", "inputs": {},
+        "registry": {
+            "verifiers": {
+                "auditor_v1": {
+                    "verifier_id": "auditor_v1", "version": "1.0.0",
+                    "effect_envelope": {"effects": [{"Read": "workspace"}]},
+                    "output_predicate": "PassesAudit", "subject_type": make_type_string()
+                }
+            },
+            "operations": {}, "trust_policy": {"trusted_issuers": {}}
+        },
         "module": {
             "name": "m", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
@@ -57,8 +67,8 @@ def s2v01_verify_subject_type_mismatch():
                     "0": {
                         "id": 0, "params": [],
                         "instructions": [
-                            {"Pure": {"dest": 1, "val": {"kind": "I64", "payload": 42}, "ty": make_type_i64()}},  # I64 SUBJECT
-                            {"Verify": {"dest": 2, "verifier_id": "auditor_v1", "subject": 1, "output_predicate": "PassesAudit", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}}  # EXPECTS STRING
+                            {"Pure": {"dest": 1, "val": {"kind": "I64", "payload": 42}, "ty": make_type_i64()}},
+                            {"Verify": {"dest": 2, "verifier_id": "auditor_v1", "subject": 1, "output_predicate": "PassesAudit", "subject_type": make_type_string(), "verifier_effects": [{"Read": "workspace"}]}}
                         ],
                         "terminator": {"Return": None}
                     }
@@ -70,10 +80,19 @@ def s2v01_verify_subject_type_mismatch():
 
 
 def s2v02_verify_caller_authority_missing_verifier_effect():
-    # Rule #5: Caller authority must cover verifier effect envelope
     prog = {
         "name": "S2V02_verify_authority_missing",
         "entry_func": "main", "inputs": {},
+        "registry": {
+            "verifiers": {
+                "heavy_v": {
+                    "verifier_id": "heavy_v", "version": "1.0.0",
+                    "effect_envelope": {"effects": [{"Read": "workspace"}, {"Act": "sandbox"}]},
+                    "output_predicate": "PassesAudit", "subject_type": make_type_string()
+                }
+            },
+            "operations": {}, "trust_policy": {"trusted_issuers": {}}
+        },
         "module": {
             "name": "m", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
@@ -95,10 +114,21 @@ def s2v02_verify_caller_authority_missing_verifier_effect():
 
 
 def s2v03_act_caller_capability_missing():
-    # Caller lacks act[workspace]
     prog = {
         "name": "S2V03_act_capability_missing",
         "entry_func": "main", "inputs": {},
+        "registry": {
+            "verifiers": {},
+            "operations": {
+                "op_write": {
+                    "op_id": "op_write", "target_domain": "workspace",
+                    "declared_envelope": {"effects": [{"Act": "workspace"}]},
+                    "declared_footprint": {"Exact": ["workspace/doc1"]},
+                    "atomicity": "Atomic", "requirements": []
+                }
+            },
+            "trust_policy": {"trusted_issuers": {}}
+        },
         "module": {
             "name": "m", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_string(),
@@ -125,10 +155,21 @@ def s2v03_act_caller_capability_missing():
 
 
 def s2v04_region_local_leak_after_match_act_outcome():
-    # Definition in success_body used in merge without block argument
     prog = {
         "name": "S2V04_act_region_leak",
         "entry_func": "main", "inputs": {},
+        "registry": {
+            "verifiers": {},
+            "operations": {
+                "op_write": {
+                    "op_id": "op_write", "target_domain": "workspace",
+                    "declared_envelope": {"effects": [{"Act": "workspace"}]},
+                    "declared_footprint": {"Exact": ["workspace/doc1"]},
+                    "atomicity": "Atomic", "requirements": []
+                }
+            },
+            "trust_policy": {"trusted_issuers": {}}
+        },
         "module": {
             "name": "m", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_i64(),
@@ -150,7 +191,7 @@ def s2v04_region_local_leak_after_match_act_outcome():
                                 "outcome_val": 2,
                                 "success_arg": 3, "success_body": {
                                     "instructions": [{"Pure": {"dest": 7, "val": {"kind": "I64", "payload": 100}, "ty": make_type_i64()}}],
-                                    "terminator": {"Br": {"target": 1, "args": []}}  # DID NOT TRANSPORT 7!
+                                    "terminator": {"Br": {"target": 1, "args": []}}
                                 },
                                 "failure_arg": 4, "failure_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": []}}},
                                 "partial_arg": 5, "partial_body": {"instructions": [], "terminator": {"Br": {"target": 1, "args": []}}},
@@ -160,7 +201,7 @@ def s2v04_region_local_leak_after_match_act_outcome():
                     },
                     "1": {
                         "id": 1, "name": "merge", "params": [], "instructions": [],
-                        "terminator": {"Return": 7}  # ILLEGAL USE OF 7!
+                        "terminator": {"Return": 7}
                     }
                 }
             }]
@@ -170,10 +211,21 @@ def s2v04_region_local_leak_after_match_act_outcome():
 
 
 def s2v05_cross_region_act_outcome_use():
-    # Value defined in failure_body used in success_body
     prog = {
         "name": "S2V05_cross_act_region",
         "entry_func": "main", "inputs": {},
+        "registry": {
+            "verifiers": {},
+            "operations": {
+                "op_write": {
+                    "op_id": "op_write", "target_domain": "workspace",
+                    "declared_envelope": {"effects": [{"Act": "workspace"}]},
+                    "declared_footprint": {"Exact": ["workspace/doc1"]},
+                    "atomicity": "Atomic", "requirements": []
+                }
+            },
+            "trust_policy": {"trusted_issuers": {}}
+        },
         "module": {
             "name": "m", "functions": [{
                 "name": "main", "params": [], "return_type": make_type_i64(),
@@ -195,7 +247,7 @@ def s2v05_cross_region_act_outcome_use():
                                 "outcome_val": 2,
                                 "success_arg": 3, "success_body": {
                                     "instructions": [],
-                                    "terminator": {"Return": 8}  # USES 8 DEFINED ONLY IN FAILURE BODY!
+                                    "terminator": {"Return": 8}
                                 },
                                 "failure_arg": 4, "failure_body": {
                                     "instructions": [{"Pure": {"dest": 8, "val": {"kind": "I64", "payload": 88}, "ty": make_type_i64()}}],
@@ -213,14 +265,69 @@ def s2v05_cross_region_act_outcome_use():
     expect_verifier_error("S2V05_cross_region_act_outcome_use", prog, "SsaUseBeforeDef")
 
 
+def s2v06_unknown_verifier():
+    prog = {
+        "name": "S2V06_unknown_verifier", "entry_func": "main", "inputs": {},
+        "registry": {"verifiers": {}, "operations": {}, "trust_policy": {"trusted_issuers": {}}},
+        "module": {
+            "name": "m", "functions": [{
+                "name": "main", "params": [], "return_type": make_type_string(),
+                "declared_effects": {"effects": [{"Read": "workspace"}]}, "entry": 0,
+                "blocks": {
+                    "0": {
+                        "id": 0, "params": [],
+                        "instructions": [
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub"}, "ty": make_type_string()}},
+                            {"Verify": {"dest": 2, "verifier_id": "unregistered_verifier", "subject": 1, "output_predicate": "AuditPass", "subject_type": make_type_string(), "verifier_effects": []}}
+                        ],
+                        "terminator": {"Return": None}
+                    }
+                }
+            }]
+        }
+    }
+    expect_verifier_error("S2V06_unknown_verifier", prog, "UnknownVerifier")
+
+
+def s2v07_unknown_operation():
+    prog = {
+        "name": "S2V07_unknown_operation", "entry_func": "main", "inputs": {},
+        "registry": {"verifiers": {}, "operations": {}, "trust_policy": {"trusted_issuers": {}}},
+        "module": {
+            "name": "m", "functions": [{
+                "name": "main", "params": [], "return_type": make_type_string(),
+                "declared_effects": {"effects": [{"Act": "workspace"}]}, "entry": 0,
+                "blocks": {
+                    "0": {
+                        "id": 0, "params": [],
+                        "instructions": [
+                            {"Pure": {"dest": 1, "val": {"kind": "String", "payload": "sub"}, "ty": make_type_string()}},
+                            {"Act": {
+                                "dest": 2, "op_id": "unregistered_operation", "target_domain": "workspace",
+                                "success_type": make_type_string(), "failure_type": make_type_string(),
+                                "args": [1], "evidence": [],
+                                "latent": {"on_success": [], "on_failure": [], "on_partial": []}
+                            }}
+                        ],
+                        "terminator": {"Return": None}
+                    }
+                }
+            }]
+        }
+    }
+    expect_verifier_error("S2V07_unknown_operation", prog, "UnknownOperation")
+
+
 if __name__ == "__main__":
     print("=" * 70)
-    print("SOMA COMPILER CONFORMANCE v0 (SLICE 2) — Negative Verifier Tests (S2V01–S2V05)")
+    print("SOMA COMPILER CONFORMANCE v0 (SLICE 2) — Negative Verifier Tests (S2V01–S2V07)")
     s2v01_verify_subject_type_mismatch()
     s2v02_verify_caller_authority_missing_verifier_effect()
     s2v03_act_caller_capability_missing()
     s2v04_region_local_leak_after_match_act_outcome()
     s2v05_cross_region_act_outcome_use()
+    s2v06_unknown_verifier()
+    s2v07_unknown_operation()
 
     print("=" * 70)
     print(f"SLICE 2 NEGATIVE VERIFIER RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")

@@ -38,6 +38,8 @@ def base_verify_act_program():
         "entry_func": "main",
         "inputs": {},
         "registry": {
+            "caller_authority": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
+            "runtime_authority": {"effects": [{"Read": "trust_store"}]},
             "verifiers": {
                 "v_audit": {
                     "verifier_id": "v_audit", "version": "1.0.0",
@@ -60,7 +62,7 @@ def base_verify_act_program():
             "name": "mod_m",
             "functions": [{
                 "name": "main", "params": [], "return_type": {"kind": "String"},
-                "declared_effects": {"effects": [{"Read": "workspace"}, {"Read": "trust_store"}, {"Act": "workspace"}]},
+                "declared_effects": {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]},
                 "entry": 0,
                 "blocks": {
                     "0": {
@@ -71,7 +73,7 @@ def base_verify_act_program():
                             {"Act": {
                                 "dest": 3, "op_id": "op_write", "target_domain": "workspace",
                                 "success_type": {"kind": "String"}, "failure_type": {"kind": "String"},
-                                "args": [1], "evidence": [2], "gate_effects": [{"Read": "trust_store"}],
+                                "args": [1], "evidence": [2], "gate_effects": [],
                                 "latent": {
                                     "on_success": [{"predicate": "SuccessFact", "args": [{"Symbol": "$value"}]}],
                                     "on_failure": [{"predicate": "FailureFact", "args": [{"Symbol": "$error"}]}],
@@ -96,43 +98,36 @@ def base_verify_act_program():
 
 
 def s2m01_verifier_out_of_envelope():
-    # Verifier tries to execute effect outside declared envelope -> Confinement error
     prog = base_verify_act_program()
     prog["verifier_out_of_envelope"] = {"v_audit": {"effects": [{"Read": "workspace"}, {"Act": "sandbox"}]}}
     obs = invoke_rust_conformance(prog)
-    # Target act must fail because verify produced error instead of valid attestation
     return obs.get("return_val") == {"kind": "String", "payload": "GateRejected"} or obs.get("return_val") == {"kind": "String", "payload": "RequirementUncovered"}
 
 
 def s2m02_drop_verifier_effect():
-    # Lowering drops one verifier effect -> caught by VM Verifier or effect check
     prog = base_verify_act_program()
     prog["mutations"] = {"s2m02_drop_verifier_effect": True}
     obs = invoke_rust_conformance(prog)
-    # Observable effects trace lacks the expected verifier effect
     return not ("read[workspace]" in obs.get("effects", []))
 
 
 def s2m03_trust_arbitrary_issuer():
-    # Untrusted verifier attestation should fail at gate, but mutation lets it pass
     prog = base_verify_act_program()
-    prog["registry"]["trust_policy"] = {"trusted_issuers": {"PassesAudit": ["other_trusted"]}}  # v_audit is NOT trusted
+    prog["registry"]["trust_policy"] = {"trusted_issuers": {"PassesAudit": ["other_trusted"]}}
     baseline_obs = invoke_rust_conformance(copy.deepcopy(prog))
     assert baseline_obs.get("return_val") == {"kind": "String", "payload": "GateRejected"}
 
     prog["mutations"] = {"s2m03_trust_arbitrary_issuer": True}
     mutant_obs = invoke_rust_conformance(prog)
-    # Mutant falsely allowed action to succeed
     return mutant_obs.get("return_val") == {"kind": "String", "payload": "act_success_ok"}
 
 
 def s2m04_deferred_treated_as_proved():
-    # Subject mismatch should fail at gate check, but if treated as Proved it executes
     prog = base_verify_act_program()
     prog["module"]["functions"][0]["blocks"]["0"]["instructions"].insert(
         1, {"Pure": {"dest": 8, "val": {"kind": "String", "payload": "wrong_subject"}, "ty": {"kind": "String"}}}
     )
-    prog["module"]["functions"][0]["blocks"]["0"]["instructions"][3]["Act"]["args"] = [8]  # MISMATCH!
+    prog["module"]["functions"][0]["blocks"]["0"]["instructions"][3]["Act"]["args"] = [8]
     baseline_obs = invoke_rust_conformance(copy.deepcopy(prog))
     assert baseline_obs.get("return_val") == {"kind": "String", "payload": "GateRejected"}
 
@@ -142,27 +137,43 @@ def s2m04_deferred_treated_as_proved():
 
 
 def s2m05_gate_rejection_still_invokes_target():
-    # When gate rejects, mutant still mutates world
     prog = base_verify_act_program()
-    prog["registry"]["trust_policy"] = {"trusted_issuers": {"PassesAudit": ["other"]}}  # Gate will reject
+    prog["registry"]["trust_policy"] = {"trusted_issuers": {"PassesAudit": ["other"]}}
     prog["mutations"] = {"s2m05_gate_rejection_still_invokes_target": True}
     obs = invoke_rust_conformance(prog)
-    return len(obs.get("mutation_trace", [])) > 0  # Mutant wrote to world!
+    return len(obs.get("mutation_trace", [])) > 0
 
 
 def s2m06_gate_effect_omitted_from_act():
-    # Gate check effect omitted from observable trace
     prog = base_verify_act_program()
     prog["mutations"] = {"s2m06_gate_effect_omitted_from_act": True}
     obs = invoke_rust_conformance(prog)
     return not ("read[trust_store]" in obs.get("effects", []))
 
 
-def s2m08_toctou_revalidation_omitted():
-    # TOCTOU version mismatch between gate check and commit:
-    # Set initial storage version to 5, gate check expects 5.
-    # But before commit, simulate version changed to 6.
+def s2m07_trusted_gate_requires_caller_authority():
+    # Caller authority has ONLY act[workspace]. Runtime authority has read[trust_store].
+    # Baseline: gate passes because runtime authority covers read[trust_store].
+    # Mutant: requires caller authority for read[trust_store], so gate fails!
     prog = base_verify_act_program()
+    prog["registry"]["caller_authority"] = {"effects": [{"Read": "workspace"}, {"Act": "workspace"}]}  # lacks read[trust_store]
+    prog["registry"]["runtime_authority"] = {"effects": [{"Read": "trust_store"}]}
+    baseline_obs = invoke_rust_conformance(copy.deepcopy(prog))
+    assert baseline_obs.get("return_val") == {"kind": "String", "payload": "act_success_ok"}
+
+    prog["mutations"] = {"s2m07_trusted_gate_requires_caller_authority": True}
+    mutant_obs = invoke_rust_conformance(prog)
+    return mutant_obs.get("return_val") == {"kind": "String", "payload": "GateRejected"}
+
+
+def s2m08_toctou_revalidation_omitted():
+    # Deterministic TOCTOU hook: version starts at 5, gate observes 5.
+    # Hook mutates storage version to 6 before commit.
+    # Baseline: atomic revalidation sees 6 != 5 -> reject commit, zero write.
+    # Mutant (s2m08_toctou_revalidation_omitted): omits witness version check -> commits blindly!
+    prog = base_verify_act_program()
+    prog["registry"]["operations"]["op_write"]["declared_envelope"]["effects"].append({"Read": "state_base"})
+    prog["registry"]["runtime_authority"]["effects"].append({"Read": "state_base"})
     prog["registry"]["operations"]["op_write"]["requirements"].append(
         {"RequiresStateBase": {"key": "workspace/doc1", "expected_version": 5}}
     )
@@ -170,15 +181,21 @@ def s2m08_toctou_revalidation_omitted():
         "storage": {"workspace/doc1": [{"kind": "String", "payload": "v5_data"}, 5]},
         "mutation_trace": []
     }
-    # Mutant omits witness version check, so it would commit even if version mismatch
+    prog["toctou_hook_bumps"] = {
+        "op_write": ("workspace/doc1", {"kind": "String", "payload": "inter_bumped"}, 6)
+    }
+
+    baseline_obs = invoke_rust_conformance(copy.deepcopy(prog))
+    assert baseline_obs.get("return_val") == {"kind": "String", "payload": "GateRejected"}, f"baseline must reject TOCTOU race: got {baseline_obs}"
+    assert len(baseline_obs.get("mutation_trace", [])) == 0, "baseline must have 0 target mutation on TOCTOU failure"
+
     prog["mutations"] = {"s2m08_toctou_revalidation_omitted": True}
-    obs = invoke_rust_conformance(prog)
-    # Mutation disabled TOCTOU guard
-    return obs["status"] == "ok"
+    mutant_obs = invoke_rust_conformance(prog)
+    # Mutant falsely allowed commit and recorded mutation trace!
+    return mutant_obs.get("return_val") == {"kind": "String", "payload": "act_success_ok"} and len(mutant_obs.get("mutation_trace", [])) > 0
 
 
 def s2m09_footprint_enforcement_disabled():
-    # Adapter attempts write outside footprint: with mutation, it succeeds instead of being caught
     prog = base_verify_act_program()
     prog["act_scenarios"] = {"op_write": "out_of_footprint_attempt"}
     baseline_obs = invoke_rust_conformance(copy.deepcopy(prog))
@@ -195,7 +212,6 @@ def s2m10_partial_collapsed_to_failure():
     prog["registry"]["operations"]["op_write"]["atomicity"] = "MayPartiallyComplete"
     prog["mutations"] = {"s2m10_partial_collapsed_to_failure": True}
     obs = invoke_rust_conformance(prog)
-    # Coerced to failure
     return obs.get("return_val") != None and "CoercedPartial" in str(obs.get("return_val"))
 
 
@@ -213,20 +229,17 @@ def s2m12_success_fact_on_partial():
     prog["registry"]["operations"]["op_write"]["atomicity"] = "MayPartiallyComplete"
     prog["mutations"] = {"s2m12_success_fact_on_partial": True}
     obs = invoke_rust_conformance(prog)
-    # Success-only fact leaked into active facts on partial outcome
     return any(f.get("predicate") == "SuccessFact" for f in obs.get("active_facts", []))
 
 
 def s2m13_atomic_adapter_partial_accepted():
-    # Adapter is Atomic, but returns Partial. Baseline gives protocol violation.
-    # Mutant accepts it as legitimate partial.
     prog = base_verify_act_program()
     prog["act_scenarios"] = {"op_write": "atomic_yielding_partial"}
     prog["registry"]["operations"]["op_write"]["atomicity"] = "Atomic"
     baseline_obs = invoke_rust_conformance(copy.deepcopy(prog))
     assert "protocol_violation" in baseline_obs["status"]
 
-    prog["registry"]["operations"]["op_write"]["atomicity"] = "MayPartiallyComplete"  # Simulates mutant acceptance
+    prog["registry"]["operations"]["op_write"]["atomicity"] = "MayPartiallyComplete"
     mutant_obs = invoke_rust_conformance(prog)
     return mutant_obs["status"] == "ok"
 
@@ -234,24 +247,28 @@ def s2m13_atomic_adapter_partial_accepted():
 def s2m14_current_facts_not_invalidated():
     prog = base_verify_act_program()
     prog["initial_facts"] = [{"predicate": "CurrentState", "args": [{"Literal": "workspace/doc1"}, {"Literal": "old"}]}]
+    baseline_obs = invoke_rust_conformance(copy.deepcopy(prog))
+    assert not any(f.get("predicate") == "CurrentState" for f in baseline_obs.get("active_facts", [])), "CurrentState must be invalidated"
+
     prog["mutations"] = {"s2m14_current_facts_not_invalidated": True}
-    obs = invoke_rust_conformance(prog)
-    # CurrentState fact for doc1 falsely survived write to doc1
-    return any(f.get("predicate") == "CurrentState" for f in obs.get("active_facts", []))
+    mutant_obs = invoke_rust_conformance(prog)
+    return any(f.get("predicate") == "CurrentState" for f in mutant_obs.get("active_facts", []))
 
 
 def s2m15_historical_facts_invalidated():
     prog = base_verify_act_program()
     prog["initial_facts"] = [{"predicate": "Historical", "args": [{"Literal": "init_provenance"}]}]
+    baseline_obs = invoke_rust_conformance(copy.deepcopy(prog))
+    assert any(f.get("predicate") == "Historical" for f in baseline_obs.get("active_facts", [])), "Historical must survive"
+
     prog["mutations"] = {"s2m15_historical_facts_invalidated": True}
-    obs = invoke_rust_conformance(prog)
-    # Historical fact was falsely removed on write
-    return not any(f.get("predicate") == "Historical" for f in obs.get("active_facts", []))
+    mutant_obs = invoke_rust_conformance(prog)
+    return not any(f.get("predicate") == "Historical" for f in mutant_obs.get("active_facts", []))
 
 
 def s2m16_untrusted_attestation_accepted():
     prog = base_verify_act_program()
-    prog["registry"]["trust_policy"] = {"trusted_issuers": {"PassesAudit": ["trusted_only"]}}  # v_audit is not trusted
+    prog["registry"]["trust_policy"] = {"trusted_issuers": {"PassesAudit": ["trusted_only"]}}
     prog["mutations"] = {"s2m16_untrusted_attestation_accepted": True}
     obs = invoke_rust_conformance(prog)
     return obs.get("return_val") == {"kind": "String", "payload": "act_success_ok"}
@@ -266,6 +283,7 @@ if __name__ == "__main__":
     kill_mutation("S2M04_deferred_treated_as_proved", s2m04_deferred_treated_as_proved)
     kill_mutation("S2M05_gate_rejection_still_invokes_target", s2m05_gate_rejection_still_invokes_target)
     kill_mutation("S2M06_gate_effect_omitted_from_act", s2m06_gate_effect_omitted_from_act)
+    kill_mutation("S2M07_trusted_gate_requires_caller_authority", s2m07_trusted_gate_requires_caller_authority)
     kill_mutation("S2M08_toctou_revalidation_omitted", s2m08_toctou_revalidation_omitted)
     kill_mutation("S2M09_footprint_enforcement_disabled", s2m09_footprint_enforcement_disabled)
     kill_mutation("S2M10_partial_collapsed_to_failure", s2m10_partial_collapsed_to_failure)
@@ -280,4 +298,4 @@ if __name__ == "__main__":
     print(f"SLICE 2 MUTATION KILLS RESULT: {PASS} passed, {FAIL} failed ({PASS + FAIL} total)")
     if FAIL:
         sys.exit(1)
-    print("All Slice 2 Compiler Mutations correctly identified and killed.")
+    print("All 16 Slice 2 Compiler Mutations correctly identified and killed.")

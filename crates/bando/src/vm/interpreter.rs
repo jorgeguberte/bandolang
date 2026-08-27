@@ -5,15 +5,13 @@ use crate::{
     analysis::PathFactAnalyzer,
     gate::{DeferredCheck, GateEngine, RequirementResolution},
     ir::{
-        effects::EffectRow,
+        effects::Effect,
         facts::{Fact, FactArg, LatentPostconditions},
         types::Type,
         values::Value as VmValue,
     },
     lowering::CompilerMutations,
-    registry::{
-        AtomicityGuarantee, MutationFootprint, OperationDescriptor, RegistrySnapshot,
-    },
+    registry::{MutationFootprint, RegistrySnapshot},
     vm_ir::{VmBlockId, VmFunction, VmInstruction, VmTerminator, VmValueId},
     world::WorldState,
 };
@@ -266,22 +264,41 @@ impl<'a> VmInterpreter<'a> {
                 dest,
                 verifier_id,
                 subject,
-                output_predicate,
-                subject_type,
-                verifier_effects,
+                output_predicate: _,
+                subject_type: _,
+                verifier_effects: _,
             } => {
                 let dest_sym = format!("v{}", dest.0);
                 let sub_sym = format!("v{}", subject.0);
                 let subject_val = state.env.get(&sub_sym).cloned().unwrap_or(VmValue::Unit);
 
-                let mut env_row = EffectRow::empty();
-                for eff in verifier_effects {
-                    env_row = env_row.with(eff.clone());
+                let desc = match self.registry.verifiers.get(verifier_id) {
+                    Some(d) => d,
+                    None => {
+                        state.status = VmStatus::Error(format!(
+                            "Unknown verifier {:?} in trusted registry",
+                            verifier_id
+                        ));
+                        return;
+                    }
+                };
+
+                let verifier_effects: Vec<_> = desc.effect_envelope.effects.iter().cloned().collect();
+
+                // Caller authority check for Verify (Rule #5, S2C04)
+                if let Some(ca) = &self.registry.caller_authority {
+                    if !ca.covers(&verifier_effects) {
+                        state.status = VmStatus::Error(format!(
+                            "Caller authority insufficient for verifier {:?}",
+                            verifier_id
+                        ));
+                        return;
+                    }
                 }
 
                 // S2M02: drop verifier effect from execution
                 if !self.mutations.s2m02_drop_verifier_effect {
-                    for eff in verifier_effects {
+                    for eff in &verifier_effects {
                         match eff {
                             crate::ir::effects::Effect::Read(d) => {
                                 state.observable_effects.push(format!("read[{}]", d))
@@ -299,14 +316,14 @@ impl<'a> VmInterpreter<'a> {
                 let verify_res = self
                     .adapters
                     .verifier
-                    .verify(verifier_id, &subject_val, &env_row);
+                    .verify(desc, &subject_val, &desc.effect_envelope);
                 let out_val = match verify_res {
                     Ok(att) => VmValue::ok(att),
                     Err(e) => VmValue::err(VmValue::String(e)),
                 };
 
                 let ret_ty = Type::result(
-                    Type::attestation(output_predicate.clone(), subject_type.clone()),
+                    Type::attestation(desc.output_predicate.clone(), desc.subject_type.clone()),
                     Type::String,
                 );
 
@@ -316,35 +333,41 @@ impl<'a> VmInterpreter<'a> {
             VmInstruction::VmAct {
                 dest,
                 op_id,
-                target_domain,
+                target_domain: _,
                 success_type,
                 failure_type,
                 args,
                 evidence,
-                gate_effects,
+                gate_effects: _,
                 latent: _,
             } => {
                 let dest_sym = format!("v{}", dest.0);
                 let ret_ty = Type::act_outcome(success_type.clone(), failure_type.clone());
                 state.types.insert(dest_sym.clone(), ret_ty.display_name());
 
-                // Look up operation descriptor
-                let op_desc = self
-                    .registry
-                    .operations
-                    .get(op_id)
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        OperationDescriptor::new(
-                            op_id.clone(),
-                            target_domain.clone(),
-                            EffectRow::empty()
-                                .with(crate::ir::effects::Effect::Act(target_domain.clone())),
-                            MutationFootprint::DomainWide(target_domain.clone()),
-                            AtomicityGuarantee::Atomic,
-                            Vec::new(),
-                        )
-                    });
+                // Look up operation descriptor (Fail-closed, P1)
+                let op_desc = match self.registry.operations.get(op_id) {
+                    Some(d) => d.clone(),
+                    None => {
+                        state.status = VmStatus::Error(format!(
+                            "Unknown operation {:?} in trusted registry",
+                            op_id
+                        ));
+                        return;
+                    }
+                };
+
+                // Caller authority check for target domain (Rule #9, S2C11)
+                if let Some(ca) = &self.registry.caller_authority {
+                    let target_eff = Effect::Act(op_desc.target_domain.clone());
+                    if !ca.contains(&target_eff) {
+                        state.status = VmStatus::Error(format!(
+                            "Caller authority lacks target capability {:?}",
+                            target_eff
+                        ));
+                        return;
+                    }
+                }
 
                 // 1. Resolve requirements against args and evidence
                 let mut arg_values = Vec::new();
@@ -374,25 +397,27 @@ impl<'a> VmInterpreter<'a> {
                 let mut witness_version = None;
                 let mut gate_eff_strings = Vec::new();
 
-                for eff in gate_effects {
-                    match eff {
-                        crate::ir::effects::Effect::Read(d) => {
-                            gate_eff_strings.push(format!("read[{}]", d))
-                        }
-                        crate::ir::effects::Effect::Infer => {
-                            gate_eff_strings.push("infer".to_string())
-                        }
-                        crate::ir::effects::Effect::Act(d) => {
-                            gate_eff_strings.push(format!("act[{}]", d))
-                        }
-                    }
-                }
-
                 match &resolution {
                     RequirementResolution::Proved => {
                         // No dynamic checks required
                     }
                     RequirementResolution::Deferred(checks) => {
+                        for check in checks {
+                            for eff in check.required_effects() {
+                                match eff {
+                                    crate::ir::effects::Effect::Read(d) => {
+                                        gate_eff_strings.push(format!("read[{}]", d))
+                                    }
+                                    crate::ir::effects::Effect::Infer => {
+                                        gate_eff_strings.push("infer".to_string())
+                                    }
+                                    crate::ir::effects::Effect::Act(d) => {
+                                        gate_eff_strings.push(format!("act[{}]", d))
+                                    }
+                                }
+                            }
+                        }
+
                         // Record gate check effects in observable trace (Rule #15)
                         if !self.mutations.s2m06_gate_effect_omitted_from_act {
                             state.observable_effects.extend(gate_eff_strings.clone());
@@ -417,6 +442,9 @@ impl<'a> VmInterpreter<'a> {
                             &state.world,
                             &trust_policy,
                             &gate_eff_strings,
+                            self.registry.caller_authority.as_ref(),
+                            self.registry.runtime_authority.as_ref(),
+                            self.mutations.s2m07_trusted_gate_requires_caller_authority,
                         );
 
                         match gate_eval {
@@ -450,7 +478,7 @@ impl<'a> VmInterpreter<'a> {
                 // 3. Execute target act
                 state
                     .observable_effects
-                    .push(format!("act[{}]", target_domain));
+                    .push(format!("act[{}]", op_desc.target_domain));
 
                 let prior_trace_len = state.world.mutation_trace.len();
 
@@ -462,7 +490,7 @@ impl<'a> VmInterpreter<'a> {
                 }
 
                 let footprint = if self.mutations.s2m09_footprint_enforcement_disabled {
-                    MutationFootprint::Unknown(target_domain.clone())
+                    MutationFootprint::Unknown(op_desc.target_domain.clone())
                 } else {
                     op_desc.declared_footprint.clone()
                 };

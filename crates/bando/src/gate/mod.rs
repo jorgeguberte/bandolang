@@ -1,8 +1,8 @@
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    ir::values::Value,
-    registry::{PolicyRequirement, TrustPolicy, VerifierId},
+    ir::{effects::Effect, values::Value},
+    registry::{AuthoritySource, CallerAuthority, PolicyRequirement, TrustPolicy, TrustedRuntimeAuthority, VerifierId},
     world::WorldState,
 };
 
@@ -30,6 +30,24 @@ pub enum DeferredCheck {
     },
 }
 
+impl DeferredCheck {
+    pub fn required_effects(&self) -> Vec<Effect> {
+        match self {
+            DeferredCheck::CheckSubjectBinding { .. } => Vec::new(),
+            DeferredCheck::CheckTrustPolicy { .. } => vec![Effect::Read("trust_store".to_string())],
+            DeferredCheck::CheckStateBaseVersion { .. } => vec![Effect::Read("state_base".to_string())],
+        }
+    }
+
+    pub fn authority_source(&self) -> AuthoritySource {
+        match self {
+            DeferredCheck::CheckSubjectBinding { .. } => AuthoritySource::Caller,
+            DeferredCheck::CheckTrustPolicy { .. } => AuthoritySource::TrustedRuntime,
+            DeferredCheck::CheckStateBaseVersion { .. } => AuthoritySource::TrustedRuntime,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GateWitness {
     pub observed_state_version: Option<u64>,
@@ -41,6 +59,7 @@ pub enum GateError {
     SubjectMismatch,
     UntrustedIssuer(String),
     BaseVersionMismatch,
+    AuthorityInsufficient(String),
     GateRejected(String),
 }
 
@@ -60,6 +79,42 @@ impl GateEngine {
 
         for req in requirements {
             match req {
+                PolicyRequirement::RequiresStaticProof { predicate, subject_arg_idx } => {
+                    let matching_evidence = evidence.iter().find_map(|v| match v {
+                        Value::Attestation { predicate: p, subject, .. } => {
+                            if p == predicate {
+                                Some(subject.clone())
+                            } else {
+                                None
+                            }
+                        }
+                        Value::Ok(inner) => match inner.as_ref() {
+                            Value::Attestation { predicate: p, subject, .. } => {
+                                if p == predicate {
+                                    Some(subject.clone())
+                                } else {
+                                    None
+                                }
+                            }
+                            _ => None,
+                        },
+                        _ => None,
+                    });
+
+                    match matching_evidence {
+                        Some(subject) => {
+                            let subject_val = args.get(*subject_arg_idx).cloned().unwrap_or(Value::Unit);
+                            if subject.as_ref() == &subject_val {
+                                // Statically proved!
+                                continue;
+                            } else {
+                                // Statically refuted by contradictory subject
+                                return RequirementResolution::Refuted;
+                            }
+                        }
+                        None => return RequirementResolution::Uncovered,
+                    }
+                }
                 PolicyRequirement::RequiresAttestation { predicate, subject_arg_idx } => {
                     let matching_attestation = evidence.iter().find_map(|v| match v {
                         Value::Attestation { predicate: p, subject, issuer, .. } => {
@@ -125,11 +180,45 @@ impl GateEngine {
         world: &WorldState,
         trust_policy: &TrustPolicy,
         gate_effects: &[String],
+        caller_authority: Option<&CallerAuthority>,
+        runtime_authority: Option<&TrustedRuntimeAuthority>,
+        require_caller_authority_for_all: bool,
     ) -> Result<GateWitness, GateError> {
         let mut witness_version = None;
         let executed_effects = gate_effects.to_vec();
 
         for check in checks {
+            let required_effects = check.required_effects();
+            let source = check.authority_source();
+
+            // Authority check (Rule #10, Rule #17)
+            match source {
+                AuthoritySource::Caller => {
+                    if let Some(ca) = caller_authority {
+                        if !ca.covers(&required_effects) {
+                            return Err(GateError::AuthorityInsufficient("Caller lacks authority for check".to_string()));
+                        }
+                    }
+                }
+                AuthoritySource::TrustedRuntime => {
+                    if require_caller_authority_for_all {
+                        // S2M07 mutation: falsely requires caller authority for trusted gate check!
+                        if let Some(ca) = caller_authority {
+                            if !ca.covers(&required_effects) {
+                                return Err(GateError::AuthorityInsufficient("S2M07: Caller lacks authority for trusted check".to_string()));
+                            }
+                        }
+                    } else {
+                        // Baseline: trusted runtime authority covers the check
+                        if let Some(ra) = runtime_authority {
+                            if !ra.covers(&required_effects) {
+                                return Err(GateError::AuthorityInsufficient("Runtime lacks authority for check".to_string()));
+                            }
+                        }
+                    }
+                }
+            }
+
             match check {
                 DeferredCheck::CheckSubjectBinding { expected_subject, attestation_subject } => {
                     if expected_subject != attestation_subject {

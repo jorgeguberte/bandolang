@@ -32,6 +32,8 @@ pub struct ConformanceProgramV0 {
     #[serde(default)]
     pub act_custom_writes: BTreeMap<String, Vec<(String, Value)>>,
     #[serde(default)]
+    pub toctou_hook_bumps: BTreeMap<String, (String, Value, u64)>,
+    #[serde(default)]
     pub initial_world: Option<WorldState>,
     #[serde(default)]
     pub initial_facts: Option<Vec<Fact>>,

@@ -64,21 +64,31 @@ pub enum Instruction {
         dest: ValueId,
         verifier_id: VerifierId,
         subject: ValueId,
+        #[serde(default)]
         output_predicate: String,
+        #[serde(default = "default_subject_type")]
         subject_type: Type,
+        #[serde(default)]
         verifier_effects: Vec<Effect>,
     },
     Act {
         dest: ValueId,
         op_id: OperationId,
+        #[serde(default)]
         target_domain: String,
         success_type: Type,
         failure_type: Type,
         args: Vec<ValueId>,
         evidence: Vec<ValueId>,
+        #[serde(default)]
         gate_effects: Vec<Effect>,
+        #[serde(default)]
         latent: ActLatentPostconditions,
     },
+}
+
+fn default_subject_type() -> Type {
+    Type::String
 }
 
 impl Instruction {

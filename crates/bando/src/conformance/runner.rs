@@ -13,14 +13,15 @@ use crate::{
         interpreter::VmStatus,
         VmInterpreter,
     },
-    vm_ir::VmFunction,
     vm_verifier::VmVerifier,
     world::WorldState,
 };
 
 pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 {
-    // 1. High-level verifier
-    if let Err(diags) = HighLevelVerifier::verify_module(&prog.module) {
+    let registry = prog.registry.clone().unwrap_or_else(RegistrySnapshot::new);
+
+    // 1. High-level verifier (with trusted registry binding, P1)
+    if let Err(diags) = HighLevelVerifier::verify_module_with_registry(&prog.module, &registry) {
         return ConformanceObservationV0 {
             status: "verifier_error".to_string(),
             return_val: None,
@@ -91,6 +92,7 @@ pub fn run_conformance(prog: &ConformanceProgramV0) -> ConformanceObservationV0 
     let mut act_adapter = DefaultTestActAdapter::default();
     act_adapter.scenarios = prog.act_scenarios.clone();
     act_adapter.custom_writes = prog.act_custom_writes.clone();
+    act_adapter.toctou_hook_bumps = prog.toctou_hook_bumps.clone();
 
     let adapters = RuntimeAdapters {
         read: Box::new(read_adapter),

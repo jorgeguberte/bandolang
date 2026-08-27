@@ -14,6 +14,12 @@ pub enum DiagnosticCode {
     InvalidTerminator,
     TypeMismatch,
     UnreachableCode,
+    UnknownVerifier,
+    UnknownOperation,
+    RefutedRequirement,
+    UncoveredRequirement,
+    EnvelopeExceeded,
+    AuthorityInsufficient,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
