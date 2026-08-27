@@ -9,10 +9,17 @@ on:
       - main
   workflow_dispatch:
 
+env:
+  PYTHONUTF8: "1"
+  PYTHONIOENCODING: "utf-8"
+
 jobs:
   conformance:
     name: SOMA Compiler & Runtime Conformance
     runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      PYTHONIOENCODING: "utf-8"
     defaults:
       run:
         shell: bash
